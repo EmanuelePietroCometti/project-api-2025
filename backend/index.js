@@ -1,9 +1,9 @@
 import express from 'express';
 import morgan from 'morgan';
 import cors from 'cors';
-import listRoutes from './routes/listRoutes';
-import filesRoutes from './routes/filesRoutes';
-import mkdirRoutes from './routes/mkdirRoutes';
+import listRoutes from './routes/listRoutes.js';
+import filesRoutes from './routes/filesRoutes.js';
+import mkdirRoutes from './routes/mkdirRoutes.js';
 
 // init express
 const app = new express();
@@ -19,9 +19,9 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // API
-app.use('/list/path', listRoutes);
-app.use('/files/path', filesRoutes);
-app.use('/mkdir/path', mkdirRoutes);
+app.use('/list', listRoutes);
+app.use('/files', filesRoutes);
+app.use('/mkdir', mkdirRoutes);
 
 
 // activate the server
