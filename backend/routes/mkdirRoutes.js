@@ -8,14 +8,13 @@ import FileDAO from '../dao/fileDAO.js';
 const f = new FileDAO();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const router = express.Router();
 const ROOT_DIR = path.join(__dirname, "..", "storage");
 
 // POST /mkdir/path
 router.post("/:path", async (req, res) => {
   try {
-    const relPath = req.params.path; 
+    const relPath = req.params.path;
     const dirPath = path.join(ROOT_DIR, relPath);
     const parentPath = path.dirname(dirPath);
 
@@ -31,6 +30,11 @@ router.post("/:path", async (req, res) => {
 
     // Crea la directory fisica
     await fs.promises.mkdir(dirPath);
+    console.log({
+      relPath,
+      basename: path.basename(relPath),
+      parentPath
+    });
 
     // Inserisci nel DB i metadata
     await f.updateFile({
