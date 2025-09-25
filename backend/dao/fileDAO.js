@@ -4,14 +4,14 @@ export default function FileDAO() {
     this.getFilesByDirectory = (parent) => {
         return new Promise((resolve, reject) => {
             const query = 'SELECT * FROM files WHERE parent=?';
-            db.all(query, [parent], (err, row) => {
+            db.all(query, [parent], (err, rows) => {
                 if (err) {
                     reject(err);
                 }
-                if (!row) {
+                if (!rows) {
                     resolve({ error: 'Directory not found.' });
                 } else {
-                    resolve();
+                    resolve(rows);
                 }
             });
         });
@@ -46,17 +46,19 @@ export default function FileDAO() {
             })
         });
     }
-    this.createDirectory=(path, parent, name, is_dir, size, mtime, permissions,version)=>{
-        const query = 'INSERT INTO files(path, parent, name, is_dir, size, mtime, permissions, version) VALUES (?, ?, ?, 1, 0, ?, ?, 1)'
-        db.run(query, [path, parent, name, is_dir, size, mtime, permissions,version], (err, row) =>{
-            if (err) {
-                reject(err);
-            }
-            if (!row) {
-                resolve({ error: 'File not found.' });
-            } else {
-                resolve();
-            }
+    this.createDirectory=({path, parent, name, is_dir, size, mtime, permissions})=>{
+        const query = 'INSERT INTO files(path, parent, name, is_dir, size, mtime, permissions, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)'
+        return new Promise((resolve, reject) => {
+            db.run(query, [path, parent, name, is_dir, size, mtime, permissions], (err, row) =>{
+                if (err) {
+                    reject(err);
+                }
+                if (!row) {
+                    resolve({ error: 'File not found.' });
+                } else {
+                    resolve();
+                }
+            });
         });
     }
     this.deleteFile=(path)=>{

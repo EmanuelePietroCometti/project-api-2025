@@ -7,11 +7,9 @@ const file=new FileDAO();
 // GET /list/path
 router.get('/:directory', async(req, res) =>{
     try{
-        const {directory} = req.params.directory;
-        const files = await file.getFileByPath(directory);
-        if( files.length ===0 ){
-            return res.status(404).json({error: 'No files found'});
-        }
+        const directory = req.params.directory;
+        const files = await file.getFilesByDirectory(directory);
+        res.json(files);
     } catch(err){
         res.status(500).json({error: err.message});
     }
