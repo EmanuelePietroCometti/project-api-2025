@@ -31,10 +31,10 @@ export default function FileDAO() {
             });
         });
     }
-    this.updateFile = (path, parent, name, is_dir, size, mtime, permissions,version) => {
+    this.updateFile = ({path, name, parent, is_dir, size, mtime, permissions}) => {
+        const query = 'INSERT INTO files(path, parent, name, is_dir, size, mtime, permissions, version) VALUES(?, ?, ?, ?, ?, ?, ?, 1) ON CONFLICT(path) DO UPDATE SET size =?, mtime =?, version = version + 1'
         return new Promise((resolve, reject) => {
-            const query = 'INSERT INTO files(path, parent, name, is_dir, size, mtime, permissions, version) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET size =?, mtime =?, version = version + 1'
-            db.run(query, [path, parent, name, is_dir, size, mtime, permissions,version], (err, row) => {
+            db.run(query, [path, name, parent, is_dir, size, mtime, permissions], (err, row) => {
                 if (err) {
                     reject(err);
                 }
