@@ -4,7 +4,3 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-polyfuse = "0.5"
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-
