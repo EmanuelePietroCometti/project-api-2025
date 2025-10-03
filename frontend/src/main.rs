@@ -1,3 +1,6 @@
+use frontend::mount_fs;
+
 fn main() {
-    println!("Hello, world!");
+    let mountpoint="mnt/remote-fs";
+    mount_fs(mountpoint);
 }
