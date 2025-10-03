@@ -1,0 +1,1 @@
+C:\Users\Utente\Documents\Dre\ testi\programmazione\ di\ sistema\rust\project-api-2025\frontend\target\debug\libfrontend.rlib: C:\Users\Utente\Documents\Dre\ testi\programmazione\ di\ sistema\rust\project-api-2025\frontend\src\lib.rs

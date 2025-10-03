@@ -1,0 +1,12 @@
+C:\Users\Utente\Documents\Dre testi\programmazione di sistema\rust\project-api-2025\frontend\target\debug\deps\libserde-e9c25cfe44164730.rmeta: C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\Utente\Documents\Dre\ testi\programmazione\ di\ sistema\rust\project-api-2025\frontend\target\debug\build\serde-b1595d812e57e816\out/private.rs
+
+C:\Users\Utente\Documents\Dre testi\programmazione di sistema\rust\project-api-2025\frontend\target\debug\deps\serde-e9c25cfe44164730.d: C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs C:\Users\Utente\Documents\Dre\ testi\programmazione\ di\ sistema\rust\project-api-2025\frontend\target\debug\build\serde-b1595d812e57e816\out/private.rs
+
+C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\Utente\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+C:\Users\Utente\Documents\Dre\ testi\programmazione\ di\ sistema\rust\project-api-2025\frontend\target\debug\build\serde-b1595d812e57e816\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\Utente\\Documents\\Dre testi\\programmazione di sistema\\rust\\project-api-2025\\frontend\\target\\debug\\build\\serde-b1595d812e57e816\\out
