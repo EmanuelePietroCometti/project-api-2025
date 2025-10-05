@@ -85,6 +85,6 @@ pub fn mount_fs(mountpoint: &str)-> anyhow::Result<()> {
         MountOption::AutoUnmount, 
         MountOption::AllowOther
     ];
-    fuser015::mount2(fs, mountpoint, options)?;
+    fuser016::mount2(fs, mountpoint, options)?;
     Ok(())
 }
