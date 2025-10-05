@@ -1,14 +1,13 @@
-#[cfg(feature = "macos")]
 use fuser015::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
-#[cfg(feature = "macos")]
+
 use fuser015::MountOption;
 use std::time::{Duration, SystemTime};
 
-#[cfg(feature = "macos")]
+
 pub struct RemoteFs;
-#[cfg(feature = "macos")]
+
 impl Filesystem for RemoteFs {
     fn lookup(  
         &mut self,
@@ -88,7 +87,7 @@ impl Filesystem for RemoteFs {
         unimplemented!()
     }
 }
-#[cfg(feature = "macos")]
+
 pub fn mount_fs(mountpoint: &str) -> anyhow::Result<()> {
     let fs = RemoteFs;
     let options = &[
