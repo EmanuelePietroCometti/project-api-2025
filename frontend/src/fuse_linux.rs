@@ -1,5 +1,6 @@
 use fuser016::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request, ReplyWrite, ReplyEmpty
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyWrite, Request,
 };
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime};
@@ -37,6 +38,8 @@ impl Filesystem for RemoteFs {
         fh: u64,
         offset: i64,
         size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
         // API call to read file content
@@ -50,7 +53,10 @@ impl Filesystem for RemoteFs {
         fh: u64,
         offset: i64,
         data: &[u8],
-        reply: fuser016::ReplyWrite,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
     ) {
         unimplemented!()
     }
@@ -61,6 +67,7 @@ impl Filesystem for RemoteFs {
         parent: u64,
         name: &std::ffi::OsStr,
         mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         // API call to create directory
@@ -79,12 +86,9 @@ impl Filesystem for RemoteFs {
     }
 }
 
-pub fn mount_fs(mountpoint: &str)-> anyhow::Result<()> {
+pub fn mount_fs(mountpoint: &str) -> anyhow::Result<()> {
     let fs = RemoteFs;
-    let options = &[
-        MountOption::AutoUnmount, 
-        MountOption::AllowOther
-    ];
+    let options = &[MountOption::AutoUnmount, MountOption::AllowOther];
     fuser016::mount2(fs, mountpoint, options)?;
     Ok(())
 }
