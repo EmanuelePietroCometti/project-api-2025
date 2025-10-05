@@ -1,26 +1,29 @@
-use fuser015::{Filesystem, FileAttr, FileType, ReplyAttr, ReplyData, ReplyEntry, ReplyDirectory, Request};
+use fuser015::{
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+};
 use std::time::{Duration, SystemTime};
 
 pub struct RemoteFs;
 
-impl Filesystem for RemoteFs{
+impl Filesystem for RemoteFs {
     fn lookup(
-        &mut self, 
-        _req: &Request<'_>, 
-        parent: u64, 
-        name: &std::ffi::OsStr, 
-        reply: ReplyEntry
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: ReplyEntry,
     ) {
         // API call to find file by name
         unimplemented!()
     }
 
     fn readdir(
-        &mut self, 
-        _req: &Request<'_>, 
-        ino: u64, fh: u64, 
-        offset: i64, 
-        reply: ReplyDirectory
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        reply: ReplyDirectory,
     ) {
         // API call to list directory contents
         unimplemented!()
@@ -71,18 +74,23 @@ impl Filesystem for RemoteFs{
     }
 
     fn unlink(
-        &mut self, 
-        _req: &Request<'_>, 
+        &mut self,
+        _req: &Request<'_>,
         parent: u64,
-        name: &std::ffi::OsStr, 
-        reply: fuser015::ReplyEmpty
+        name: &std::ffi::OsStr,
+        reply: fuser015::ReplyEmpty,
     ) {
         // API call to delete file or directory
         unimplemented!()
     }
 }
 
-pub fn mount_fs(mountpoint: &str){
+pub fn mount_fs(mountpoint: &str) -> anyhow::Result<()> {
     let fs = RemoteFs;
-    fuser015::mount2(fs, mountpoint, &[] as &[fuser015::MountOption]).unwrap();
+    let options = &[
+        MountOption::AutoUnmount, 
+        MountOption::AllowOther
+    ];
+    fuser015::mount2(fs, mountpoint, options)?;
+    Ok(())
 }

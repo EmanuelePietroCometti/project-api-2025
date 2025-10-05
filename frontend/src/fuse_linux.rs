@@ -79,7 +79,12 @@ impl Filesystem for RemoteFs {
     }
 }
 
-pub fn mount_fs(mountpoint: &str) {
-    let mut fs = RemoteFs;
-    fuser016::mount2(fs, mountpoint, &[] as &[&OsStr]).unwrap();
+pub fn mount_fs(mountpoint: &str)-> anyhow::Result<()> {
+    let fs = RemoteFs;
+    let options = &[
+        MountOption::AutoUnmount, 
+        MountOption::AllowOther
+    ];
+    fuser015::mount2(fs, mountpoint, options)?;
+    Ok(())
 }
