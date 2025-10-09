@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow= "1"
 fuser015={package = "fuser", version = "0.15.1", optional = true}
 fuser016={package = "fuser", version = "0.16.0", optional = true}
 winfsp={ version = "0.12.0", optional = true }
 winfsp-sys = { version = "0.12.0+winfsp-2.1", optional = true }
-tokio= { version = "1.0", features = ["rt", "rt-multi-thread"] }
-anyhow = "1.0"
 widestring = "1.2.0"
 
 [features]
