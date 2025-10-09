@@ -2,6 +2,9 @@ use anyhow::{anyhow, Result};
 use reqwest::{Client, Body};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use std::path;
+use serde::Deserialize;
+use serde_json;
 
 #[derive(Clone)]
 pub struct FileApi {
@@ -92,4 +95,51 @@ impl FileApi {
             ))
         }
     }
+
+     pub async fn mkdir(&self, path: &str)-> Result<(),reqwest::Error>{
+
+        let res= self.client
+                .post(format!("{}/mkdir",self.base_url))
+                .query(&[("relPath",path)])
+                .send()
+                .await?;
+
+        Ok(())    
+    }
+
+
+    #[derive(Deserialize, Debug)]
+    pub struct DirectoryEntry{//struct in cui mettiamo i valori da stampare nel ls
+        name:String,
+        size: u64,
+        mtime: u64,//vediamo se mettere date
+        permission: String,
+    }
+
+
+    pub async fn ls(&self, path:&str)->Result<Vec<DirectoryEntry>,Box<dyn std::error::Error>>{
+
+       /*  let res= client
+                .get(format!("{}/list/{}", origin,path))
+                .send()
+                .await?
+                .json::<Vec<DirectoryEntry>>()
+                .await?;*/
+
+        let res = self.client
+            .get(format!("{}/list/{}", self.base_url, path))
+            .send()
+            .await?;
+
+        let text = res.text().await?;
+        println!("DEBUG risposta server: {}", text);
+
+        let parsed: Vec<DirectoryEntry> = serde_json::from_str(&text)?;
+        Ok(parsed)
+
+       // Ok(res)
+
+    }
+
+
 }

@@ -3,7 +3,6 @@ pub mod directoryapi {
     use std::path;
     use serde::Deserialize;
     use serde_json;
-
     use reqwest::Client;
     
 
