@@ -104,32 +104,56 @@ impl FileApi {
         }
     }
 
-     pub async fn mkdir(&self, path: &str)-> Result<(),reqwest::Error>{
+     pub async fn mkdir(&self, path: &str)-> Result<()>{
 
-        let res= self.client
+        let resp= self.client
                 .post(format!("{}/mkdir",self.base_url))
                 .query(&[("relPath",path)])
                 .send()
                 .await?;
 
-        Ok(())    
+        let status = resp.status();
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(anyhow!(
+                "mkdir failed: {} - {}",
+                status,
+                text
+            ))
+        }    
     }
 
 
 
-    pub async fn ls(&self, path:&str)->Result<Vec<DirectoryEntry>,reqwest::Error>{
+    pub async fn ls(&self, path:&str)->Result<Vec<DirectoryEntry>>{
 
 
-         let res= self.client
+         let resp= self.client
                 .get(format!("{}/list/{}", self.base_url, path))
                 .send()
-                .await?
-                .json::<Vec<DirectoryEntry>>()
                 .await?;
+                
      
-        println!("Response text: {:?}", res);
+        
+
        
-        Ok(res)
+        let status = resp.status();
+        if resp.status().is_success() {
+            let v= resp.json::<Vec<DirectoryEntry>>()
+                .await?;
+
+            println!("Response text: {:?}", v);
+            Ok(v)
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(anyhow!(
+                "ls failed: {} - {}",
+                status,
+                text
+            ))
+        }    
 
     }
 

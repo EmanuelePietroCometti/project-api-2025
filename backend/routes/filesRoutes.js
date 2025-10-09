@@ -77,6 +77,7 @@ router.put("/", async (req, res) => {
     writeStream.on("finish", async () => {
       const stats = await fs.promises.stat(filePathAbs);
 
+
       // Aggiorna o inserisci metadata nel DB
       await f.updateFile({
         path: relPath,
