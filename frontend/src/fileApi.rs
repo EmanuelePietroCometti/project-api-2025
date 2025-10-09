@@ -12,6 +12,14 @@ pub struct FileApi {
     client: Client,
 }
 
+ #[derive(Deserialize, Debug)]
+    pub struct DirectoryEntry{//struct in cui mettiamo i valori da stampare nel ls
+        name:String,
+        size: i64,
+        mtime: i64,
+        permissions: String,
+    }
+
 impl FileApi {
     pub fn new(base_url: &str) -> Self {
         FileApi {
@@ -108,36 +116,20 @@ impl FileApi {
     }
 
 
-    #[derive(Deserialize, Debug)]
-    pub struct DirectoryEntry{//struct in cui mettiamo i valori da stampare nel ls
-        name:String,
-        size: u64,
-        mtime: u64,//vediamo se mettere date
-        permission: String,
-    }
+
+    pub async fn ls(&self, path:&str)->Result<Vec<DirectoryEntry>,reqwest::Error>{
 
 
-    pub async fn ls(&self, path:&str)->Result<Vec<DirectoryEntry>,Box<dyn std::error::Error>>{
-
-       /*  let res= client
-                .get(format!("{}/list/{}", origin,path))
+         let res= self.client
+                .get(format!("{}/list/{}", self.base_url, path))
                 .send()
                 .await?
                 .json::<Vec<DirectoryEntry>>()
-                .await?;*/
-
-        let res = self.client
-            .get(format!("{}/list/{}", self.base_url, path))
-            .send()
-            .await?;
-
-        let text = res.text().await?;
-        println!("DEBUG risposta server: {}", text);
-
-        let parsed: Vec<DirectoryEntry> = serde_json::from_str(&text)?;
-        Ok(parsed)
-
-       // Ok(res)
+                .await?;
+     
+        println!("Response text: {:?}", res);
+       
+        Ok(res)
 
     }
 

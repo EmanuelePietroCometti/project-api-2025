@@ -50,7 +50,7 @@ router.put("/", async (req, res) => {
     const relPath = req.query.relPath;
     const filePathAbs = path.join(ROOT_DIR, relPath);
     const parentPathAbs = path.dirname(filePathAbs);
-    const parentPath = path.dirname(filePathAbs);
+    const parentPath = path.dirname(relPath);
     const name = path.basename(filePathAbs);
 
     console.log({
