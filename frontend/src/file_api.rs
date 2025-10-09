@@ -2,9 +2,7 @@ use anyhow::{anyhow, Result};
 use reqwest::{Client, Body};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use std::path;
 use serde::Deserialize;
-use serde_json;
 
 #[derive(Clone)]
 pub struct FileApi {
@@ -14,10 +12,10 @@ pub struct FileApi {
 
  #[derive(Deserialize, Debug)]
     pub struct DirectoryEntry{//struct in cui mettiamo i valori da stampare nel ls
-        name:String,
-        size: i64,
-        mtime: i64,
-        permissions: String,
+        pub name:String,
+        pub size: i64,
+        pub mtime: i64,
+        pub permissions: String,
     }
 
 impl FileApi {

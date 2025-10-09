@@ -1,6 +1,5 @@
 
 pub mod directoryapi {
-    use std::path;
     use serde::Deserialize;
     use serde_json;
     use reqwest::Client;
@@ -11,7 +10,7 @@ pub mod directoryapi {
         let origin= "http://localhost:3001";
         let client= Client::new();
 
-        let res= client
+        let _res= client
                 .post(format!("{}/mkdir",origin))
                 .query(&[("relPath",path)])
                 .send()
@@ -22,10 +21,10 @@ pub mod directoryapi {
 
     #[derive(Deserialize, Debug)]
     pub struct DirectoryEntry{//struct in cui mettiamo i valori da stampare nel ls
-        name:String,
-        size: u64,
-        mtime: u64,//vediamo se mettere date
-        permission: String,
+        _name:String,
+        _size: u64,
+        _mtime: u64,//vediamo se mettere date
+        _permission: String,
     }
     //#[tokio::main]
     //pub async fn ls(path:&str)->Result<Vec<DirectoryEntry>,reqwest::Error>{

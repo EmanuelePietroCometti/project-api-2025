@@ -252,6 +252,7 @@ dependencies = [
  "anyhow",
  "fuser 0.15.1",
  "fuser 0.16.0",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

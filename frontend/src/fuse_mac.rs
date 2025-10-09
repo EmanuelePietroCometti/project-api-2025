@@ -88,7 +88,7 @@ impl Filesystem for RemoteFs {
     }
 }
 
-pub fn mount_fs(mountpoint: &str) -> anyhow::Result<()> {
+pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
     let fs = RemoteFs;
     let options = &[
         MountOption::AutoUnmount, 
