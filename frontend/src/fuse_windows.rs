@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 use widestring::U16CStr;
-
+use std::time::Duration;
 use winfsp::filesystem::{DirMarker, FileSecurity, FileSystemContext, OpenFileInfo, FileInfo};
 use winfsp::host::{FileSystemHost, VolumeParams};
 
@@ -116,9 +116,11 @@ impl FileSystemContext for RemoteFs {
 
 pub fn mount_fs(mountpoint: &str) -> anyhow::Result<()> {
     let fs = RemoteFs::new();
-    let vparams = VolumeParams::default();
+    let mut vparams = VolumeParams::default();
+    vparams.sectors_per_allocation_unit(64); // Numero di settori per unità di allocazione
+    vparams.sector_size(4096); // Dimensione di settore (4096 bytes)
+    vparams.file_info_timeout(5); // Timeout per caching info file (in secondi);
     let mut host = FileSystemHost::new(vparams, fs)?;
-
     host.mount(mountpoint)?;
     host.start()?;
 
