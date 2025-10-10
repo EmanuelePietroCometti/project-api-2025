@@ -4,8 +4,9 @@ fn main() -> anyhow::Result<()> {
     let mountpoint = if cfg!(target_os = "windows") {
         r"Z:"
     } else {
-        "/mnt/remote-fs" 
+        "/home/emanuele-pietro-cometti/mnt/remote-fs" 
     };
-    let api = FileApi::new("http://localhost:3000");
-    crate::mount_fs(mountpoint, api)
+    let mp=mountpoint.to_string();
+    let api = FileApi::new("http://localhost:3001");
+    mount_fs(&mp, api)
 }

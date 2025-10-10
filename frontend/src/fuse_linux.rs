@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
+use nix::unistd::{Gid, Uid};
 use tokio::runtime::Runtime;
 
 use crate::file_api::{DirectoryEntry, FileApi};
@@ -222,18 +223,26 @@ impl Filesystem for RemoteFs {
             return;
         };
         let mut offset: i64 = 1;
-        let _ =reply.add(ino, offset, FileType::Directory, ".");
+        let _ = reply.add(ino, offset, FileType::Directory, ".");
         offset += 1;
-        let parent_ino = if dir == Path::new("/") { 1 } else { self.alloc_ino(dir.parent().unwrap_or(Path::new("/"))) };
-        let _=reply.add(parent_ino, offset, FileType::Directory, "..");
+        let parent_ino = if dir == Path::new("/") {
+            1
+        } else {
+            self.alloc_ino(dir.parent().unwrap_or(Path::new("/")))
+        };
+        let _ = reply.add(parent_ino, offset, FileType::Directory, "..");
         offset += 1;
         match self.dir_entries(&dir) {
             Ok(entries) => {
                 for (child, de) in entries {
                     let is_dir = Self::is_dir(&de.permissions);
-                    let ty = if is_dir { FileType::Directory } else { FileType::RegularFile };
+                    let ty = if is_dir {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
                     let child_ino = self.alloc_ino(&child);
-                    let _=reply.add(child_ino, offset, ty, child.file_name().unwrap());
+                    let _ = reply.add(child_ino, offset, ty, child.file_name().unwrap());
                     offset += 1;
                 }
                 reply.ok();
@@ -246,7 +255,15 @@ impl Filesystem for RemoteFs {
     // Senza questa funzione i dati non sarebbero aggiornati compromettendo il funzionamento di ls
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == 1 {
-            let attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755);
+            // Permette di definire gli attributi della root
+            // Servono per evitare di fare una chiamata API inutile
+            // La root è sempre una directory con permessi 755
+            // Sulla base di questi attributi il kernel decide se inoltrare o meno la chiamata API
+            let uid = Uid::current().as_raw();
+            let gid = Gid::current().as_raw();
+            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755);
+            attr.uid = uid;
+            attr.gid = gid;
             reply.attr(&TTL, &attr);
             return;
         }
@@ -344,7 +361,13 @@ impl Filesystem for RemoteFs {
             // Prepara file vuoto
             let _ = fs::remove_file(&tmp);
             let _ = OpenOptions::new().create(true).write(true).open(&tmp);
-            writes.insert(ino, TempWrite { tem_path: tmp, size: 0 });
+            writes.insert(
+                ino,
+                TempWrite {
+                    tem_path: tmp,
+                    size: 0,
+                },
+            );
         }
         let tw = writes.get_mut(&ino).unwrap();
         // Scrive in offset
@@ -505,10 +528,24 @@ impl Filesystem for RemoteFs {
 pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
     let fs = RemoteFs::new(api, rt);
+    let mp = mountpoint.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    ctrlc::set_handler({
+        let tx = tx.clone();
+        move || {
+            let _ = tx.send(());
+        }
+    })?;
     let options = vec![
-        MountOption::FSName("remote_fs".to_string()),
+        MountOption::FSName("remote_fs".into()),
         MountOption::DefaultPermissions,
     ];
-    fuser016::mount2(fs, mountpoint, &options)?;
+    let session = fuser016::spawn_mount2(fs, &mp, &options)?;
+    let _ = rx.recv();
+    let _ = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mp)
+        .status();
+    let _ = session.join();
     Ok(())
 }
