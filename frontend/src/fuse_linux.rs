@@ -1,9 +1,10 @@
 use anyhow::Result;
 use fuser016::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EACCES, EEXIST, ENOENT, ENOTDIR};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -13,7 +14,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
-use nix::unistd::{Gid, Uid};
 use tokio::runtime::Runtime;
 
 use crate::file_api::{DirectoryEntry, FileApi};
@@ -100,6 +100,8 @@ impl RemoteFs {
         let mtime_st = mtime
             .and_then(|sec| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sec as u64)))
             .unwrap_or(now);
+        let uid = unsafe { libc::getuid() } as u32;
+        let gid = unsafe { libc::getgid() } as u32;
         FileAttr {
             ino: self.alloc_ino(path),
             size,
@@ -111,8 +113,8 @@ impl RemoteFs {
             kind: ty,
             perm,
             nlink: 1,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
@@ -155,6 +157,7 @@ impl RemoteFs {
             } else {
                 PathBuf::from("/").join(&rel).join(&de.name)
             };
+            println!(" - Found entry: {:?}", child);
             out.push((child, de));
         }
         Ok(out)
@@ -162,6 +165,105 @@ impl RemoteFs {
 }
 
 impl Filesystem for RemoteFs {
+    // Funzione indispensabile per aggiornare correttmente gli attributi di un file
+    // Senza questa funzione non si ha modo di cambiare i permessi e il kernel fallisce (crea il file ma restituisce errore)
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let Some(path) = self.path_of(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let mut attr = if let Some(attr) = self.attr_cache.lock().unwrap().get(&path).cloned() {
+            attr
+        } else {
+            // Recupera gli attributi correnti
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            match self.dir_entries(parent) {
+                Ok(entries) => {
+                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
+                        let is_dir = Self::is_dir(&de.permissions);
+                        let ty = if is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        let perm = Self::parse_perm(&de.permissions, is_dir);
+                        let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+                        let attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
+                        self.attr_cache.lock().unwrap().insert(path.clone(), attr);
+                        attr
+                    } else {
+                        reply.error(ENOENT);
+                        return;
+                    }
+                }
+                Err(_) => {
+                    reply.error(ENOENT);
+                    return;
+                }
+            }
+        };
+        // Applica le modifiche richieste
+        if let Some(m) = _mtime {
+            let st = match m {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => SystemTime::now(),
+            };
+            attr.mtime = st;
+            attr.ctime = st;
+        }
+        if let Some(a) = _atime {
+            let st = match a {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => SystemTime::now(),
+            };
+            attr.atime = st;
+        }
+        if let Some(u) = uid {
+            attr.uid = u;
+        }
+        if let Some(g) = gid {
+            attr.gid = g;
+        }
+        if let Some(s) = size {
+            attr.size = s;
+            attr.blocks = (s + 511) / 512;
+        }
+        if let Some(f) = flags {
+            attr.flags = f;
+        }
+        // Aggiorna la cache
+        self.attr_cache
+            .lock()
+            .unwrap()
+            .insert(path.clone(), attr.clone());
+        // Risponde con i nuovi attributi
+        reply.attr(&TTL, &attr);
+    }
+    // Implementazione minima per far funzionare df
+    // Restituisce valori fittizi
+    // Non ha impatto sul funzionamento del filesystem
+    // Serve per far funzionare correttamente il comando df
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser016::ReplyStatfs) {
+        reply.statfs(0, 0, 0, 0, 0, 0, 0,0);
+    }
+
     // Permette di effettuare la ricerca di una directory per nome e ne resttiuisce il contenuto
     // Non invoca direttamente l'API ls ma lo fa richiamando la funzione dir_entries
     fn lookup(
@@ -199,9 +301,8 @@ impl Filesystem for RemoteFs {
                         .lock()
                         .unwrap()
                         .insert(path.to_path_buf(), attr);
-                    let attr_ref = self.attr_cache.lock().unwrap();
-                    let last = attr_ref.values().last().unwrap();
-                    reply.entry(&TTL, last, 0);
+                    let attr = self.attr_cache.lock().unwrap().get(&path).unwrap().clone();
+                    reply.entry(&TTL, &attr, 0);
                 } else {
                     reply.error(ENOENT);
                 }
@@ -228,9 +329,12 @@ impl Filesystem for RemoteFs {
         let parent_ino = if dir == Path::new("/") {
             1
         } else {
-            self.alloc_ino(dir.parent().unwrap_or(Path::new("/")))
+            dir.parent()
+                .and_then(|p| self.ino_by_path.lock().unwrap().get(p).cloned())
+                .unwrap_or(1)
         };
         let _ = reply.add(parent_ino, offset, FileType::Directory, "..");
+
         offset += 1;
         match self.dir_entries(&dir) {
             Ok(entries) => {
@@ -255,12 +359,8 @@ impl Filesystem for RemoteFs {
     // Senza questa funzione i dati non sarebbero aggiornati compromettendo il funzionamento di ls
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == 1 {
-            // Permette di definire gli attributi della root
-            // Servono per evitare di fare una chiamata API inutile
-            // La root è sempre una directory con permessi 755
-            // Sulla base di questi attributi il kernel decide se inoltrare o meno la chiamata API
-            let uid = Uid::current().as_raw();
-            let gid = Gid::current().as_raw();
+            let uid = unsafe { libc::getuid() } as u32;
+            let gid = unsafe { libc::getgid() } as u32;
             let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755);
             attr.uid = uid;
             attr.gid = gid;
@@ -293,44 +393,6 @@ impl Filesystem for RemoteFs {
                     reply.attr(&TTL, &attr);
                 } else {
                     reply.error(ENOENT);
-                }
-            }
-            Err(_) => reply.error(ENOENT),
-        }
-    }
-
-    // Precede sempre la scrittura e la lettura di un file
-    // Se viene dimenticata non si apre il file
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(ino, 0);
-    }
-
-    fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        let Some(path) = self.path_of(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let rel = Self::rel_of(&path);
-        // Dwonload contenuto file dal server
-        // Ottimizzazione con cache e lettura chunked
-        match self.rt.block_on(self.api.read_file(&rel)) {
-            Ok(bytes) => {
-                let start = offset.max(0) as usize;
-                let end = (start + size as usize).min(bytes.len());
-                if start >= bytes.len() {
-                    reply.data(&[]);
-                } else {
-                    reply.data(&bytes[start..end]);
                 }
             }
             Err(_) => reply.error(ENOENT),
@@ -444,8 +506,9 @@ impl Filesystem for RemoteFs {
         } else {
             parent_path.join(name)
         };
+        let ino = self.alloc_ino(&path);
         let mut tmp = std::env::temp_dir();
-        tmp.push(format!("remote_fs_create_{:x}.part", self.alloc_ino(&path)));
+        tmp.push(format!("remote_fs_create_{:x}.part", ino));
         let _ = fs::remove_file(&tmp);
         let _ = fs::File::create(&tmp);
         let rel = Self::rel_of(&path);
@@ -455,9 +518,12 @@ impl Filesystem for RemoteFs {
         {
             Ok(_) => {
                 let attr = self.file_attr(&path, FileType::RegularFile, 0, None, 0o644);
-                self.attr_cache.lock().unwrap().insert(path.clone(), attr);
+                self.attr_cache
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), attr.clone());
                 let attr = self.attr_cache.lock().unwrap().get(&path).unwrap().clone();
-                reply.created(&TTL, &attr, 0, self.alloc_ino(&path), 0);
+                reply.created(&TTL, &attr, 0, ino, 0);
                 let _ = fs::remove_file(&tmp);
             }
             Err(_) => {
@@ -529,23 +595,35 @@ pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
     let fs = RemoteFs::new(api, rt);
     let mp = mountpoint.to_string();
+    let shutting_down = Arc::new(AtomicBool::new(false)); // Flag atomico per evitare di chiamare più volte lo smontaggio
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    ctrlc::set_handler({
+    {
         let tx = tx.clone();
-        move || {
-            let _ = tx.send(());
-        }
-    })?;
+        let shutting_down = shutting_down.clone();
+        ctrlc::set_handler(move || {
+            if !shutting_down.swap(true, Ordering::SeqCst) {
+                let _ = tx.send(());
+            }
+        })?;
+    }
     let options = vec![
         MountOption::FSName("remote_fs".into()),
         MountOption::DefaultPermissions,
     ];
     let session = fuser016::spawn_mount2(fs, &mp, &options)?;
     let _ = rx.recv();
-    let _ = std::process::Command::new("fusermount3")
+    let ok = std::process::Command::new("fusermount3")
         .arg("-u")
         .arg(&mp)
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        let _ = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&mp)
+            .status();
+    }
     let _ = session.join();
     Ok(())
 }
