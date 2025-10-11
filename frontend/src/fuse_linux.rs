@@ -147,19 +147,22 @@ impl RemoteFs {
 
     // Funzione che definisce i le entries di una directory
     // Qua dentro avviene la chiamata all'API ls
-    fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
-        let rel = Self::rel_of(dir);
+    pub fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
+        let mut rel = Self::rel_of(dir);
         let list = self.rt.block_on(self.api.ls(&rel))?;
         let mut out = Vec::with_capacity(list.len());
+
         for de in list {
-            let child = if rel.is_empty() {
-                PathBuf::from("/").join(&de.name)
-            } else {
-                PathBuf::from("/").join(&rel).join(&de.name)
-            };
-            println!(" - Found entry: {:?}", child);
+            let mut child = PathBuf::from("/");
+            if !rel.is_empty() {
+                child.push(&rel);
+            }
+            child.push(&de.name);
+
+            println!("Found entry: {:?}", child);
             out.push((child, de));
         }
+
         Ok(out)
     }
 }
@@ -261,7 +264,7 @@ impl Filesystem for RemoteFs {
     // Non ha impatto sul funzionamento del filesystem
     // Serve per far funzionare correttamente il comando df
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser016::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 0, 0,0);
+        reply.statfs(0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     // Permette di effettuare la ricerca di una directory per nome e ne resttiuisce il contenuto
