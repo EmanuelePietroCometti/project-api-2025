@@ -1,3 +1,4 @@
+use crate::file_api::FileApi;
 use fuser015::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
