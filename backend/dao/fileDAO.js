@@ -4,7 +4,6 @@ import p from "path";
 export default function FileDAO() {
     this.getFilesByDirectory = (parent) => {
         return new Promise((resolve, reject) => {
-            console.log("parent in getFilesByDirectory: ", parent);
             const query = 'SELECT * FROM files WHERE parent=?';
             db.all(query, [parent], (err, rows) => {
                 if (err) {

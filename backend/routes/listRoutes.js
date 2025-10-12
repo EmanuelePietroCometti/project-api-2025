@@ -9,7 +9,10 @@ const file=new FileDAO();
 router.get('/', async(req, res) =>{
     try{
         const relPath= req.query.relPath;
-        const dirname = path.dirname(relPath);
+        let dirname = path.basename(relPath);
+        if (dirname === ''){
+            dirname='.';
+        }
         // console.log("Listing directory:", dirname);
         const files = await file.getFilesByDirectory(dirname);
         res.json(files);

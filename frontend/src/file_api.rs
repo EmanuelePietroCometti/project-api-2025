@@ -17,6 +17,8 @@ pub struct DirectoryEntry {
     pub size: i64,
     pub mtime: i64,
     pub permissions: String,
+    pub is_dir: i64,
+    pub version: i64,
 }
 
 impl FileApi {
