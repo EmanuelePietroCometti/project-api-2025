@@ -19,7 +19,7 @@ router.post("/", async (req, res) => {
     const relPath = req.query.relPath;
     const dirPath = path.join(ROOT_DIR, relPath);
     const parentPathAbs = path.dirname(dirPath);
-    const parentDirName = path.basename(relPath);
+    const parentDirName = path.dirname(relPath);
     const name = path.basename(dirPath);
     // Controlla se la directory padre esiste
     if (!fs.existsSync(parentPathAbs) && parentPathAbs !== ROOT_DIR) {

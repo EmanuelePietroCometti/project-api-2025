@@ -10,7 +10,7 @@ pub struct FileApi {
     client: Client,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
     //struct in cui mettiamo i valori da stampare nel ls
     pub name: String,
@@ -123,12 +123,11 @@ impl FileApi {
         let status = resp.status();
         if resp.status().is_success() {
             let v = resp.json::<Vec<DirectoryEntry>>().await?;
-
-            println!("Response text: {:?}", v);
+            // println!("Response text: {:?}", v);
             Ok(v)
         } else {
             let text = resp.text().await.unwrap_or_default();
-            println!("Error response text: {}", text);
+            // println!("Error response text: {}", text);
             Err(anyhow!("ls failed: {} - {}", status, text))
         }
     }
