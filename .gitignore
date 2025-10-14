@@ -1,1 +1,22 @@
-/target
+#/target
+# Node.js / npm
+node_modules/
+npm-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Rust / Cargo
+target/
+Cargo.lock
+
+# Files generati da editor/IDE comuni
+*.swp
+*.swo
+.idea/
+.vscode/
+*.log
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

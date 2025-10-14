@@ -1,4 +1,5 @@
  use std::ffi::c_void;
+use std::path::PathBuf;
 use widestring::U16CStr;
 use std::time::Duration;
 use winfsp::filesystem::{DirMarker, FileSecurity, FileSystemContext, OpenFileInfo, FileInfo};
@@ -6,7 +7,10 @@ use winfsp::host::{FileSystemHost, VolumeParams};
 
 use winfsp::FspError;
 
-pub struct MyFileContext;
+pub struct MyFileContext {
+    pub ino: u64,
+    pub temp_write: Option<TempWrite>, // Some se stiamo scrivendo, None se solo lettura
+}
 
 use crate::file_api::{DirectoryEntry, FileApi};
 const TTL: Duration = Duration::from_secs(1);
@@ -171,36 +175,93 @@ impl FileSystemContext for RemoteFs {
         unimplemented!()
     }
 
+    const FILE_WRITE_DATA: u32 = 0x0002;
+
     fn open(
         &self,
-        _path: &U16CStr,
+        path: &U16CStr,
         _create_options: u32,
-        _granted_access: u32,
+        granted_access: u32,
         _file_info: &mut OpenFileInfo,
     ) -> Result<Self::FileContext, FspError> {
-        // Operazione chiamata quando un file viene aperto.
-        // Potrai verificare se esiste il file chiamando:
-        // await self.api_read_file(path)
-        // o semplicemente restituire un contesto vuoto.
-        Ok(MyFileContext)
+        let path = self.path_from_u16(path);
+        let ino = self.alloc_ino(&path);
+
+        // Se abbiamo accesso in scrittura, creiamo un TempWrite
+        let temp_write = if granted_access & Self::FILE_WRITE_DATA != 0 {
+            let temp_path = self.get_temporary_path(ino);
+
+            if !temp_path.exists() {
+                std::fs::File::create(&temp_path)
+                    .map_err(|_| FspError::from_win32())?;
+            }
+
+            let tw = TempWrite {
+                tem_path: temp_path.clone(),
+                size: 0,
+            };
+
+            // Inseriamo nella mappa writes
+            self.writes.lock().unwrap().insert(ino, tw.clone());
+            Some(tw)
+        } else {
+            None
+        };
+
+        Ok(MyFileContext { ino, temp_write })
     }
 
-    fn close(&self, _file_context: Self::FileContext) {
-        // Chiusura file. Normalmente non serve fare nulla.
+    fn close(&self, file_context: Self::FileContext) {
+        let temp_write = match file_context.temp_write {
+            Some(tw) => tw,
+            None => return,
+        };
+
+        let rel_path = Self::rel_of(&self.path_of(file_context.ino).unwrap());
+
+        // Commit sul backend
+        if let Err(e) = self.rt.block_on(
+            self.api.write_file(&rel_path, &temp_write.tem_path.to_string_lossy())// la faccio qua la chiamata API vera e propria della write andando a scrivere il / i file temporanei creati
+        ) {
+            eprintln!("Errore commit file {}: {:?}", rel_path, e);
+        }
+
+        // Rimuovi file temporaneo
+        let _ = std::fs::remove_file(&temp_write.tem_path);
+
+        // Rimuovi dalla mappa writes
+        self.writes.lock().unwrap().remove(&file_context.ino);
     }
 
     fn read(
         &self,
-        _file_context: &Self::FileContext,
-        _buffer: &mut [u8],
-        _offset: u64,
+        file_context: &Self::FileContext,
+        buffer: &mut [u8],
+        offset: u64,
     ) -> Result<u32, FspError> {
-        // Quando un'applicazione legge un file locale:
-        // -> effettua una GET /files/<path> al backend
-        // -> copia i byte nel buffer locale
-        // TODO: inserire codice asincrono per leggere i dati
-        unimplemented!()
+        let path = self.path_of(file_context.ino)
+            .ok_or(FspError::from_win32())?;
+        let rel_path = Self::rel_of(&path);
+
+        // Leggi dal temp file se il file è aperto in scrittura
+        let data = if let Some(tw) = &file_context.temp_write {
+            std::fs::read(&tw.tem_path).map_err(|_| FspError::from_win32())?
+        } else {
+            self.rt.block_on(self.api.read_file(&rel_path))
+                .map_err(|_| FspError::from_win32())?
+        };
+
+        let start = offset as usize;
+        if start >= data.len() {
+            return Ok(0);
+        }
+        let end = std::cmp::min(start + buffer.len(), data.len());
+        let bytes_to_copy = &data[start..end];
+        buffer[..bytes_to_copy.len()].copy_from_slice(bytes_to_copy);
+
+        Ok(bytes_to_copy.len() as u32)
     }
+    
 
     fn write(
         &self,
@@ -214,7 +275,22 @@ impl FileSystemContext for RemoteFs {
         // Quando un file viene scritto:
         // -> invia i byte al backend tramite PUT /files/<path>
         // TODO: inserire codice asincrono per scrittura remota
-        unimplemented!()
+        let tw = match &file_context.temp_write {
+            Some(tw) => tw,
+            None => return Err(FspError::from_win32()), // file opened read-only
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tw.tem_path)
+            .map_err(|_| FspError::from_win32())?;
+
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|_| FspError::from_win32())?;
+        file.write_all(buffer)
+            .map_err(|_| FspError::from_win32())?;
+
+        Ok(buffer.len() as u32)
     }
 
     fn read_directory(
@@ -250,6 +326,7 @@ impl FileSystemContext for RemoteFs {
         unimplemented!()
     }
 }
+
 
 pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
     let fs = RemoteFs::new();
