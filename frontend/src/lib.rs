@@ -1,20 +1,4 @@
-pub mod fs;
 pub mod file_api;
-
-#[cfg(test)]
-mod tests {
-    use super::fs::directoryapi;
-
-    #[tokio::test]
-    async fn test_mkdir_and_ls() {
-        let path = "test_rust_api";
-        directoryapi::mkdir(path).await.unwrap();
-        println!("directory creata con successo");
-
-        let entries = directoryapi::ls(path).await.unwrap();
-        println!("Entries: {:?}", entries);
-    }
-}
 #[cfg(all(target_os = "linux", feature = "linux"))]
 mod fuse_linux;
 #[cfg(all(target_os = "linux", feature = "linux"))]

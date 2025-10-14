@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
-use reqwest::{Client, Body};
+use anyhow::{Result, anyhow};
+use reqwest::{Body, Client};
+use serde::Deserialize;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use serde::Deserialize;
 
 #[derive(Clone)]
 pub struct FileApi {
@@ -10,13 +10,16 @@ pub struct FileApi {
     client: Client,
 }
 
- #[derive(Deserialize, Debug)]
-    pub struct DirectoryEntry{//struct in cui mettiamo i valori da stampare nel ls
-        pub name:String,
-        pub size: i64,
-        pub mtime: i64,
-        pub permissions: String,
-    }
+#[derive(Deserialize, Debug, Clone)]
+pub struct DirectoryEntry {
+    //struct in cui mettiamo i valori da stampare nel ls
+    pub name: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub permissions: String,
+    pub is_dir: i64,
+    pub version: i64,
+}
 
 impl FileApi {
     pub fn new(base_url: &str) -> Self {
@@ -30,21 +33,18 @@ impl FileApi {
     pub async fn read_file(&self, rel_path: &str) -> Result<Vec<u8>> {
         let url = format!("{}/files", self.base_url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .query(&[("relPath", rel_path)])
             .send()
             .await?;
 
         let status = resp.status();
-            
+
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "read_file failed: {} - {}",
-                status,
-                text
-            ));
+            return Err(anyhow!("read_file failed: {} - {}", status, text));
         }
 
         let bytes = resp.bytes().await?;
@@ -59,7 +59,8 @@ impl FileApi {
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
 
-        let resp = self.client
+        let resp = self
+            .client
             .put(&url)
             .query(&[("relPath", rel_path)])
             .body(Body::from(buffer))
@@ -71,11 +72,7 @@ impl FileApi {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "write_file failed: {} - {}",
-                status,
-                text
-            ))
+            Err(anyhow!("write_file failed: {} - {}", status, text))
         }
     }
 
@@ -83,7 +80,8 @@ impl FileApi {
     pub async fn delete(&self, rel_path: &str) -> Result<()> {
         let url = format!("{}/files", self.base_url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .delete(&url)
             .query(&[("relPath", rel_path)])
             .send()
@@ -94,66 +92,45 @@ impl FileApi {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "delete failed: {} - {}",
-                status,
-                text
-            ))
+            Err(anyhow!("delete failed: {} - {}", status, text))
         }
     }
 
-     pub async fn mkdir(&self, path: &str)-> Result<()>{
-
-        let resp= self.client
-                .post(format!("{}/mkdir",self.base_url))
-                .query(&[("relPath",path)])
-                .send()
-                .await?;
+    pub async fn mkdir(&self, path: &str) -> Result<()> {
+        let resp = self
+            .client
+            .post(format!("{}/mkdir", self.base_url))
+            .query(&[("relPath", path)])
+            .send()
+            .await?;
 
         let status = resp.status();
         if resp.status().is_success() {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "mkdir failed: {} - {}",
-                status,
-                text
-            ))
-        }    
+            Err(anyhow!("mkdir failed: {} - {}", status, text))
+        }
     }
 
+    pub async fn ls(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
 
+        let resp = self
+            .client
+            .get(format!("{}/list", self.base_url))
+            .query(&[("relPath", path)])
+            .send()
+            .await?;
 
-    pub async fn ls(&self, path:&str)->Result<Vec<DirectoryEntry>>{
-
-
-         let resp= self.client
-                .get(format!("{}/list/{}", self.base_url, path))
-                .send()
-                .await?;
-                
-     
-        
-
-       
         let status = resp.status();
         if resp.status().is_success() {
-            let v= resp.json::<Vec<DirectoryEntry>>()
-                .await?;
-
-            println!("Response text: {:?}", v);
+            let v = resp.json::<Vec<DirectoryEntry>>().await?;
+            // println!("Response text: {:?}", v);
             Ok(v)
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!(
-                "ls failed: {} - {}",
-                status,
-                text
-            ))
-        }    
-
+            // println!("Error response text: {}", text);
+            Err(anyhow!("ls failed: {} - {}", status, text))
+        }
     }
-
-
 }
