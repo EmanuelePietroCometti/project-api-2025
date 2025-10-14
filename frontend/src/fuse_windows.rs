@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+ use std::ffi::c_void;
 use widestring::U16CStr;
 use std::time::Duration;
 use winfsp::filesystem::{DirMarker, FileSecurity, FileSystemContext, OpenFileInfo, FileInfo};
@@ -8,17 +8,154 @@ use winfsp::FspError;
 
 pub struct MyFileContext;
 
-#[derive(Clone)]
-pub struct RemoteFs;
+use crate::file_api::{DirectoryEntry, FileApi};
+const TTL: Duration = Duration::from_secs(1);
+
+struct TempWrite {
+    tem_path: PathBuf,
+    size: u64,
+}
+struct RemoteFs {
+    api: FileApi,
+    rt: Arc<Runtime>,
+    // path <-> ino
+    ino_by_path: Mutex<HashMap<PathBuf, u64>>,
+    path_by_ino: Mutex<HashMap<u64, PathBuf>>,
+    // cache attributi
+    attr_cache: Mutex<HashMap<PathBuf, FileAttr>>,
+    // gestione scritture temporanee per file aperti
+    writes: Mutex<HashMap<u64, TempWrite>>,
+    next_ino: Mutex<u64>,
+}
+
 impl RemoteFs {
-    pub fn new() -> Self {
-        RemoteFs
+    // Funzione che instanzia una nuova struct RemoteFs
+    fn new(api: FileApi, rt: Arc<Runtime>) -> Self {
+        let mut ino_by_path = HashMap::new();
+        let mut path_by_ino = HashMap::new();
+        ino_by_path.insert(PathBuf::from("/"), 1);
+        path_by_ino.insert(1, PathBuf::from("/"));
+        Self {
+            api,
+            rt,
+            ino_by_path: Mutex::new(ino_by_path),
+            path_by_ino: Mutex::new(path_by_ino),
+            attr_cache: Mutex::new(HashMap::new()),
+            writes: Mutex::new(HashMap::new()),
+            next_ino: Mutex::new(2),
+        }
     }
-    pub fn delete(&self, path: &U16CStr) -> Result<(), FspError> {
-        // DELETE /files/<path>
-        Ok(())
+    // Funzione che alloca l'inode
+    fn alloc_ino(&self, path: &Path) -> u64 {
+        if let Some(ino) = self.ino_by_path.lock().unwrap().get(path).cloned() {
+            return ino;
+        }
+        let mut next_ino = self.next_ino.lock().unwrap();
+        let ino = *next_ino;
+        *next_ino += 1;
+        self.ino_by_path
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), ino);
+        self.path_by_ino
+            .lock()
+            .unwrap()
+            .insert(ino, path.to_path_buf());
+        ino
+    }
+
+    // Funzione che recupera il path dall'inode
+    fn path_of(&self, ino: u64) -> Option<PathBuf> {
+        self.path_by_ino.lock().unwrap().get(&ino).cloned()
+    }
+
+    // Funzione che estre il path relativo
+    fn rel_of(path: &Path) -> String {
+        let s = path.to_string_lossy();
+        if s == "/" {
+            "".to_string()
+        } else {
+            s.trim_start_matches('/').to_string()
+        }
+    }
+
+    // Funzione che si occupa di estrapolare i permessi del file
+    fn file_attr(
+        &self,
+        path: &Path,
+        ty: FileType,
+        size: u64,
+        mtime: Option<i64>,
+        perm: u16,
+    ) -> FileAttr {
+        let now = SystemTime::now();
+        let mtime_st = mtime
+            .and_then(|sec| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sec as u64)))
+            .unwrap_or(now);
+        let uid = unsafe { libc::getuid() } as u32;
+        let gid = unsafe { libc::getgid() } as u32;
+        FileAttr {
+            ino: self.alloc_ino(path),
+            size,
+            blocks: (size + 511) / 512,
+            atime: mtime_st,
+            mtime: mtime_st,
+            ctime: mtime_st,
+            crtime: mtime_st,
+            kind: ty,
+            perm,
+            nlink: 1,
+            uid,
+            gid,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+
+    // Funzione che si occupa di trasformare i permessi in formato ottale
+    fn parse_perm(permissions: &str, is_dir: bool) -> u16 {
+        // Permessi stile "drwxr-xr-x" o "-rw-r--r--"
+        // Posizioni 1..=9 map a rwx rwx rwx
+        let s = permissions.as_bytes();
+        let b = |i| {
+            if i < s.len() && s[i] as char != '-' {
+                1
+            } else {
+                0
+            }
+        };
+        let u = (b(1) * 4 + b(2) * 2 + b(3)) as u16;
+        let g = (b(4) * 4 + b(5) * 2 + b(6)) as u16;
+        let o = (b(7) * 4 + b(8) * 2 + b(9)) as u16;
+        let base = ((u << 6) | (g << 3) | o) as u16;
+        if is_dir { base | 0o111 } else { base }
+    }
+
+    // Funzione che verifica se una i permessi passati corrispondono a quelli di una direcotory
+    fn is_dir(permissions: &str) -> bool {
+        permissions.chars().next().unwrap_or('-') == 'd'
+    }
+
+    // Funzione che definisce i le entries di una directory
+    // Qua dentro avviene la chiamata all'API ls
+    fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
+        let rel = Self::rel_of(dir);
+        let list = self.rt.block_on(self.api.ls(&rel))?;
+        let mut out = Vec::with_capacity(list.len());
+        for de in list {
+            let child = if rel.is_empty() {
+                PathBuf::from("/").join(&de.name)
+            } else {
+                PathBuf::from("/").join(&rel).join(&de.name)
+            };
+            println!(" - Found entry: {:?}", child);
+            out.push((child, de));
+        }
+        Ok(out)
     }
 }
+
 
 impl FileSystemContext for RemoteFs {
     type FileContext = MyFileContext;
