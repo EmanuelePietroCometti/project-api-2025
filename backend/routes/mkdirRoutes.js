@@ -21,14 +21,6 @@ router.post("/", async (req, res) => {
     const parentPathAbs = path.dirname(dirPath);
     const parentDirName = path.dirname(relPath);
     const name = path.basename(dirPath);
-    /*console.log({
-      dirPath,
-      relPath,
-      parentPathAbs,
-      name,
-      parentDirName,
-      ROOT_DIR,
-    });*/
     // Controlla se la directory padre esiste
     if (!fs.existsSync(parentPathAbs) && parentPathAbs !== ROOT_DIR) {
       return res.status(400).json({ error: "Parent directory not found" });
@@ -45,7 +37,15 @@ router.post("/", async (req, res) => {
     // Crea la directory fisica
     await fs.promises.mkdir(dirPath);
     
-
+    
+    console.log({
+      dirPath,
+      relPath,
+      parentPathAbs,
+      name,
+      parentDirName,
+      ROOT_DIR,
+    });
     // Inserisci nel DB i metadata
     await f.createDirectory({
       path: relPath,

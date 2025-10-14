@@ -53,13 +53,13 @@ router.put("/", async (req, res) => {
     const parentPath = path.dirname(relPath);
     const name = path.basename(filePathAbs);
 
-    console.log({
+    /* console.log({
       relPath,
       filePathAbs,
       parentPathAbs,
       name,
       ROOT_DIR,
-    });
+    }); */
 
     // Controlla che la directory padre esista
     if (!fs.existsSync(parentPathAbs)) {
