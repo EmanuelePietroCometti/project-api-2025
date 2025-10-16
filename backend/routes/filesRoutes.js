@@ -105,33 +105,89 @@ router.put("/", async (req, res) => {
 // DELETE /files/path
 router.delete("/", async (req, res) => {
   try {
-    try {
-      const relPath = req.query.relPath;
-      const filePathAbs = path.join(ROOT_DIR, relPath);
+    const relPath = req.query.relPath;
+    const filePathAbs = path.join(ROOT_DIR, relPath);
 
-      // Controlla se esiste
-      const stats = await fs.promises.stat(filePathAbs).catch(() => null);
-      if (!stats) {
-        return res.status(404).json({ error: "File or directory not found" });
-      }
-
-      // Cancella fisicamente dal filesystem
-      if (stats.isDirectory()) {
-        await fs.promises.rm(filePathAbs, { recursive: true, force: true });
-      } else {
-        await fs.promises.unlink(filePathAbs);
-      }
-
-      // Cancella i metadata dal DB (ON DELETE CASCADE gestisce eventuali figli)
-      await f.deleteFile(relPath);
-
-      res.status(200).json({ message: "Deletion completed" });
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+    // Controlla se esiste
+    const stats = await fs.promises.stat(filePathAbs).catch(() => null);
+    if (!stats) {
+      return res.status(404).json({ error: "File or directory not found" });
     }
+
+    // Cancella fisicamente dal filesystem
+    if (stats.isDirectory()) {
+      await fs.promises.rm(filePathAbs, { recursive: true, force: true });
+    } else {
+      await fs.promises.unlink(filePathAbs);
+    }
+
+    // Cancella i metadata dal DB (ON DELETE CASCADE gestisce eventuali figli)
+    await f.deleteFile(relPath);
+    res.status(200).json({ message: "Deletion completed" });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// PATCH /files/chmod?relPath=...&perm=755
+router.patch("/chmod", async (req, res) => {
+  try {
+    const relPath = req.query.relPath;
+    const perm = req.query.perm; // stringa ottale, es. "644"
+    const filePathAbs = path.join(ROOT_DIR, relPath); // FIX: era undefined
+    await fs.promises.chmod(filePathAbs, parseInt(perm, 8));
+    await f.updatePermissions(relPath, perm);
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "chmod failed" });
+  }
+});
+
+// PATCH /files/truncate?relPath=...&size=123
+router.patch("/truncate", async (req, res) => {
+  try {
+    const relPath = req.query.relPath;
+    const size = parseInt(req.query.size, 10);
+    const filePathAbs = path.join(ROOT_DIR, relPath);
+    await fs.promises.truncate(filePathAbs, size);
+    const stats = await fs.promises.stat(filePathAbs);
+    await f.updateFile({
+      path: relPath,
+      name: path.basename(filePathAbs),
+      parent: path.dirname(relPath),
+      is_dir: false,
+      size: stats.size,
+      mtime: Math.floor(stats.mtimeMs / 1000),
+      permissions: undefined, // non toccare qui
+    });
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "truncate failed" });
+  }
+});
+
+// PATCH /files/utimes?relPath=...&atime=...&mtime=...
+router.patch("/utimes", async (req, res) => {
+  try {
+    const relPath = req.query.relPath;
+    const at = req.query.atime ? parseInt(req.query.atime, 10) : null; 
+    const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null; 
+    const filePathAbs = path.join(ROOT_DIR, relPath);
+
+    // Se mancano, usa stat per tenere l'altro inalterato
+    const stats = await fs.promises.stat(filePathAbs);
+    const atime = at ? new Date(at * 1000) : stats.atime;
+    const mtime = mt ? new Date(mt * 1000) : stats.mtime;
+    await fs.promises.utimes(filePathAbs, atime, mtime);
+    const stats2 = await fs.promises.stat(filePathAbs);
+    await f.updateMtime(relPath, Math.floor(stats2.mtimeMs / 1000));
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "utimes failed" });
   }
 });
 
