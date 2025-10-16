@@ -273,7 +273,7 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> Result<u32, FspError> {
         // Quando un file viene scritto:
-        // -> invia i byte al backend tramite PUT /files/<path>
+        // -> invia i byte al backend tramite PUT /files/<path>, ma lo fa solo quando il file viene chiuso
         // TODO: inserire codice asincrono per scrittura remota
         let tw = match &file_context.temp_write {
             Some(tw) => tw,
@@ -301,10 +301,30 @@ impl FileSystemContext for RemoteFs {
         _buffer: &mut [u8],
     ) -> Result<u32, FspError> {
         // Quando viene fatto "dir" o "ls":
-        // -> chiama GET /list/<path> dal backend
+        // lo usiamo come wrapper della funzione interna del file system dir_entries la quale chiama effettivamente da backend la ls
         // -> per ogni entry restituita, aggiungi a `marker.add_file(name, attributes)`
-        // TODO: chiamare self.api_list_directory() appena async disponibile
-        unimplemented!()
+       
+        let dir_path = self.path_of(_file_context.ino)
+                        .ok_or(FspError::from_win32())?;
+        
+        let entries = self.dir_entries(&dir_path)?;
+        
+        //trovi il punto in cui si era fermato il marker
+        for (path, file_entry) in entries.into_iter().skip_while(|(p, _)| {
+           // skip finché il path è <= marker
+            marker.file_name().map_or(false, |name| {
+                name.to_string_lossy() >= p.file_name().unwrap().to_string_lossy()
+            })
+        }) {
+            // aggiungi la entry al marker (buffer)
+            if !marker.add_file(&file_entry.name, file_entry.attr) {
+                break; // buffer pieno, esci dal ciclo
+            }
+        }
+
+        Ok(marker.bytes_written() as u32)
+    
+
     }
 
     fn create(
@@ -323,9 +343,39 @@ impl FileSystemContext for RemoteFs {
         // -> se è dir: POST /mkdir/<path>
         // -> se è file: PUT /files/<path> con body vuoto
         // TODO: chiamare self.api_create_directory() o self.api_write_file()
-        unimplemented!()
+        let path_str = self.path_from_u16(path);
+        let is_dir = (create_options & winfsp::filesystem::CREATE_DIRECTORY) != 0;
+
+        // Creazione fisica nel backend remoto directoryi se il bit era a 1 se no file
+        if is_dir {
+           
+            self.rt.block_on(self.api.create_directory(&path_str))
+                .map_err(|_| FspError::from_win32())?;
+        } else {
+            self.rt.block_on(self.api.write_file(&path_str, ""))
+                .map_err(|_| FspError::from_win32())?;
+        }
+
+        file_info.basic.file_attributes = if is_dir {
+            winfsp::filesystem::FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            0
+        };
+        file_info.basic.file_size = 0;
+
+        // Apri il file creato se è un file e se concessi permessi di scrittura
+        if !is_dir && (granted_access & Self::FILE_WRITE_DATA != 0) {
+            // Riuso la funzione open che crea il contesto corretto e TempWrite
+            return self.open(path, create_options, granted_access, file_info);
+        }
+
+        // Per directory o file senza scrittura, ritorna contesto semplice
+        let ino = self.alloc_ino(Path::new(&path_str));
+        Ok(MyFileContext { ino, temp_write: None })
     }
+
 }
+
 
 
 pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
