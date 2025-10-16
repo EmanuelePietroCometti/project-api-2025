@@ -38,14 +38,14 @@ router.post("/", async (req, res) => {
     await fs.promises.mkdir(dirPath);
     
     
-    console.log({
+    /*console.log({
       dirPath,
       relPath,
       parentPathAbs,
       name,
       parentDirName,
       ROOT_DIR,
-    });
+    });*/
     // Inserisci nel DB i metadata
     await f.createDirectory({
       path: relPath,
