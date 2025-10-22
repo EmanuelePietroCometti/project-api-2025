@@ -1,11 +1,17 @@
- use std::ffi::c_void;
-use std::path::PathBuf;
+use std::ffi::c_void;
+use std::io::{self, Read, Seek, Write};
+use std::path::{PathBuf, Path};
 use widestring::U16CStr;
 use std::time::Duration;
 use winfsp::filesystem::{DirMarker, FileSecurity, FileSystemContext, OpenFileInfo, FileInfo};
 use winfsp::host::{FileSystemHost, VolumeParams};
+use std::sync::{Mutex, Arc};
+use tokio::runtime::Runtime;
+use std::collections::HashMap;
+use std::fs::FileType;
+use std::time::SystemTime;
 
-use winfsp::FspError;
+use winfsp::{FspError, Result as WinFspResult};
 
 pub struct MyFileContext {
     pub ino: u64,
@@ -15,10 +21,34 @@ pub struct MyFileContext {
 use crate::file_api::{DirectoryEntry, FileApi};
 const TTL: Duration = Duration::from_secs(1);
 
+#[derive(Clone)]
 struct TempWrite {
     tem_path: PathBuf,
     size: u64,
 }
+
+// Definisco un FileAttr locale (simile a fuse::FileAttr). 
+// Lo usi per cache degli attributi; adattalo se vuoi campi diversi.
+#[derive(Clone, Debug)]
+struct FileAttr {
+    ino: u64,
+    size: u64,
+    blocks: u64,
+    atime: SystemTime,
+    mtime: SystemTime,
+    ctime: SystemTime,
+    crtime: SystemTime,
+    // per semplicità uso FileType come "kind"
+    kind: FileType,
+    perm: u16,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u32,
+    blksize: u32,
+    flags: u32,
+}
+
 struct RemoteFs {
     api: FileApi,
     rt: Arc<Runtime>,
@@ -31,6 +61,11 @@ struct RemoteFs {
     writes: Mutex<HashMap<u64, TempWrite>>,
     next_ino: Mutex<u64>,
 }
+
+// Costanti WinAPI che non sempre sono re-esportate dal crate
+const FILE_WRITE_DATA: u32 = 0x0002;
+const CREATE_DIRECTORY: u32 = 0x00000001;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
 
 impl RemoteFs {
     // Funzione che instanzia una nuova struct RemoteFs
@@ -49,6 +84,7 @@ impl RemoteFs {
             next_ino: Mutex::new(2),
         }
     }
+
     // Funzione che alloca l'inode
     fn alloc_ino(&self, path: &Path) -> u64 {
         if let Some(ino) = self.ino_by_path.lock().unwrap().get(path).cloned() {
@@ -73,7 +109,7 @@ impl RemoteFs {
         self.path_by_ino.lock().unwrap().get(&ino).cloned()
     }
 
-    // Funzione che estre il path relativo
+    // Funzione che estrae il path relativo
     fn rel_of(path: &Path) -> String {
         let s = path.to_string_lossy();
         if s == "/" {
@@ -96,8 +132,11 @@ impl RemoteFs {
         let mtime_st = mtime
             .and_then(|sec| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sec as u64)))
             .unwrap_or(now);
-        let uid = unsafe { libc::getuid() } as u32;
-        let gid = unsafe { libc::getgid() } as u32;
+
+        // su Windows non abbiamo getuid/getgid; usa 0 per default o adattalo
+        let uid = 0u32;
+        let gid = 0u32;
+
         FileAttr {
             ino: self.alloc_ino(path),
             size,
@@ -136,16 +175,22 @@ impl RemoteFs {
         if is_dir { base | 0o111 } else { base }
     }
 
-    // Funzione che verifica se una i permessi passati corrispondono a quelli di una direcotory
+    // Funzione che verifica se i permessi passati corrispondono a quelli di una directory
     fn is_dir(permissions: &str) -> bool {
         permissions.chars().next().unwrap_or('-') == 'd'
     }
 
-    // Funzione che definisce i le entries di una directory
+    // Funzione che definisce le entries di una directory
     // Qua dentro avviene la chiamata all'API ls
-    fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
+    fn dir_entries(&self, dir: &Path) -> WinFspResult<Vec<(PathBuf, DirectoryEntry)>> {
         let rel = Self::rel_of(dir);
-        let list = self.rt.block_on(self.api.ls(&rel))?;
+        // Assumo che api.ls(&rel) -> Result<Vec<DirectoryEntry>, E>
+        let list = self.rt.block_on(self.api.ls(&rel))
+            .map_err(|e| {
+                // converto l'errore della tua API in FspError
+                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                FspError::from(io_err)
+            })?;
         let mut out = Vec::with_capacity(list.len());
         for de in list {
             let child = if rel.is_empty() {
@@ -158,6 +203,20 @@ impl RemoteFs {
         }
         Ok(out)
     }
+
+    fn path_from_u16(&self, path: &U16CStr) -> String {
+        path.to_os_string()
+            .to_string_lossy()
+            .to_string()
+    }
+
+    // Utility: crea un percorso temporaneo per un ino
+    fn get_temporary_path(&self, ino: u64) -> PathBuf {
+        // usa la cartella temp di sistema e un nome unico per ino
+        let mut p = std::env::temp_dir();
+        p.push(format!("remotefs_tmp_{}.bin", ino));
+        p
+    }
 }
 
 
@@ -169,13 +228,10 @@ impl FileSystemContext for RemoteFs {
         _name: &U16CStr,
         _buf: Option<&mut [c_void]>,
         _f: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
-    ) -> Result<FileSecurity, FspError> {
+    ) -> WinFspResult<FileSecurity> {
         // Facoltativo: qui potresti ottenere permessi o ACL dal server remoto.
-        // Per ora puoi restituire permessi fittizi o "unimplemented!".
         unimplemented!()
     }
-
-    const FILE_WRITE_DATA: u32 = 0x0002;
 
     fn open(
         &self,
@@ -183,17 +239,20 @@ impl FileSystemContext for RemoteFs {
         _create_options: u32,
         granted_access: u32,
         _file_info: &mut OpenFileInfo,
-    ) -> Result<Self::FileContext, FspError> {
+    ) -> WinFspResult<Self::FileContext> {
         let path = self.path_from_u16(path);
-        let ino = self.alloc_ino(&path);
+        let ino = self.alloc_ino(Path::new(&path));
 
         // Se abbiamo accesso in scrittura, creiamo un TempWrite
-        let temp_write = if granted_access & Self::FILE_WRITE_DATA != 0 {
+        let temp_write = if (granted_access & FILE_WRITE_DATA) != 0 {
             let temp_path = self.get_temporary_path(ino);
 
             if !temp_path.exists() {
                 std::fs::File::create(&temp_path)
-                    .map_err(|_| FspError::from_win32())?;
+                    .map_err(|e| {
+                        let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                        FspError::from(io_err)
+                    })?;
             }
 
             let tw = TempWrite {
@@ -221,7 +280,7 @@ impl FileSystemContext for RemoteFs {
 
         // Commit sul backend
         if let Err(e) = self.rt.block_on(
-            self.api.write_file(&rel_path, &temp_write.tem_path.to_string_lossy())// la faccio qua la chiamata API vera e propria della write andando a scrivere il / i file temporanei creati
+            self.api.write_file(&rel_path, &temp_write.tem_path.to_string_lossy())
         ) {
             eprintln!("Errore commit file {}: {:?}", rel_path, e);
         }
@@ -238,17 +297,24 @@ impl FileSystemContext for RemoteFs {
         file_context: &Self::FileContext,
         buffer: &mut [u8],
         offset: u64,
-    ) -> Result<u32, FspError> {
+    ) -> WinFspResult<u32> {
         let path = self.path_of(file_context.ino)
-            .ok_or(FspError::from_win32())?;
+            .ok_or(FspError::WIN32(1))?;
         let rel_path = Self::rel_of(&path);
 
         // Leggi dal temp file se il file è aperto in scrittura
-        let data = if let Some(tw) = &file_context.temp_write {
-            std::fs::read(&tw.tem_path).map_err(|_| FspError::from_win32())?
+        let data: Vec<u8> = if let Some(tw) = &file_context.temp_write {
+            std::fs::read(&tw.tem_path)
+                .map_err(|e| {
+                    let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                    FspError::from(io_err)
+                })?
         } else {
             self.rt.block_on(self.api.read_file(&rel_path))
-                .map_err(|_| FspError::from_win32())?
+                .map_err(|e| {
+                    let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                    FspError::from(io_err)
+                })?
         };
 
         let start = offset as usize;
@@ -261,34 +327,39 @@ impl FileSystemContext for RemoteFs {
 
         Ok(bytes_to_copy.len() as u32)
     }
-    
 
     fn write(
         &self,
-        _file_context: &Self::FileContext,
-        _buffer: &[u8],
-        _offset: u64,
+        file_context: &Self::FileContext,
+        buffer: &[u8],
+        offset: u64,
         _write_to_end_of_file: bool,
         _constrained_io: bool,
-        file_info: &mut FileInfo,
-    ) -> Result<u32, FspError> {
-        // Quando un file viene scritto:
-        // -> invia i byte al backend tramite PUT /files/<path>, ma lo fa solo quando il file viene chiuso
-        // TODO: inserire codice asincrono per scrittura remota
+        _file_info: &mut FileInfo,
+    ) -> WinFspResult<u32> {
         let tw = match &file_context.temp_write {
             Some(tw) => tw,
-            None => return Err(FspError::from_win32()), // file opened read-only
+            None => return Err(FspError::WIN32(1)), // file opened read-only
         };
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&tw.tem_path)
-            .map_err(|_| FspError::from_win32())?;
+            .map_err(|e| {
+                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                FspError::from(io_err)
+            })?;
 
         file.seek(std::io::SeekFrom::Start(offset))
-            .map_err(|_| FspError::from_win32())?;
+            .map_err(|e| {
+                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                FspError::from(io_err)
+            })?;
         file.write_all(buffer)
-            .map_err(|_| FspError::from_win32())?;
+            .map_err(|e| {
+                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                FspError::from(io_err)
+            })?;
 
         Ok(buffer.len() as u32)
     }
@@ -297,34 +368,42 @@ impl FileSystemContext for RemoteFs {
         &self,
         _file_context: &Self::FileContext,
         _pattern: Option<&U16CStr>,
-        mut _marker: DirMarker<'_>,
-        _buffer: &mut [u8],
-    ) -> Result<u32, FspError> {
-        // Quando viene fatto "dir" o "ls":
-        // lo usiamo come wrapper della funzione interna del file system dir_entries la quale chiama effettivamente da backend la ls
-        // -> per ogni entry restituita, aggiungi a `marker.add_file(name, attributes)`
-       
+        mut marker: DirMarker<'_>,
+        buffer: &mut [u8],
+    ) -> WinFspResult<u32> {
         let dir_path = self.path_of(_file_context.ino)
-                        .ok_or(FspError::from_win32())?;
+                        .ok_or(FspError::WIN32(1))?;
         
         let entries = self.dir_entries(&dir_path)?;
-        
-        //trovi il punto in cui si era fermato il marker
-        for (path, file_entry) in entries.into_iter().skip_while(|(p, _)| {
-           // skip finché il path è <= marker
-            marker.file_name().map_or(false, |name| {
-                name.to_string_lossy() >= p.file_name().unwrap().to_string_lossy()
-            })
-        }) {
-            // aggiungi la entry al marker (buffer)
-            if !marker.add_file(&file_entry.name, file_entry.attr) {
-                break; // buffer pieno, esci dal ciclo
+
+        // Trova il punto in cui ripartire rispetto al marker
+
+        let mut offset = 0;
+
+        for (_, de) in entries {
+            // Converti il nome in UTF-16LE
+            let name_utf16: Vec<u16> = de.name.encode_utf16().chain(Some(0)).collect();
+            let name_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    name_utf16.as_ptr() as *const u8,
+                    name_utf16.len() * 2
+                )
+            };
+
+            // Se il buffer non ha spazio, interrompi
+            if offset + name_bytes.len() > buffer.len() {
+                break;
             }
+
+            // Copia il nome nel buffer
+            buffer[offset..offset + name_bytes.len()].copy_from_slice(name_bytes);
+            offset += name_bytes.len();
+
+                    // Non dobbiamo aggiornare il marker manualmente: WinFsp gestisce la ripresa
         }
 
-        Ok(marker.bytes_written() as u32)
-    
-
+        Ok(offset as u32)
+            
     }
 
     fn create(
@@ -332,39 +411,41 @@ impl FileSystemContext for RemoteFs {
         path: &U16CStr,
         create_options: u32,
         granted_access: u32,
-        file_attributes: u32,
-        allocation_size: Option<&[c_void]>,
-        create_flags: u64,
-        reserved: Option<&[u8]>,
-        write_through: bool,
+        _file_attributes: u32,
+        _allocation_size: Option<&[c_void]>,
+        _create_flags: u64,
+        _reserved: Option<&[u8]>,
+        _write_through: bool,
         file_info: &mut OpenFileInfo,
-    ) -> Result<Self::FileContext, FspError> {
-        // Quando viene creato un file o directory:
-        // -> se è dir: POST /mkdir/<path>
-        // -> se è file: PUT /files/<path> con body vuoto
-        // TODO: chiamare self.api_create_directory() o self.api_write_file()
+    ) -> WinFspResult<Self::FileContext> {
         let path_str = self.path_from_u16(path);
-        let is_dir = (create_options & winfsp::filesystem::CREATE_DIRECTORY) != 0;
+        let is_dir = (create_options & CREATE_DIRECTORY) != 0;
+        let file_info_mut: &mut FileInfo = file_info.as_mut();
 
-        // Creazione fisica nel backend remoto directoryi se il bit era a 1 se no file
+        // Creazione fisica nel backend remoto
         if is_dir {
-           
-            self.rt.block_on(self.api.create_directory(&path_str))
-                .map_err(|_| FspError::from_win32())?;
+            self.rt.block_on(self.api.mkdir(&path_str))
+                .map_err(|e| {
+                    let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                    FspError::from(io_err)
+                })?;
         } else {
             self.rt.block_on(self.api.write_file(&path_str, ""))
-                .map_err(|_| FspError::from_win32())?;
+                .map_err(|e| {
+                    let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                    FspError::from(io_err)
+                })?;
         }
 
-        file_info.basic.file_attributes = if is_dir {
-            winfsp::filesystem::FILE_ATTRIBUTE_DIRECTORY
+        file_info_mut.file_attributes = if is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
         } else {
             0
         };
-        file_info.basic.file_size = 0;
+        file_info_mut.file_size = 0;
 
         // Apri il file creato se è un file e se concessi permessi di scrittura
-        if !is_dir && (granted_access & Self::FILE_WRITE_DATA != 0) {
+        if !is_dir && (granted_access & FILE_WRITE_DATA) != 0 {
             // Riuso la funzione open che crea il contesto corretto e TempWrite
             return self.open(path, create_options, granted_access, file_info);
         }
@@ -373,13 +454,11 @@ impl FileSystemContext for RemoteFs {
         let ino = self.alloc_ino(Path::new(&path_str));
         Ok(MyFileContext { ino, temp_write: None })
     }
-
 }
 
-
-
 pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
-    let fs = RemoteFs::new();
+    let rt = Arc::new(Runtime::new()?);
+    let fs = RemoteFs::new(api, rt);
     let mut vparams = VolumeParams::default();
     vparams.sectors_per_allocation_unit(64); // Numero di settori per unità di allocazione
     vparams.sector_size(4096); // Dimensione di settore (4096 bytes)
