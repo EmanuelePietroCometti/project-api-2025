@@ -14,6 +14,7 @@ const ROOT_DIR = path.join(__dirname, "..", "storage");
 router.get("/", async (req, res) => {
   try {
     const relPath = req.query.relPath;
+    console.log("Requested file:", relPath);
     const filePath = path.join(ROOT_DIR, relPath);
     const parentPath = path.dirname(filePath);
 
