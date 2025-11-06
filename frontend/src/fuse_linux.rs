@@ -279,7 +279,6 @@ impl RemoteFs {
     // Qua dentro avviene la chiamata all'API ls
     pub fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
         let rel = Self::rel_of(dir);
-
         // 1) prova cache directory
         if let Some((entries, ts)) = self.dir_cache.lock().unwrap().get(dir).cloned() {
             if SystemTime::now()
