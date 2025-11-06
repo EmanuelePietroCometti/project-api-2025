@@ -358,16 +358,24 @@ impl RemoteFs {
     fn nt_time_from_system_time(t: SystemTime) -> u64 {
         // NT epoch 1601-01-01 to Unix epoch 1970-01-01 in 100ns ticks
         const SECS_BETWEEN_EPOCHS: u64 = 11644473600;
+        const HUNDRED_NS_PER_SEC: u64 = 10_000_000;
+
         match t.duration_since(UNIX_EPOCH) {
-            Ok(dur) => (dur.as_secs() + SECS_BETWEEN_EPOCHS) * 10_000_000 + (dur.subsec_nanos() as u64 / 100),
+            Ok(dur) => {
+                let secs = dur.as_secs().saturating_add(SECS_BETWEEN_EPOCHS);
+                let sub_100ns = (dur.subsec_nanos() / 100) as u64;
+                (secs.saturating_mul(HUNDRED_NS_PER_SEC)).saturating_add(sub_100ns)
+            }
             Err(_) => 0,
         }
     }
 
 
+
     fn is_directory_from_permissions(p: &str) -> bool {
         p.chars().next().unwrap_or('-') == 'd'
     }
+    
 }
 
 impl FileSystemContext for RemoteFs {
@@ -612,6 +620,7 @@ impl FileSystemContext for RemoteFs {
         _constrained_io: bool,
         _file_info: &mut FileInfo,
     ) -> WinFspResult<u32> {
+        println!("Siamo in write");
         let tw = match &file_context.temp_write {
             Some(tw) => tw,
             None => return Err(FspError::WIN32(1)), // file opened read-only
@@ -778,61 +787,127 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut OpenFileInfo,
     ) -> WinFspResult<Self::FileContext> {
         println!("Siamo in create");
+
         let path_str = self.path_from_u16(path);
-        let rel = RemoteFs::rel_of(Path::new(&path_str)); // "/" -> ".", "/a" -> "./a"
+        let rel = RemoteFs::rel_of(Path::new(&path_str));
         let is_dir = (create_options & CREATE_DIRECTORY) != 0;
-        let file_info_mut: &mut FileInfo = file_info.as_mut();
 
-        // Intercetta desktop.ini: Windows/Explorer lo crea automaticamente.
-        if rel.to_lowercase().ends_with("desktop.ini") {
-            // tenta di creare un file vuoto (ma se fallisce, ignora l'errore per non far fallire l'operazione)
-            let _ = self.rt.block_on(self.api.write_file(&rel, ""));
-            file_info_mut.file_attributes = 0;
-            file_info_mut.file_size = 0;
-            let ino = self.alloc_ino(Path::new(&path_str));
-            return Ok(MyFileContext { ino, temp_write: None });
-        }
-        println!("[CREATE] mkdir backend rel='{}'", rel);
-        // Creazione sul backend
+        let now = SystemTime::now();
+        let nt_time = RemoteFs::nt_time_from_system_time(now);
+        let fi = file_info.as_mut();
+
+        // Gestione directory
         if is_dir {
-            if let Err(e) = self.rt.block_on(self.api.mkdir(&rel)) {
-                // Se fallisce, verifica se effettivamente esiste sul backend -> allora ritorna ERROR_ALREADY_EXISTS
-                if self.backend_entry_exists(&rel) {
-                    return Err(FspError::WIN32(ERROR_ALREADY_EXISTS as u32));
-                } else {
-                    let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-                    return Err(FspError::from(io_err));
+            match self.rt.block_on(self.api.mkdir(&rel)) {
+                Ok(_) => {
+                    fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+                    fi.file_size = 0;
+                    fi.creation_time = nt_time;
+                    fi.last_access_time = nt_time;
+                    fi.last_write_time = nt_time;
+                    fi.change_time = nt_time;
+
+                    let ino = self.alloc_ino(Path::new(&path_str));
+                    return Ok(MyFileContext { ino, temp_write: None });
                 }
-            }
-        } else {
-            if let Err(e) = self.rt.block_on(self.api.write_file(&rel, "")) {
-                // se fallisce e backend mostra che esiste, segnalalo; altrimenti ritorna l'errore
-                if self.backend_entry_exists(&rel) {
-                    return Err(FspError::WIN32(ERROR_ALREADY_EXISTS as u32));
-                } else {
-                    let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-                    return Err(FspError::from(io_err));
+                Err(e) => {
+                    if self.backend_entry_exists(&rel) {
+                        return self.open(path, create_options, granted_access, file_info);
+                    } else {
+                        let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                        return Err(FspError::from(io_err));
+                    }
                 }
             }
         }
 
-        file_info_mut.file_attributes = if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
-        file_info_mut.file_size = 0;
-
-        if !is_dir && (granted_access & FILE_WRITE_DATA) != 0 {
-            return self.open(path, create_options, granted_access, file_info);
+        // ✅ File normale: NON scrivere ancora sul backend!
+        // Verifica solo che non esista già
+        if self.backend_entry_exists(&rel) {
+            return Err(FspError::WIN32(ERROR_ALREADY_EXISTS));
         }
+
+        fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
+        fi.file_size = 0;
+        fi.creation_time = nt_time;
+        fi.last_access_time = nt_time;
+        fi.last_write_time = nt_time;
+        fi.change_time = nt_time;
 
         let ino = self.alloc_ino(Path::new(&path_str));
-        println!(
-            "INSERT PATH_INODE_MAP: raw={:?}, normalized={:?}, normalizzato ={:?}",
-            path,
-            path_str,
-            rel
-        );
 
-        Ok(MyFileContext { ino, temp_write: None })
+        // ✅ Prepara temp solo se ha accesso scrittura
+        let temp_write = if (granted_access & FILE_WRITE_DATA) != 0 {
+            let temp_path = self.get_temporary_path(ino);
+            
+            // Crea temp locale vuoto
+            std::fs::File::create(&temp_path).map_err(|e| {
+                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
+                FspError::from(io_err)
+            })?;
+            
+            let tw = TempWrite { tem_path: temp_path, size: 0 };
+            self.writes.lock().unwrap().insert(ino, tw.clone());
+            Some(tw)
+        } else {
+            None
+        };
+
+        // ✅ Ritorna il context con temp preparato
+        Ok(MyFileContext { ino, temp_write })
     }
+
+    fn set_basic_info(//per la modifica di permessi 
+        &self,
+        file_context: &Self::FileContext,
+        file_attributes: u32,
+        _creation_time: u64,
+        _last_access_time: u64,
+        _last_write_time: u64,
+        _change_time: u64,
+        file_info: &mut FileInfo,
+    ) -> WinFspResult<()> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
+        
+        println!("[DEBUG] set_basic_info chiamato");
+        
+        // Recupera il path dal context
+        let path = self.path_of(file_context.ino)
+            .ok_or(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND))?;
+        let rel = RemoteFs::rel_of(&path);
+        
+        println!(
+            "[DEBUG] set_basic_info: path='{}' file_attributes={:#x}",
+            rel, file_attributes
+        );
+        
+        // Mappa FILE_ATTRIBUTE_READONLY ai permessi Unix
+        let mode = if (file_attributes & FILE_ATTRIBUTE_READONLY) != 0 {
+            println!("[DEBUG] Impostazione file read-only: 0o444");
+            0o444
+        } else {
+            println!("[DEBUG] Impostazione file read-write: 0o644");
+            0o644
+        };
+        
+        // Chiama l'API chmod del backend
+        if let Err(e) = self.rt.block_on(self.api.chmod(&rel, mode)) {
+            eprintln!("[ERROR] chmod failed per '{}': {}", rel, e);
+            let io_err = io::Error::new(io::ErrorKind::Other, format!("chmod failed: {}", e));
+            return Err(FspError::from(io_err));
+        }
+        
+        // Aggiorna il FileInfo con i nuovi attributi
+        file_info.file_attributes = file_attributes;
+        
+        println!("[DEBUG] set_basic_info: chmod completato con successo");
+        Ok(())
+    }
+
+
+
+
+
 }
 
 pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
