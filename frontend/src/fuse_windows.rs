@@ -201,8 +201,13 @@ impl RemoteFs {
         if is_dir { base | 0o111 } else { base }
     }
 
-    fn is_dir(permissions: &str) -> bool {
-        permissions.chars().next().unwrap_or('-') == 'd'
+    fn is_dir(val:&i64) -> bool {
+        if *val ==1 {
+            true
+        }
+        else{
+            false
+        }
     }
 
     fn dir_entries(&self, dir: &Path) -> WinFspResult<Vec<(PathBuf, DirectoryEntry)>> {
@@ -452,7 +457,7 @@ impl FileSystemContext for RemoteFs {
 
 
         if let Some(de) = list.iter().find(|d| d.name == name_only) {
-            let is_dir = RemoteFs::is_dir(&de.permissions);
+            let is_dir = RemoteFs::is_dir(&de.is_dir);
             let attrs = if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
             println!(
             "[DEBUG] returning FileSecurity: attrs={:#x} sz_sd={} reparse={}",
@@ -687,7 +692,7 @@ impl FileSystemContext for RemoteFs {
                 (*dir_info_ptr).Size = entry_size;
 
                 // Determina se è una directory o un file
-                let is_dir = Self::is_dir(&de.permissions);
+                let is_dir = Self::is_dir(&de.is_dir);
                 
                 // Imposta gli attributi
                 (*dir_info_ptr).FileInfo.FileAttributes =
