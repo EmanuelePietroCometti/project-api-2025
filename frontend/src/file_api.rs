@@ -192,6 +192,7 @@ impl FileApi {
     }
 
     pub async fn ls(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
+        println!("PATH API ls : {}",path);
         let resp = self
             .client
             .get(format!("{}/list", self.base_url))
