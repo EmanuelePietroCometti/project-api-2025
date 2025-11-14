@@ -23,7 +23,6 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_DATA,FILE_ATTRIBUTE_DIR
 use winfsp_sys::FspCleanupDelete;
 
 
-
 use winfsp_sys::{FspFileSystemAddDirInfo, FSP_FSCTL_DIR_INFO};
 use std::mem::{size_of, zeroed};
 use std::ptr::{addr_of_mut};
@@ -37,6 +36,8 @@ pub struct MyFileContext {
     pub ino: u64,
     pub temp_write: Option<TempWrite>, // Some se stiamo scrivendo, None se solo lettura
     pub delete_on_close: AtomicBool,
+    pub allow_delete: bool,
+    pub is_dir: bool,
 }
 
 use crate::file_api::{DirectoryEntry, FileApi};
@@ -71,8 +72,11 @@ struct FileAttr {
 struct RemoteFs {
     api: FileApi,
     rt: Arc<Runtime>,
+    //path <-> ino
     ino_by_path: Mutex<HashMap<PathBuf, u64>>,
     path_by_ino: Mutex<HashMap<u64, PathBuf>>,
+    //cache attributi
+    dir_cache: Mutex<HashMap<PathBuf,(Vec<DirectoryEntry>, SystemTime)>>,
     attr_cache: Mutex<HashMap<PathBuf, FileAttr>>,
     writes: Mutex<HashMap<u64, TempWrite>>,
     next_ino: Mutex<u64>,
@@ -81,9 +85,11 @@ struct RemoteFs {
 
 // Costanti WinAPI che non sempre sono re-esportate dal crate
 //const FILE_WRITE_DATA: u32 = 0x0002;
-const CREATE_DIRECTORY: u32 = 0x00000001;//poi da provare ad usare un import
+const CREATE_DIRECTORY: u32 = 0x00000001;//TODO poi da provare ad usare un import
 //const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
-const FSP_CLEANUP_DELETE: u32 = 0x20;// vedere se si riesce ad importare
+const FSP_CLEANUP_DELETE: u32 = 0x20;//TODO vedere se si riesce ad importare
+const DELETE: u32 = 0x0001_0000;//TODO vedere se si riesce ad importare 
+
 
 impl RemoteFs {
     fn new(api: FileApi, rt: Arc<Runtime>) -> Self {
@@ -396,12 +402,13 @@ impl RemoteFs {
     fn can_delete(
         &self,
         file_context: &MyFileContext,
-        file_name: Option<&U16CStr>,
+        //file_name: Option<&U16CStr>,
+        rel : String,
     ) -> WinFspResult<()> {
         println!("[CAN_DELETE] enter");
 
         // Risolvi path
-        let path = if let Some(name) = file_name {
+       /*  let path = if let Some(name) = file_name {
             let p = self.path_from_u16(name);
             println!("[CAN_DELETE] file_name provided -> path_from_u16 = {}", p);
             p
@@ -416,7 +423,7 @@ impl RemoteFs {
             p
         };
 
-        let rel = RemoteFs::rel_of(std::path::Path::new(&path));
+        let rel = RemoteFs::rel_of(std::path::Path::new(&path));*/
         println!("[CAN_DELETE] rel = '{}'", rel);
 
         // Root non cancellabile
@@ -643,28 +650,40 @@ impl FileSystemContext for RemoteFs {
 
 
 
+    
+
     fn open(
         &self,
         file_name: &U16CStr,
-        _create_options: u32,
+        create_options: u32,
         granted_access: u32,
         open_info: &mut OpenFileInfo,
     ) -> WinFspResult<Self::FileContext> {
         let path = self.path_from_u16(file_name);
         let rel = RemoteFs::rel_of(std::path::Path::new(&path));
-        
-        println!("[DEBUG] open: path='{}' rel='{}'", path, rel);
-        
+
+        let wants_delete = (granted_access & DELETE) != 0;
+        println!(
+            "[OPEN] path='{}' rel='{}' granted_access=0x{:X} create_options=0x{:X} wants_delete={}",
+            path, rel, granted_access, create_options, wants_delete
+        );
+
         // Root directory
         if rel == "." {
             let fi = open_info.as_mut();
             fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
             fi.file_size = 0;
             let ino = self.alloc_ino(Path::new(&path));
-            return Ok(MyFileContext { ino, temp_write: None, delete_on_close: AtomicBool::new(false), });
+            return Ok(MyFileContext {
+                ino,
+                is_dir: true,
+                allow_delete: wants_delete,
+                delete_on_close: AtomicBool::new(false),
+                temp_write: None,
+            });
         }
 
-        // ✅ Usa la stessa logica di get_security_by_name
+        // Lookup parent + entry
         let parent_rel = std::path::Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -675,18 +694,15 @@ impl FileSystemContext for RemoteFs {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let list = self.rt.block_on(self.api.ls(&parent_rel))
-            .map_err(|e| {
-                let ioe = std::io::Error::new(std::io::ErrorKind::Other, format!("{e}"));
-                FspError::from(ioe)
-            })?;
+        let list = self.rt.block_on(self.api.ls(&parent_rel)).map_err(|e| {
+            let ioe = std::io::Error::new(std::io::ErrorKind::Other, format!("{e}"));
+            FspError::from(ioe)
+        })?;
 
-        let de = list.iter()
-            .find(|d| d.name == name_only)
-            .ok_or_else(|| {
-                eprintln!("[ERROR] open: '{}' not found in '{}'", name_only, parent_rel);
-                FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND)
-            })?;
+        let de = list.iter().find(|d| d.name == name_only).ok_or_else(|| {
+            eprintln!("[ERROR] open: '{}' not found in '{}'", name_only, parent_rel);
+            FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND)
+        })?;
 
         let is_dir = RemoteFs::is_dir(&de.is_dir);
         let ino = self.alloc_ino(Path::new(&path));
@@ -695,13 +711,19 @@ impl FileSystemContext for RemoteFs {
         if is_dir {
             fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
             fi.file_size = 0;
-            return Ok(MyFileContext { ino, temp_write: None, delete_on_close: AtomicBool::new(false), });
+            return Ok(MyFileContext {
+                ino,
+                is_dir: true,
+                allow_delete: wants_delete,
+                delete_on_close: AtomicBool::new(false),
+                temp_write: None,
+            });
         }
 
         fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
         fi.file_size = de.size as u64;
 
-        // Gestione temp write (invariato)
+        // Gestione temp write
         let temp_write = if (granted_access & FILE_WRITE_DATA) != 0 {
             let temp_path = self.get_temporary_path(ino);
             if !temp_path.exists() {
@@ -717,8 +739,15 @@ impl FileSystemContext for RemoteFs {
             None
         };
 
-        Ok(MyFileContext { ino, temp_write , delete_on_close: AtomicBool::new(false),})
+        Ok(MyFileContext {
+            ino,
+            is_dir: false,
+            allow_delete: wants_delete,
+            delete_on_close: AtomicBool::new(false),
+            temp_write,
+        })
     }
+
 
 
     fn close(&self, file_context: Self::FileContext) {
@@ -971,7 +1000,7 @@ impl FileSystemContext for RemoteFs {
                     fi.change_time = nt_time;
 
                     let ino = self.alloc_ino(Path::new(&path_str));
-                    return Ok(MyFileContext { ino, temp_write: None,delete_on_close: AtomicBool::new(false), });
+                    return Ok(MyFileContext { ino, temp_write: None,delete_on_close: AtomicBool::new(false),is_dir: true, allow_delete: (granted_access & DELETE) != 0 });
                 }
                 Err(e) => {
                     if self.backend_entry_exists(&rel) {
@@ -1031,7 +1060,7 @@ impl FileSystemContext for RemoteFs {
             };
 
             // ✅ Ritorna il context con temp preparato
-            Ok(MyFileContext { ino, temp_write ,delete_on_close: AtomicBool::new(false),})
+            Ok(MyFileContext { ino, temp_write ,delete_on_close: AtomicBool::new(false),is_dir: false, allow_delete: (granted_access & DELETE) != 0,})
         }
     }
     //per la modifica dei permessi
@@ -1117,10 +1146,29 @@ impl FileSystemContext for RemoteFs {
             file_name,
             file_context.ino
         );
+        let percorso= Some(file_name);
+
+        let path = if let Some(name) = percorso {
+            let p = self.path_from_u16(name);
+            println!("[CAN_DELETE] file_name provided -> path_from_u16 = {}", p);
+            p
+        } else {
+            let p = self
+                .path_of(file_context.ino)
+                .map(|p| p.to_string_lossy().to_string())
+                .ok_or(FspError::WIN32(
+                    windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
+                ))?;
+            println!("[CAN_DELETE] no file_name, path_of(ino={}) = {}", file_context.ino, p);
+            p
+        };
+
+        let rel = RemoteFs::rel_of(std::path::Path::new(&path));
 
         if delete {
             // Prima verifica se si può cancellare
-            self.can_delete(file_context, Some(file_name))?;
+
+            self.can_delete(file_context, rel)?;
             
             // 🔴 Importante: marca il contesto come "da cancellare al close"
             file_context.delete_on_close.store(true, Ordering::Relaxed);
@@ -1133,7 +1181,7 @@ impl FileSystemContext for RemoteFs {
         Ok(())//tornando ok dovrebbe marcare il fspCleanupDelete in modo da abilitare la cancellazione
     }
 
-
+//problema con la rimozione da windows powershell perchè rmdir non funziona per farlo funzionare bisogna chiamare cmd /c rmdir nome_cartella
     fn cleanup(
         &self,
         file_context: &MyFileContext,
@@ -1141,11 +1189,7 @@ impl FileSystemContext for RemoteFs {
         flags: u32,
     ) {
         println!("flag {} e fscClean val: {}", flags, FspCleanupDelete as u32);
-        // Esegui solo se marcato delete-on-close da WinFsp
-        if (flags & (FspCleanupDelete as u32)) == 0 {
-            println!("[DEBUG] cleanup: no DELETE flag, esco");
-            return;
-        }
+        // Esegui solo se marcato delete-on-close da WinFs
 
         // Risolvi il path canonico (preferisci il nome passato, altrimenti mappa ino->path)
         let path = if let Some(name) = file_name {
@@ -1192,6 +1236,16 @@ impl FileSystemContext for RemoteFs {
 
         let is_dir = RemoteFs::is_dir(&de.is_dir);
 
+        let del_flag = (flags & (FspCleanupDelete as u32)) != 0;
+        let del_ctx  = file_context.delete_on_close.load(Ordering::Relaxed);
+        println!("[CLEANUP] rel='{}' is_dir={} del_flag={} del_ctx={}", rel, is_dir, del_flag, del_ctx);
+
+        // Cancella SOLO se richiesto
+        if !(del_flag || del_ctx) {
+            println!("[DEBUG] cleanup: no delete request, skip");
+            return;
+        }
+
         // Per directory: ri-verifica opzionale che sia vuota (CanDelete l’ha già garantito)
         if is_dir {
             match self.rt.block_on(self.api.ls(&rel)) {
@@ -1221,6 +1275,7 @@ impl FileSystemContext for RemoteFs {
         // Evizione stato locale (mapping, cache e eventuale temp write)
         self.evict_all_state_for(&path);
     }
+
 
 
 
