@@ -4,6 +4,7 @@ import cors from 'cors';
 import listRoutes from './routes/listRoutes.js';
 import filesRoutes from './routes/filesRoutes.js';
 import mkdirRoutes from './routes/mkdirRoutes.js';
+import statsRoutes from './routes/statsRoutes.js';
 
 // init express
 const app = new express();
@@ -22,6 +23,7 @@ app.use(cors(corsOptions));
 app.use('/list', listRoutes);
 app.use('/files', filesRoutes);
 app.use('/mkdir', mkdirRoutes);
+app.use('/stats', statsRoutes);
 
 
 // activate the server

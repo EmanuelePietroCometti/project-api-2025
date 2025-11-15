@@ -1,9 +1,9 @@
 use anyhow::{Result, anyhow};
 use reqwest::{Body, Client};
 use serde::Deserialize;
+use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use std::time::SystemTime;
 #[derive(Clone)]
 pub struct FileApi {
     base_url: String,
@@ -20,12 +20,40 @@ pub struct DirectoryEntry {
     pub is_dir: i64,
     pub version: i64,
 }
+#[derive(Deserialize, Debug, Clone)]
+pub struct StatsResponse {
+    #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
+    pub bsize: u64,
+    #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
+    pub blocks: u64,
+    #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
+    pub bfree: u64,
+    #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
+    pub bavail: u64,
+    #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
+    pub files: u64,
+    #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
+    pub ffree: u64,
+}
 
 impl FileApi {
     pub fn new(base_url: &str) -> Self {
         FileApi {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: Client::new(),
+        }
+    }
+    pub async fn statfs(&self) -> Result<StatsResponse> {
+        let url = format!("{}/stats", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            let stats = resp.json::<StatsResponse>().await?;
+            Ok(stats)
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(anyhow!("statfs failed: {} - {}", status, text))
         }
     }
 
@@ -43,11 +71,7 @@ impl FileApi {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "chmod failed: {} - {}",
-                status,
-                text
-            ))
+            Err(anyhow::anyhow!("chmod failed: {} - {}", status, text))
         }
     }
 
@@ -64,11 +88,7 @@ impl FileApi {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "truncate failed: {} - {}",
-                status,
-                text
-            ))
+            Err(anyhow::anyhow!("truncate failed: {} - {}", status, text))
         }
     }
 
@@ -99,11 +119,7 @@ impl FileApi {
             Ok(())
         } else {
             let text = resp.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!(
-                "utimes failed: {} - {}",
-                status,
-                text
-            ))
+            Err(anyhow::anyhow!("utimes failed: {} - {}", status, text))
         }
     }
 
@@ -208,6 +224,22 @@ impl FileApi {
             let text = resp.text().await.unwrap_or_default();
             // println!("Error response text: {}", text);
             Err(anyhow!("ls failed: {} - {}", status, text))
+        }
+    }
+    pub async fn rename(&self, old_rel_path: &str, new_rel_path: &str) -> Result<()> {
+        let url = format!("{}/files/rename", self.base_url);
+        let resp = self
+            .client
+            .patch(&url)
+            .query(&[("oldRelPath", old_rel_path), ("newRelPath", new_rel_path)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(anyhow!("rename failed: {} - {}", status, text))
         }
     }
 }
