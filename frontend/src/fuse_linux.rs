@@ -3,7 +3,7 @@ use fuser016::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY, EOPNOTSUPP};
+use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
@@ -1099,51 +1099,6 @@ impl Filesystem for RemoteFs {
                 reply.error(errno);
             }
         }
-    }
-    fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
-        reply: ReplyEmpty,
-    ) {
-        // Non supportiamo gli attributi estesi
-        reply.error(EOPNOTSUPP);
-    }
-
-    fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _name: &OsStr,
-        _size: u32,
-        reply: fuser016::ReplyXattr,
-    ) {
-        // Non supportiamo gli attributi estesi
-        reply.error(EOPNOTSUPP);
-    }
-
-    fn listxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _size: u32,
-        reply: fuser016::ReplyXattr,
-    ) {
-        // Non abbiamo attributi estesi da elencare
-        if _size == 0 {
-            reply.size(0); // La dimensione della lista è 0
-        } else {
-            reply.data(&[]); // La lista è vuota
-        }
-    }
-
-    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
-        // Non supportiamo gli attributi estesi
-        reply.error(EOPNOTSUPP);
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
