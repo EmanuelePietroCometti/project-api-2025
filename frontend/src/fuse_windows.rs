@@ -18,7 +18,8 @@ use widestring::{U16CStr, U16CString};
 // API Windows per convertire SDDL -> SECURITY_DESCRIPTOR (self-relative)
 use windows_sys::Win32::Foundation::{LocalFree, HLOCAL, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_DATA,FILE_ATTRIBUTE_DIRECTORY,FILE_ATTRIBUTE_NORMAL,FILE_FLAG_BACKUP_SEMANTICS,FILE_FLAG_OPEN_REPARSE_POINT};
+use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_DATA,FILE_ATTRIBUTE_DIRECTORY,FILE_ATTRIBUTE_NORMAL,FILE_FLAG_BACKUP_SEMANTICS,FILE_FLAG_OPEN_REPARSE_POINT,FILE_ATTRIBUTE_READONLY,FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+    FILE_ATTRIBUTE_ARCHIVE,};
 //use windows_sys::Win32::System::IO::CREATE_DIRECTORY;
 use winfsp_sys::FspCleanupDelete;
 
@@ -984,6 +985,8 @@ impl FileSystemContext for RemoteFs {
             eprintln!("Errore commit file {}: {:?}", rel_path, e);
         }
 
+        let _ = self.rt.block_on(self.api.chmod(&rel_path, 0o644));
+
         let parent_rel = Path::new(&rel_path).parent()
             .and_then(|p| Some(p.to_string_lossy().to_string()))
             .filter(|s| !s.is_empty())
@@ -1309,7 +1312,7 @@ impl FileSystemContext for RemoteFs {
 
         // ★ NEW: aggiorna cache parent (come FUSE)
         let _ = self.update_cache(&parent_path);
-        /* la attr dovrebbe farla la update se lo trova
+        // la attr dovrebbe farla la update se lo trova
         // ★ NEW: crea attributi file e inserisci in cache (come FUSE create)
         let mut attr = self.file_attr(
             Path::new(&path_str),
@@ -1319,8 +1322,8 @@ impl FileSystemContext for RemoteFs {
             0o644,
         );
         attr.nlink = 1;
-        self.insert_attr_cache(Path::new(&path_str).to_path_buf(), attr);
-        */
+        self.insert_attr_cache(Path::new(&rel).to_path_buf(), attr);
+        
         Ok(MyFileContext {
             ino,
             temp_write,
@@ -1340,60 +1343,49 @@ impl FileSystemContext for RemoteFs {
         last_write_time: u64,
         change_time: u64,
         file_info: &mut FileInfo,
-    ) -> WinFspResult<()> {
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
-        
+    ) -> WinFspResult<()>
+    {
         let path = self.path_of(file_context.ino)
             .ok_or(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND))?;
         let rel = RemoteFs::rel_of(&path);
-        
-        // 1) carica attr base dalla cache o ricaricando il parent
+        let rel_key = PathBuf::from(rel.clone());        // "./file", non "/file"
+        let parent_rel = std::path::Path::new(&rel)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        let parent_key = PathBuf::from(parent_rel.clone());
 
-        let parent = path.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
-
-        let mut attr = if let Some(a) = self.get_attr_cache(&path) {
-             a 
-            } 
-            else {
-        // ricarica il parent con dir_entries e costruisci FileAttr del figlio
-        // identico al flusso della tua setattr Linux
-                match self.dir_entries(&parent) {
-                    Ok(entries) => {
-                        if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
-                            let is_dir = Self::is_dir(&de);
-                            let ty = if is_dir {
-                                NodeType::Directory
-                            } else {
-                                NodeType::RegularFile
-                            };
-                            let perm = Self::parse_perm(&de.permissions);
-                            let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                            let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                            self.insert_attr_cache(path.clone(), a.clone());
-                            a
-                        } else {
-                            return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND));
-                        }
-                    }
-                    Err(_) => {
-                        return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND));                  
+        // 1) attr dalla cache sulla chiave canonica
+        let mut attr = if let Some(a) = self.get_attr_cache(&rel_key) {
+            a
+        } else {
+            match self.dir_entries(&parent_key) {
+                Ok(entries) => {
+                    if let Some((p, de)) = entries.into_iter().find(|(p, _)| *p == rel_key) {
+                        let is_dir = Self::is_dir(&de);
+                        let ty = if is_dir { NodeType::Directory } else { NodeType::RegularFile };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+                        let a = self.file_attr(&p, ty, size, Some(de.mtime), perm);
+                        self.insert_attr_cache(p.clone(), a.clone());
+                        a
+                    } else {
+                        return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND));
                     }
                 }
-            };
-
-        // Mappa attributi → permessi Unix
-        let mode = if (file_attributes & FILE_ATTRIBUTE_READONLY) != 0 {
+                Err(_) => return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND)),
+            }
+        };
+        //altri permessi non cambiano l ottale del backend
+        // 2) mappa ReadOnly -> chmod backend
+        let mode = if (file_attributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY) != 0 {
             0o444
         } else {
             0o644
         };
-        
-        // Chiama chmod
         self.rt.block_on(self.api.chmod(&rel, mode))
-            .map_err(|e| {
-                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-                FspError::from(io_err)
-            })?;
+            .map_err(|e| FspError::from(io::Error::new(io::ErrorKind::Other, format!("{}", e))))?;
 
 
         // 3) Gestione Timestamps → utimes (equivalente Linux)
@@ -1431,8 +1423,8 @@ impl FileSystemContext for RemoteFs {
 
         //
         // 4) Aggiorna cache locale (UID/GID/Flags non gestiti su Windows)
-        self.insert_attr_cache(path.clone(), attr.clone());
-        let _ = self.update_cache(&parent);
+        //self.insert_attr_cache(path.clone(), attr.clone());
+        let _ = self.update_cache(&parent_key);
 
         // 5) Aggiorna file_info WinFsp
         if file_attributes != u32::MAX {
