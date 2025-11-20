@@ -5,6 +5,7 @@ import listRoutes from './routes/listRoutes.js';
 import filesRoutes from './routes/filesRoutes.js';
 import mkdirRoutes from './routes/mkdirRoutes.js';
 import statsRoutes from './routes/statsRoutes.js';
+import os from 'os';
 
 // init express
 const app = new express();
@@ -12,9 +13,20 @@ app.use(morgan('dev'));
 app.use(express.json());
 
 const port = 3001;
+const interfaces = os.networkInterfaces(); 
+const addresses = [];
+
+for (let iface in interfaces) {
+  for (let addr of interfaces[iface]) {
+    if (addr.family === "IPv4" && !addr.internal) {
+      addresses.push(addr.address);
+    }
+  }
+}
+const originAddress = `http://${addresses[0]}:5173/`;
 
 const corsOptions = {
-  origin: 'http://localhost:5173/',
+  origin: originAddress,
   credentials: true
 };
 app.use(cors(corsOptions));
@@ -28,5 +40,5 @@ app.use('/stats', statsRoutes);
 
 // activate the server
 app.listen(port, () => {
-  console.log(`Server listening at http://localhost:${port}`);
+  console.log(`Server listening at ${originAddress}`);
 });
