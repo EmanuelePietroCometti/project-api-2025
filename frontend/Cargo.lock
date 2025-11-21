@@ -512,6 +512,7 @@ dependencies = [
  "tokio 1.47.1",
  "urlencoding",
  "widestring",
+ "windows-sys 0.59.0",
  "winfsp",
  "winfsp-sys",
 ]
