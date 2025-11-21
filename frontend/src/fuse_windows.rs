@@ -16,16 +16,14 @@ use winfsp::{FspError, Result as WinFspResult};
 use std::{ffi::c_void, ptr};
 use widestring::{U16CStr, U16CString};
 // API Windows per convertire SDDL -> SECURITY_DESCRIPTOR (self-relative)
-use windows_sys::Win32::Foundation::{LocalFree, HLOCAL, ERROR_ALREADY_EXISTS};
+use windows_sys::Win32::Foundation::{LocalFree, HLOCAL, ERROR_ALREADY_EXISTS,ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SAME_DEVICE, ERROR_DIRECTORY, ERROR_NOT_SUPPORTED,};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_DATA,FILE_ATTRIBUTE_DIRECTORY,FILE_ATTRIBUTE_NORMAL,FILE_FLAG_BACKUP_SEMANTICS,FILE_FLAG_OPEN_REPARSE_POINT,FILE_ATTRIBUTE_READONLY,FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
     FILE_ATTRIBUTE_ARCHIVE,};
 //use windows_sys::Win32::System::IO::CREATE_DIRECTORY;
 use winfsp_sys::FspCleanupDelete;
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
-    ERROR_NOT_SAME_DEVICE, ERROR_DIRECTORY, ERROR_NOT_SUPPORTED,
-};
+
 
 
 use winfsp_sys::{FspFileSystemAddDirInfo, FSP_FSCTL_DIR_INFO};
@@ -759,6 +757,10 @@ impl RemoteFs {
         FspError::WIN32(ERROR_ACCESS_DENIED)
     }
 
+    fn block_on<T>(rt: &tokio::runtime::Runtime, fut: impl std::future::Future<Output = T>) -> T {
+        rt.block_on(fut)
+    }
+
     
 }
 
@@ -1142,95 +1144,105 @@ impl FileSystemContext for RemoteFs {
 
     fn rename(
         &self,
-        context: &Self::FileContext,
+        context: &MyFileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> WinFspResult<()> {
-        // 1) Risolvi path assoluti e canonizza in rel “./…”
+        // 1) Canonicalizza path
         let src_abs = self.path_from_u16(file_name);
         let dst_abs = self.path_from_u16(new_file_name);
-        let src_rel = RemoteFs::rel_of(Path::new(&src_abs));
-        let dst_rel = RemoteFs::rel_of(Path::new(&dst_abs));
+        let src_rel = RemoteFs::rel_of(std::path::Path::new(&src_abs));
+        let dst_rel = RemoteFs::rel_of(std::path::Path::new(&dst_abs));
         println!(
             "[RENAME] start ino={} is_dir={} src='{}' -> dst='{}' replace={}",
             context.ino, context.is_dir, src_rel, dst_rel, replace_if_exists
         );
 
-        // 2) Rifiuta rename cross-root/volume (qui unico volume: check superfluo ma esplicito)
-        // Se hai radici multiple, verifica i root keys; altrimenti ignora.
-        // if root_of(&src_rel) != root_of(&dst_rel) { return Err(FspError::WIN32(ERROR_NOT_SAME_DEVICE)); }
+        // 2) Parent/nome canonici
+        let (src_parent_rel, src_name) = RemoteFs::split_parent_name(&src_rel);
+        let (dst_parent_rel, dst_name) = RemoteFs::split_parent_name(&dst_rel);
+        let src_parent_key = std::path::PathBuf::from(&src_parent_rel);
+        let dst_parent_key = std::path::PathBuf::from(&dst_parent_rel);
 
-        // 3) Ricava parent e name per sorgente e destinazione
-        let (src_parent_rel, src_name) = split_parent_name(&src_rel);
-        let (dst_parent_rel, dst_name) = split_parent_name(&dst_rel);
-
-        // 4) Carica entries dei parent usando la tua cache/back-end
-        let src_parent_key = PathBuf::from(&src_parent_rel);
-        let dst_parent_key = PathBuf::from(&dst_parent_rel);
-
+        // 3) Liste parent (cache-aware)
         let src_list = self.dir_entries(&src_parent_key)
             .map_err(|e| { eprintln!("[RENAME] dir_entries('{}') failed: {}", src_parent_rel, e); e })?;
         let dst_list = if src_parent_rel == dst_parent_rel {
-            // Riusa la stessa lista per efficienza se parent coincide
             src_list.clone()
         } else {
             self.dir_entries(&dst_parent_key)
                 .map_err(|e| { eprintln!("[RENAME] dir_entries('{}') failed: {}", dst_parent_rel, e); e })?
         };
 
-        // 5) Verifica esistenza sorgente
+        // 4) Sorgente deve esistere
         let (src_child_path, src_de) = match src_list.iter().find(|(_, d)| d.name == src_name) {
-            Some(x) => (x.0.clone(), x.1.clone()),
+            Some((p, d)) => (p.clone(), d.clone()),
             None => {
                 eprintln!("[RENAME] source '{}' not found in '{}'", src_name, src_parent_rel);
-                return Err(FspError::WIN32(ERROR_FILE_NOT_FOUND));
+                return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND));
             }
         };
         let src_is_dir = RemoteFs::is_dir(&src_de);
 
-        // 6) Se destinazione esiste
+        // 5) Gestisci destinazione esistente e replace_if_exists
         if let Some((_, dst_de)) = dst_list.iter().find(|(_, d)| d.name == dst_name) {
             let dst_is_dir = RemoteFs::is_dir(&dst_de);
-            // Regole: file->dir o dir->file non consentito
             if src_is_dir != dst_is_dir {
                 eprintln!("[RENAME] type mismatch: src_is_dir={} dst_is_dir={}", src_is_dir, dst_is_dir);
-                return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+                return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED));
             }
             if !replace_if_exists {
                 eprintln!("[RENAME] destination exists and replace_if_exists=false");
-                return Err(FspError::WIN32(ERROR_ALREADY_EXISTS));
+                return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS));
             }
-            // Se è directory, assicurati che sia vuota o che il backend supporti replace atomico di cartelle
             if dst_is_dir {
-                // Se non supporti replace di directory, rifiuta
-                return Err(FspError::WIN32(ERROR_NOT_SUPPORTED));
+                eprintln!("[RENAME] replace directory not supported");
+                return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED));
+            }
+            // Emula REPLACE_EXISTING se hai delete
+            if let Err(e) = self.rt.block_on(self.api.delete(&dst_rel)) {
+                eprintln!("[RENAME] pre-delete failed for '{}': {}", dst_rel, e);
+                return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED));
             }
         }
 
-        // 7) Autorizzazioni: richiedi DELETE sul src e DELETE_CHILD sul parent di destinazione (semplificato)
-        // Se implementi controllo ACL: verifica che l’utente abbia DELETE/DELETE_CHILD; altrimenti prosegui.
-
-        // 8) Esegui rename nel backend
-        // Assumi che il backend esponga: self.api.rename(src_rel, dst_rel, replace_if_exists)
-        self.api.rename(&src_rel, &dst_rel, replace_if_exists)
-            .map_err(|e| {
-                eprintln!("[RENAME] backend rename failed: {} -> {} err={}", src_rel, dst_rel, e);
-                map_backend_err(e)
-            })?;
-
-        // 9) Aggiorna cache: rimuovi vecchia entry, invalida parent sorgente e destinazione, aggiorna attrcache
-        self.invalidate_dir_cache(&src_parent_key);
-        if src_parent_rel != dst_parent_rel {
-            self.invalidate_dir_cache(&dst_parent_key);
+        // 6) Backend rename (async PATCH /files/rename?oldRelPath=&newRelPath=)
+        if let Err(e) = self.rt.block_on(self.api.rename(&src_rel, &dst_rel)) {
+            eprintln!("[RENAME] backend rename failed: {} -> {} err={}", src_rel, dst_rel, e);
+            return Err(FspError::WIN32(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED));
         }
-        self.remove_attr_cache(&PathBuf::from(&src_rel));
-        self.remove_attr_cache(&PathBuf::from(&dst_rel)); // sicurezza: forza refresh
-        // Aggiorna mappa ino->path se conosci l’ino corrente
-        if let Some(old_path) = self.path_of(context.ino) {
-            // Se l’ino corrisponde al file/dir rinominato, aggiorna
-            if RemoteFs::rel_of(&old_path) == src_rel {
-                self.update_ino_path(context.ino, PathBuf::from(&dst_abs));
+
+        // 7) Aggiorna cache in modo coerente con le tue API
+        // Evict state vecchio path (attrcache/dircache/inode mapping/pendenze write)
+        self.evict_all_state_for(&src_rel);
+
+        // Hard refresh dei parent coinvolti (usa le tue primitive)
+        // - Se hai update_cache(Path), usala per ricaricare da backend e ripopolare dircache/attrcache.
+        // - Se no, chiama ls e insert_dir_cache come già fai altrove.
+
+        // Aggiorna cache parent sorgente e destinazione
+        if let Err(e) = self.update_cache(&src_parent_key) {
+            eprintln!("[RENAME] update_cache('{}') failed: {}", src_parent_rel, e);
+            // continua comunque
+        }
+        if src_parent_rel != dst_parent_rel {
+            if let Err(e) = self.update_cache(&dst_parent_key) {
+                eprintln!("[RENAME] update_cache('{}') failed: {}", dst_parent_rel, e);
+            }
+        }
+
+        // 8) Aggiorna mappa ino->path se il context punta proprio all’oggetto rinominato
+        if let Some(cur) = self.path_of(context.ino) {
+            if RemoteFs::rel_of(&cur) == src_rel {
+                // path_by_ino modificabile con le tue strutture
+                if let Ok(mut byino) = self.path_by_ino.lock() {
+                    byino.insert(context.ino, PathBuf::from(dst_abs.clone()));
+                }
+                if let Ok(mut bypath) = self.ino_by_path.lock() {
+                    bypath.remove(&cur);
+                    bypath.insert(std::path::PathBuf::from(&dst_abs), context.ino);
+                }
             }
         }
 
@@ -1240,11 +1252,6 @@ impl FileSystemContext for RemoteFs {
         );
         Ok(())
     }
-
-
-
-
-
 
     
 
@@ -1650,7 +1657,7 @@ impl FileSystemContext for RemoteFs {
 
         //Caso Directory
         if is_dir {
-            match self.rt.block_on(self.api.mkdir(&rel)) {
+             match self.rt.block_on(self.api.mkdir(&rel)) {
                 Ok(_) => {
                     fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
                     fi.file_size = 0;
@@ -1659,38 +1666,33 @@ impl FileSystemContext for RemoteFs {
                     fi.last_write_time = nt_time;
                     fi.change_time = nt_time;
 
-                    let ino = self.alloc_ino(Path::new(&path_str));
+                    let ino = self.alloc_ino(std::path::Path::new(&path_str));
 
-                    // aggiorna cache parent
+                    // 1) Aggiorna cache parent: ricarica elenco (Explorer leggerà subito)
                     let _ = self.update_cache(&parent_path);
 
-                    //inserisci attributi directory in cache
-                   /*  let mut attr = self.file_attr(
-                        Path::new(&path_str),
+                    // 2) Inserisci attr della nuova dir in cache (evita finestra di inconsistenza)
+                    let mut attr = self.file_attr(
+                        std::path::Path::new(&path_str),
                         NodeType::Directory,
                         0,
                         None,
                         0o755,
                     );
-                    attr.nlink = 2;
-                    println!("[CREATE] aggiorno attr cache");
-                    self.insert_attr_cache(PathBuf::from(&rel), attr);
-                    */
+                    attr.nlink = 2; // directory tipicamente 2
+                    self.insert_attr_cache(std::path::PathBuf::from(&rel), attr);
+
                     return Ok(MyFileContext {
                         ino,
                         temp_write: None,
-                        delete_on_close: AtomicBool::new(false),
+                        delete_on_close: std::sync::atomic::AtomicBool::new(false),
                         is_dir: true,
                         allow_delete: (granted_access & DELETE) != 0,
                     });
                 }
                 Err(e) => {
-                    if self.backend_entry_exists(&rel) {
-                        return self.open(path, create_options, granted_access, file_info);
-                    } else {
-                        let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-                        return Err(FspError::from(io_err));
-                    }
+                    eprintln!("[CREATE] mkdir failed for '{}' -> {}", rel, e);
+                    return Err(FspError::from(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
                 }
             }
         }
