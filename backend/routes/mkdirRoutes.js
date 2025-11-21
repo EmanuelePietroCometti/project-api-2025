@@ -33,7 +33,6 @@ router.post("/", async (req, res) => {
     if (fs.existsSync(dirPath)) {
       return res.status(409).json({ error: "Directory already exist" });
     }
-
     // Crea la directory fisica
     await fs.promises.mkdir(dirPath);
     

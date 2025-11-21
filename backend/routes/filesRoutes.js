@@ -14,7 +14,6 @@ const ROOT_DIR = path.join(__dirname, "..", "storage");
 router.get("/", async (req, res) => {
   try {
     const relPath = req.query.relPath;
-    console.log("Requested file:", relPath);
     const filePath = path.join(ROOT_DIR, relPath);
     const parentPath = path.dirname(filePath);
 
@@ -174,8 +173,8 @@ router.patch("/truncate", async (req, res) => {
 router.patch("/utimes", async (req, res) => {
   try {
     const relPath = req.query.relPath;
-    const at = req.query.atime ? parseInt(req.query.atime, 10) : null; 
-    const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null; 
+    const at = req.query.atime ? parseInt(req.query.atime, 10) : null;
+    const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null;
     const filePathAbs = path.join(ROOT_DIR, relPath);
 
     // Se mancano, usa stat per tenere l'altro inalterato
@@ -192,4 +191,53 @@ router.patch("/utimes", async (req, res) => {
   }
 });
 
+// PATCH /files/rename?oldRelPath=...&newRelPath=... 
+router.patch("/rename", async (req, res) => {
+  try {
+    const oldRelPath = req.query.oldRelPath;
+    const newRelPath = req.query.newRelPath;
+    if (!oldRelPath || !newRelPath) {
+      return res.status(400).json({ error: "Missing oldRelPath or newRelPath" });
+    }
+    const oldAbsPath = path.join(ROOT_DIR, oldRelPath);
+    const newAbsPath = path.join(ROOT_DIR, newRelPath);
+    const newParentDir = path.dirname(newAbsPath);
+
+    // Identifica se l'operazione di rename proviene dal Cestino (e quindi è un ripristino)
+    const isRestore = oldRelPath.startsWith("/.Trash-");
+    try {
+      await fs.promises.stat(newAbsPath);
+      await fs.promises.unlink(newAbsPath);
+      await f.deleteFile(newRelPath);
+
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        throw err;
+      }
+    }
+    if (!fs.existsSync(newParentDir)) {
+      if (isRestore) {
+        try {
+          await fs.promises.mkdir(newParentDir, { recursive: true });
+        } catch (err) {
+          console.error("Impossibile creare la directory padre durante il ripristino:", err);
+          return res.status(500).json({ error: "Failed to create destination parent directory for restore" });
+        }
+      } else {
+        return res.status(404).json({ error: "New parent directory does not exist" });
+      }
+    }
+    await fs.promises.rename(oldAbsPath, newAbsPath);
+    await f.rename(oldRelPath, newRelPath);
+
+    res.status(200).json({ ok: true });
+
+  } catch (err) {
+    console.error(err);
+    if (err.code === 'ENOENT') {
+      return res.status(404).json({ error: "File not found for rename" });
+    }
+    res.status(500).json({ error: "rename failed" });
+  }
+});
 export default router;

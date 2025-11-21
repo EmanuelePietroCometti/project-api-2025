@@ -16,6 +16,7 @@ Cargo.lock
 .vscode/
 *.log
 *.bin
+
 # Sistema operativo
 .DS_Store
 Thumbs.db

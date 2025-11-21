@@ -136,4 +136,20 @@ export default function FileDAO() {
             });
         });
     };
+    this.rename = async (oldPath, newPath) => {
+        const newParentPath = p.dirname(newPath);
+        const newParentId = await this.getIdByPath(newParentPath);
+        const newName = p.basename(newPath);
+        const query = 'UPDATE files SET path=?, parent_id=?, parent=?, name=?, version=version+1 WHERE path=?';
+        return new Promise((resolve, reject) => {
+            db.run(query, [newPath, newParentId, newParentPath, newName, oldPath], function (err) {
+                if (err) return reject(err);
+                if (this.changes === 0) {
+                    resolve({ error: 'File not found.' });
+                } else {
+                    resolve({ success: true });
+                }
+            });
+        });
+    }
 }

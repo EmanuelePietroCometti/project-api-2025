@@ -477,7 +477,7 @@ impl Filesystem for RemoteFs {
 
         // 3) Aggiorna cache e rispondi
         self.insert_attr_cache(path.clone(), attr.clone());
-        let _ = self.update_cache(parent); // ricarica listing e metadati del parent
+        let _ = self.update_cache(parent);
         reply.attr(&self.cache_ttl, &attr);
     }
 
@@ -486,7 +486,45 @@ impl Filesystem for RemoteFs {
     // Non ha impatto sul funzionamento del filesystem
     // Serve per far funzionare correttamente il comando df
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser016::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 0, 0, 0);
+        match self.rt.block_on(self.api.statfs()) {
+            Ok(stats) => {
+                let bsize = stats.bsize; // Dimensione blocco (dal backend)
+                let blocks = stats.blocks; // Blocchi totali (dal backend)
+                let bfree = stats.bfree; // Blocchi liberi (dal backend)
+                let bavail = stats.bavail; // Blocchi disponibili (dal backend)
+                let files = stats.files; // Nodi file totali (dal backend)
+                let ffree = stats.ffree; // Nodi file liberi (dal backend)
+                let namelen: u32 = 255; // Lunghezza massima nome file (hardcoded)
+                let frsize: u32 = bsize as u32; // Dimensione frammento
+
+                reply.statfs(
+                    blocks,
+                    bfree,
+                    bavail,
+                    files,
+                    ffree,
+                    bsize as u32,
+                    namelen,
+                    frsize,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "statfs API call failed: {:?}. Falling back to dummy stats.",
+                    e
+                );
+                let bsize: u32 = 4096;
+                let blocks: u64 = 1_000_000;
+                let bfree: u64 = 1_000_000;
+                let bavail: u64 = 1_000_000;
+                let files: u64 = 1_000_000;
+                let ffree: u64 = 1_000_000;
+                let namelen: u32 = 255;
+                let frsize: u32 = bsize;
+
+                reply.statfs(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize);
+            }
+        }
     }
 
     // Permette di effettuare la ricerca di una directory per nome e ne resttiuisce il contenuto
@@ -914,6 +952,78 @@ impl Filesystem for RemoteFs {
         // Restituisci fh ed evita di cancellare il temporaneo; commit in flush/release
         reply.created(&self.cache_ttl, &attr, 0, ino, 0);
     }
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let old = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let new = match newname.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Recupera path dei parent
+        let Some(old_parent_path) = self.path_of(parent) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let Some(new_parent_path) = self.path_of(newparent) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        // Costruisci path completi
+        let old_path = old_parent_path.join(old);
+        let new_path = new_parent_path.join(new);
+
+        // Path relativi da passare alla API
+        let old_rel = Self::rel_of(&old_path);
+        let new_rel = Self::rel_of(&new_path);
+
+        // Chiamata alla API remota
+        match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
+            Ok(_) => {
+                // Pulisci cache
+                self.clear_cache(Some(&old_path));
+
+                let _ = self.update_cache(&old_parent_path);
+                let _ = self.update_cache(&new_parent_path);
+
+                // Aggiorna mapping inode
+                let mut ino_by_path = self.ino_by_path.lock().unwrap();
+                let mut path_by_ino = self.path_by_ino.lock().unwrap();
+
+                if let Some(ino) = ino_by_path.remove(&old_path) {
+                    path_by_ino.remove(&ino);
+
+                    // NUOVO mapping necessario per la GUI
+                    ino_by_path.insert(new_path.clone(), ino);
+                    path_by_ino.insert(ino, new_path.clone());
+                }
+
+                reply.ok();
+            }
+            Err(e) => {
+                reply.error(errno_from_anyhow(&e));
+            }
+        }
+    }
 
     fn mkdir(
         &mut self,
@@ -934,7 +1044,6 @@ impl Filesystem for RemoteFs {
             parent_path.join(name)
         };
         let rel = Self::rel_of(&path);
-
         match self.rt.block_on(self.api.mkdir(&rel)) {
             Ok(_) => {
                 if let Err(e) = self.update_cache(&parent_path) {
