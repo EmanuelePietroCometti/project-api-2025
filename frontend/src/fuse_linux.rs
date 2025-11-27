@@ -1012,7 +1012,7 @@ impl Filesystem for RemoteFs {
                 if let Some(ino) = ino_by_path.remove(&old_path) {
                     path_by_ino.remove(&ino);
 
-                    // NUOVO mapping necessario per la GUI
+                    // Mapping necessario per la GUI
                     ino_by_path.insert(new_path.clone(), ino);
                     path_by_ino.insert(ino, new_path.clone());
                 }
