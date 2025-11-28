@@ -1271,9 +1271,10 @@ impl FileSystemContext for RemoteFs {
         let rel  = RemoteFs::rel_of(std::path::Path::new(&path));       // "." o "./nome"
 
         let wants_delete = (granted_access & DELETE) != 0;
+        let wants_write = (granted_access & FILE_WRITE_DATA) != 0;
         println!(
-            "[OPEN] path='{}' rel='{}' granted_access=0x{:X} create_options=0x{:X} wants_delete={}",
-            path, rel, granted_access, create_options, wants_delete
+            "[OPEN] path='{}' rel='{}' granted_access=0x{:X} create_options=0x{:X} wants_delete={} wants_write={}",
+            path, rel, granted_access, create_options, wants_delete,wants_write
         );
 
         // 2) Root
@@ -1369,7 +1370,7 @@ impl FileSystemContext for RemoteFs {
         }
 
         // 8) TempWrite solo se FILE_WRITE_DATA
-        let temp_write = if (granted_access & FILE_WRITE_DATA) != 0 {
+        let temp_write = if wants_write {
             let temp_path = self.get_temporary_path(ino);
             if !temp_path.exists() {
                 std::fs::File::create(&temp_path).map_err(|e| {
@@ -1704,54 +1705,80 @@ impl FileSystemContext for RemoteFs {
             return Err(FspError::WIN32(ERROR_ALREADY_EXISTS));
         }
 
-        fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
-        fi.file_size = 0;
-        fi.creation_time = nt_time;
-        fi.last_access_time = nt_time;
-        fi.last_write_time = nt_time;
-        fi.change_time = nt_time;
 
         let ino = self.alloc_ino(Path::new(&path_str));
         println!("[CREATE] file ino: {:?}",ino);
 
+         // 1. Crea il file temporaneo vuoto PRIMA di chiamare write_file
         let temp_path = self.get_temporary_path(ino);
+        if let Err(e) = std::fs::File::create(&temp_path) {
+            eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
+            return Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32));
+        }
 
-        // TempWrite solo se ha FILE_WRITE_DATA
-        let temp_write = if (granted_access & FILE_WRITE_DATA) != 0 {
-            println!("[CREATE]Creo Temp file");
-            std::fs::File::create(&temp_path).map_err(|e| {
-                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-                FspError::from(io_err)
-            })?;
+        //aggiungo la creazione immediata del file vuoto per la gui (di explorer) che mi permette di fare la creazione file
+        match self.rt.block_on(self.api.write_file(&rel, &temp_path.to_str().unwrap())) {
+            Ok(_) => {
+                // 2. Prepara la struttura per le scritture temporanee
+                let temp_path = self.get_temporary_path(ino);
+                
+                // Crea il file temporaneo locale vuoto
+                if let Err(e) = std::fs::File::create(&temp_path) {
+                    eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
+                    return Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32));
+                }
+                //3 Prepara la struttura TempWrite
+                let temp_write = TempWrite {
+                    tem_path: temp_path,
+                    size: 0,
+                };
+                
+                // Salva il riferimento alle scritture temporanee
+                self.writes.lock().unwrap().insert(ino, temp_write);
+                
+                // 4. Crea il contesto del file
+                let file_context = MyFileContext {
+                    ino,
+                    temp_write: Some(TempWrite {
+                        tem_path: self.get_temporary_path(ino),
+                        size: 0,
+                    }),
+                    delete_on_close: AtomicBool::new(false),
+                    allow_delete: (granted_access & DELETE) != 0,
+                    is_dir: false,
+                };
+                
+                fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
+                fi.file_size = 0;
+                fi.creation_time = nt_time;
+                fi.last_access_time = nt_time;
+                fi.last_write_time = nt_time;
+                fi.change_time = nt_time;
 
-            let tw = TempWrite { tem_path: temp_path.clone(), size: 0 };
-            self.writes.lock().unwrap().insert(ino, tw.clone());
-            Some(tw)
-        } else {
-            None
-        };
+                // 4) Aggiorna cache parent: ricarica elenco (Explorer leggerà subito)
+                let _ = self.update_cache(&parent_path);
 
-        // ★ NEW: aggiorna cache parent (come FUSE)
-        let _ = self.update_cache(&parent_path);
-        // la attr dovrebbe farla la update se lo trova
-        // ★ NEW: crea attributi file e inserisci in cache (come FUSE create)
-        let mut attr = self.file_attr(
-            Path::new(&path_str),
-            NodeType::RegularFile,
-            0,
-            None,
-            0o644,
-        );
-        attr.nlink = 1;
-        self.insert_attr_cache(Path::new(&rel).to_path_buf(), attr);
-        
-        Ok(MyFileContext {
-            ino,
-            temp_write,
-            delete_on_close: AtomicBool::new(false),
-            is_dir: false,
-            allow_delete: (granted_access & DELETE) != 0,
-        })
+                 // ★ NEW: crea attributi file e inserisci in cache (come FUSE create)
+                let mut attr = self.file_attr(
+                    Path::new(&path_str),
+                    NodeType::RegularFile,
+                    0,
+                    None,
+                    0o644,
+                );
+                attr.nlink = 1;
+                self.insert_attr_cache(Path::new(&rel).to_path_buf(), attr);
+
+
+                Ok(file_context)
+            }
+            Err(e) => {
+                eprintln!("[CREATE] Errore creazione file sul backend: {}", e);
+                //pulisci il file temporaneo locale se write fallisce
+                let _ = std::fs::remove_file(&temp_path);
+                Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32))
+            }
+        }
     }
 
     //per la modifica dei permessi
