@@ -8,8 +8,14 @@ import statsRoutes from './routes/statsRoutes.js';
 import os from 'os';
 import fs from 'fs/promises';
 import db from './db/fileDB.js';
+import { Server as SocketIOServer } from 'socket.io';
+import http from 'http';
+import chokidar from 'chokidar';
+import FileDAO from './dao/fileDAO.js';
+import { stat } from 'fs';
+import path from 'path';
 
-const ROOT_DIR = './storage';
+export const ROOT_DIR = path.join(process.cwd(), "storage");
 async function bootstrap(rootDir, dbConnection) {
   console.log('Running startup routine...');
   try {
@@ -35,20 +41,238 @@ async function bootstrap(rootDir, dbConnection) {
         );
         CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
     `;
-    return new Promise((resolve, reject) => {
-        // dbConnection è il tuo oggetto db (es. sqlite3.Database)
-        dbConnection.exec(createTableQuery, (err) => { 
-            if (err) {
-                console.error("Error creating DB table:", err);
-                return reject(err);
-            }
-            console.log("Table 'files' created in DB.");
-            resolve();
-        });
+  return new Promise((resolve, reject) => {
+    // dbConnection è il tuo oggetto db (es. sqlite3.Database)
+    dbConnection.exec(createTableQuery, (err) => {
+      if (err) {
+        console.error("Error creating DB table:", err);
+        return reject(err);
+      }
+      console.log("Table 'files' created in DB.");
+      resolve();
     });
+  });
 }
 
 await bootstrap(ROOT_DIR, db);
+export const backendChanges = new Set();
+
+const watcher = chokidar.watch(ROOT_DIR, {
+  persistent: true,
+  ignoreInitial: true,
+  depth: 10,
+  alwaysStat: true,
+  awaitWriteFinish: {
+    stabilityThreshold: 200,
+    pollInterval: 100
+  },
+});
+
+async function handleFileUpdate(pathFile, stats) {
+  try {
+    console.log(`Handling update for ${path}`);
+    if (!stats) {
+      stats = await fs.stat(pathFile);
+    }
+    const relPath = clean(pathFile);
+    const parentPath = path.dirname(relPath);
+    const name = path.basename(pathFile);
+    const permissions = (stats.mode & 0o777).toString(8);
+
+
+
+    const fileData = {
+      path: relPath,
+      name,
+      parent: parentPath,
+      is_dir: stats.isDirectory(),
+      size: stats.size,
+      mtime: Math.floor(stats.mtimeMs / 1000),
+      permissions
+    }
+    console.log('File data to update:', fileData);
+    await f.updateFile(fileData);
+  } catch (err) {
+    console.error(`Error handling update for ${pathFile}:`, err);
+  }
+}
+async function handleRename(oldAbs, newAbs) {
+  try {
+    const oldRel = clean(oldAbs);
+    const newRel = clean(newAbs);
+    console.log(`Handling rename: ${oldRel} → ${newRel}`);
+    const parts = newRel.split("/");
+    const newParent = parts.length === 1 ? "." : parts.slice(0, -1).join("/");
+    const newName = parts[parts.length - 1];
+    const result = await f.rename(oldRel, newRel);
+
+    if (result?.error) {
+      console.error(`Rename failed: ${result.error}`);
+      return;
+    }
+
+    console.log(`Rename updated in DB: ${oldRel} → ${newRel}`);
+
+  } catch (err) {
+    console.error(`Error handling rename of ${oldAbs}:`, err);
+  }
+}
+
+
+async function handleFileDeletion(pathFile) {
+  try {
+    console.log(`Handling deletion for ${pathFile}`);
+    await f.deleteFile(clean(pathFile));
+  } catch (err) {
+    console.error(`Error handling deletion for ${pathFile}:`, err);
+  }
+}
+let pendingUnlink = null;
+let pendingUnlinkDir = null;
+const f = new FileDAO();
+watcher
+  .on('add', async fPath => {
+    console.log("absPath in addDir watcher:", fPath);
+    if (backendChanges.has(fPath)) {
+      backendChanges.delete(fPath);
+      return;
+    }
+    if (pendingUnlink && pendingUnlink.path !== fPath) {
+      clearTimeout(pendingUnlink.timer);
+      const oldAbs = pendingUnlink.path;
+      pendingUnlink = null;
+
+      console.log(`Detected manual rename (unlink+add): ${oldAbs} → ${fPath}`);
+      await handleRename(oldAbs, fPath);
+
+      io.emit('fs_change', {
+        op: 'rename',
+        oldPath: clean(oldAbs),
+        newPath: clean(fPath),
+      });
+      return;
+    }
+    console.log('File added:', fPath);
+    await handleFileUpdate(fPath);
+    io.emit('fs_change', { op: 'add', relPath: clean(fPath) });
+  })
+  .on('write', async fPath => {
+    console.log("absPath in write watcher:", fPath);
+    if (backendChanges.has(fPath)) {
+      backendChanges.delete(fPath);
+      return;
+    }
+    console.log('File written:', fPath);
+    await handleFileUpdate(fPath);
+    io.emit('fs_change', { op: 'write', relPath: clean(fPath) });
+  })
+  .on('addDir', async fPath => {
+    console.log("absPath in addDir watcher:", fPath);
+    if (backendChanges.has(fPath)) {
+      backendChanges.delete(fPath);
+      return;
+    }
+    if (pendingUnlinkDir && pendingUnlinkDir.path !== fPath) {
+    clearTimeout(pendingUnlinkDir.timer);
+
+    const oldAbs = pendingUnlinkDir.path;
+    pendingUnlinkDir = null;
+
+    console.log(`Detected manual directory rename: ${oldAbs} → ${fPath}`);
+    await handleRename(oldAbs, fPath);     // stessa handleRename dei file, funziona anche per dir
+
+    io.emit("fs_change", {
+      op: "renameDir",
+      oldPath: clean(oldAbs),
+      newPath: clean(fPath),
+    });
+
+    return;
+  }
+
+  // Caso: creazione manuale di una directory
+  console.log("Directory added manually:", fPath);
+  await handleFileUpdate(fPath);
+  io.emit("fs_change", { op: "addDir", relPath: clean(fPath) });
+  })
+  .on('unlink', async fPath => {
+    console.log("absPath in addDir watcher:", fPath);
+    if (backendChanges.has(fPath)) {
+      backendChanges.delete(fPath);
+      return;
+    }
+    if (pendingUnlink) {
+      clearTimeout(pendingUnlink.timer);
+    }
+
+    pendingUnlink = {
+      path: fPath,
+      timer: setTimeout(async () => {
+        // Se dopo il timeout nessuno "add" ha consumato questo unlink,
+        // allora è una cancellazione vera.
+        if (pendingUnlink && pendingUnlink.path === fPath) {
+          console.log('Confirmed manual deletion:', fPath);
+          pendingUnlink = null;
+
+          await handleFileDeletion(fPath);
+          io.emit('fs_change', { op: 'unlink', relPath: clean(fPath) });
+        }
+      }, 200), // 200ms di finestra per intercettare un eventuale add
+    };  
+  })
+  .on('unlinkDir', async fPath => {
+    console.log("absPath in addDir watcher:", fPath);
+    if (backendChanges.has(fPath)) {
+      backendChanges.delete(fPath);
+      return;
+    }
+    console.log("Directory unlinked (maybe delete or rename):", fPath);
+
+  if (pendingUnlinkDir) {
+    clearTimeout(pendingUnlinkDir.timer);
+  }
+
+  pendingUnlinkDir = {
+    path: fPath,
+    timer: setTimeout(async () => {
+      if (pendingUnlinkDir && pendingUnlinkDir.path === fPath) {
+        console.log("Confirmed manual directory deletion:", fPath);
+        pendingUnlinkDir = null;
+
+        await handleFileDeletion(fPath);
+        io.emit("fs_change", { op: "unlinkDir", relPath: clean(fPath) });
+      }
+    }, 200)
+  };
+  })
+  .on('change', async fPath => {
+    console.log("absPath in change watcher:", fPath);
+    if (backendChanges.has(fPath)) {
+      backendChanges.delete(fPath);
+      return;
+    }
+    console.log('File changed:', fPath);
+    await handleFileUpdate(fPath);
+    io.emit('fs_change', { op: 'change', relPath: clean(fPath) });
+  })
+  .on('rename', async (oldP, newP) => {
+    if (backendChanges.has(newP) || backendChanges.has(oldP)) {
+      backendChanges.delete(newP);
+      backendChanges.delete(oldP);
+      return;
+    }
+    console.log(`Renamed from ${oldP} to ${newP}`);
+    await handleRename(oldP, newP);
+    io.emit('fs_change', {
+      op: 'rename',
+      oldPath: clean(oldP),
+      newPath: clean(newP)
+    });
+  });
+
+function clean(path) {
+  return path.replace(/^.*storage\//, "");
+}
 
 // init express
 const app = new express();
@@ -56,7 +280,7 @@ app.use(morgan('dev'));
 app.use(express.json());
 
 const port = 3001;
-const interfaces = os.networkInterfaces(); 
+const interfaces = os.networkInterfaces();
 const addresses = [];
 
 for (let iface in interfaces) {
@@ -80,8 +304,25 @@ app.use('/files', filesRoutes);
 app.use('/mkdir', mkdirRoutes);
 app.use('/stats', statsRoutes);
 
+// Add the socket.io server
+const httpServer = http.createServer(app);
+export const io = new SocketIOServer(httpServer, {
+  cors: {
+    origin: originAddress,
+    credentials: true
+  }
+});
+
+io.on('connection', (socket) => {
+  console.log('A user connected:', socket.id);
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+  });
+});
+
 
 // activate the server
-app.listen(port, () => {
+httpServer.listen(port, () => {
   console.log(`Server listening at ${originAddress}`);
 });

@@ -1,7 +1,5 @@
 import express from 'express';
 import FileDAO from '../dao/fileDAO.js';
-import path from "path";
-import { dir } from 'console';
 
 const router = express.Router();
 const file=new FileDAO();
