@@ -3,7 +3,7 @@ use fuser015::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, ENOTSUP, EINVAL};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
@@ -44,6 +44,8 @@ struct RemoteFs {
     writes: Mutex<HashMap<u64, TempWrite>>,
     next_ino: Mutex<u64>,
     cache_ttl: Duration,
+    // gestione xattr (serve per non far fallire alcune operazioni sul finder)
+    xattrs: Mutex<HashMap<(u64, String), Vec<u8>>>,
 }
 
 fn errno_from_anyhow(err: &anyhow::Error) -> i32 {
@@ -188,6 +190,7 @@ impl RemoteFs {
             writes: Mutex::new(HashMap::new()),
             next_ino: Mutex::new(2),
             cache_ttl: Duration::from_secs(300),
+            xattrs: Mutex::new(HashMap::new()),
         }
     }
     // Funzione che alloca l'inode
@@ -487,7 +490,46 @@ impl Filesystem for RemoteFs {
     // Non ha impatto sul funzionamento del filesystem
     // Serve per far funzionare correttamente il comando df
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser015::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 0, 0, 0);
+
+          match self.rt.block_on(self.api.statfs()) {
+            Ok(stats) => {
+                let bsize = stats.bsize; // Dimensione blocco (dal backend)
+                let blocks = stats.blocks; // Blocchi totali (dal backend)
+                let bfree = stats.bfree; // Blocchi liberi (dal backend)
+                let bavail = stats.bavail; // Blocchi disponibili (dal backend)
+                let files = stats.files; // Nodi file totali (dal backend)
+                let ffree = stats.ffree; // Nodi file liberi (dal backend)
+                let namelen: u32 = 255; // Lunghezza massima nome file (hardcoded)
+                let frsize: u32 = bsize as u32; // Dimensione frammento
+
+                reply.statfs(
+                    blocks,
+                    bfree,
+                    bavail,
+                    files,
+                    ffree,
+                    bsize as u32,
+                    namelen,
+                    frsize,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "statfs API call failed: {:?}. Falling back to dummy stats.",
+                    e
+                );
+                let bsize: u32 = 4096;
+                let blocks: u64 = 1_000_000;
+                let bfree: u64 = 1_000_000;
+                let bavail: u64 = 1_000_000;
+                let files: u64 = 1_000_000;
+                let ffree: u64 = 1_000_000;
+                let namelen: u32 = 255;
+                let frsize: u32 = bsize;
+
+                reply.statfs(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize);
+            }
+        }
     }
 
     // Permette di effettuare la ricerca di una directory per nome e ne resttiuisce il contenuto
@@ -916,6 +958,115 @@ impl Filesystem for RemoteFs {
         reply.created(&self.cache_ttl, &attr, 0, ino, 0);
     }
 
+fn rename(
+    &mut self,
+    _req: &Request<'_>,
+    parent: u64,
+    name: &OsStr,
+    newparent: u64,
+    newname: &OsStr,
+    flags: u32,
+    reply: ReplyEmpty,
+) {
+
+    println!("RENAME {:?}/{:?} -> {:?}/{:?}", parent, name, newparent, newname);
+
+    // --- 1. Flag macOS da gestire ---
+    const RENAME_EXCL: u32 = 0x00000002;
+    const RENAME_NOREPLACE: u32 = 0x00000004;
+    const RENAME_SWAP: u32 = 0x00000008;
+
+    // Finder non usa RENAME_SWAP -> possiamo rifiutarlo
+    if flags & RENAME_SWAP != 0 {
+        reply.error(libc::ENOTSUP);
+        return;
+    }
+
+    // --- 2. Conversione nome file ---
+    let old = match name.to_str() {
+        Some(s) => s,
+        None => {
+            reply.error(libc::EINVAL);
+            return;
+        }
+    };
+    let new = match newname.to_str() {
+        Some(s) => s,
+        None => {
+            reply.error(libc::EINVAL);
+            return;
+        }
+    };
+
+    // --- 3. Risoluzione path ---
+    let Some(old_parent_path) = self.path_of(parent) else {
+        reply.error(libc::ENOENT);
+        return;
+    };
+    let Some(new_parent_path) = self.path_of(newparent) else {
+        reply.error(libc::ENOENT);
+        return;
+    };
+
+    let old_path = old_parent_path.join(old);
+    let new_path = new_parent_path.join(new);
+
+    let old_rel = Self::rel_of(&old_path);
+    let new_rel = Self::rel_of(&new_path);
+
+    // --- 4. Gestione RENAME_EXCL / NOREPLACE ---
+    if flags & (RENAME_EXCL | RENAME_NOREPLACE) != 0 {
+        if new_path.exists() {
+            reply.error(libc::EEXIST);
+            return;
+        }
+    }
+
+    // --- 5. Chiamata al backend remoto ---
+    match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
+        Ok(_) => {
+            // --- 6. Pulizia cache ---
+            self.clear_cache(Some(&old_path));
+            let _ = self.update_cache(&old_parent_path);
+            let _ = self.update_cache(&new_parent_path);
+
+            // --- 7. Aggiorna inode mapping ---
+            let mut ino_by_path = self.ino_by_path.lock().unwrap();
+            let mut path_by_ino = self.path_by_ino.lock().unwrap();
+
+            if let Some(ino) = ino_by_path.remove(&old_path) {
+                // aggiorna il nodo renamato
+                path_by_ino.remove(&ino);
+                ino_by_path.insert(new_path.clone(), ino);
+                path_by_ino.insert(ino, new_path.clone());
+
+                // se è una directory, aggiorna i figli
+                let mut to_update = Vec::new();
+                for (path, child_ino) in ino_by_path.iter() {
+                    if let Ok(suffix) = path.strip_prefix(&old_path) {
+                        to_update.push((*child_ino, suffix.to_path_buf()));
+                    }
+                }
+
+                for (child_ino, suffix) in to_update {
+                    let old_child = old_path.join(&suffix);
+                    let new_child = new_path.join(&suffix);
+
+                    ino_by_path.remove(&old_child);
+                    ino_by_path.insert(new_child.clone(), child_ino);
+                    path_by_ino.insert(child_ino, new_child);
+                }
+            }
+
+            reply.ok();
+        }
+
+        Err(e) => {
+            reply.error(errno_from_anyhow(&e));
+        }
+    }
+}
+
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
@@ -992,6 +1143,106 @@ impl Filesystem for RemoteFs {
             }
         }
     }
+
+    fn setxattr(
+    &mut self,
+    _req: &Request<'_>,
+    ino: u64,
+    name: &OsStr,
+    value: &[u8],
+    flags: i32,
+    _position: u32,
+    reply: ReplyEmpty,
+) {
+    let key = (ino, name.to_string_lossy().to_string());
+    let mut map = self.xattrs.lock().unwrap();
+
+    // XATTR_CREATE → fallisce se esiste già
+    if flags & libc::XATTR_CREATE != 0 {
+        if map.contains_key(&key) {
+            reply.error(libc::EEXIST);
+            return;
+        }
+    }
+
+    // XATTR_REPLACE → fallisce se NON esiste
+    if flags & libc::XATTR_REPLACE != 0 {
+        if !map.contains_key(&key) {
+            reply.error(libc::ENOATTR);
+            return;
+        }
+    }
+
+    map.insert(key, value.to_vec());
+    reply.ok();
+}
+
+
+fn getxattr(
+    &mut self,
+    _req: &Request<'_>,
+    ino: u64,
+    name: &OsStr,
+    size: u32,
+    reply: fuser015::ReplyXattr,
+) {
+    let key = (ino, name.to_string_lossy().to_string());
+    let map = self.xattrs.lock().unwrap();
+
+    if let Some(val) = map.get(&key) {
+        if size == 0 {
+            reply.size(val.len() as u32);
+        } else {
+            reply.data(val);
+        }
+    } else {
+        reply.error(libc::ENOATTR);
+    }
+}
+
+
+fn listxattr(
+    &mut self,
+    _req: &Request<'_>,
+    ino: u64,
+    size: u32,
+    reply: fuser015::ReplyXattr,
+) {
+    let map = self.xattrs.lock().unwrap();
+
+    let mut names = Vec::new();
+    for ((xino, name), _) in map.iter() {
+        if *xino == ino {
+            names.extend_from_slice(name.as_bytes());
+            names.push(0); // null terminator
+        }
+    }
+
+    if size == 0 {
+        reply.size(names.len() as u32);
+    } else {
+        reply.data(&names);
+    }
+}
+
+
+fn removexattr(
+    &mut self,
+    _req: &Request<'_>,
+    ino: u64,
+    name: &OsStr,
+    reply: ReplyEmpty,
+) {
+    let key = (ino, name.to_string_lossy().to_string());
+    let mut map = self.xattrs.lock().unwrap();
+
+    if map.remove(&key).is_some() {
+        reply.ok();
+    } else {
+        reply.error(libc::ENOATTR);
+    }
+}
+
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let Some(parent_path) = self.path_of(parent) else {
