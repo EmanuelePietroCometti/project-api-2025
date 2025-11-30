@@ -114,7 +114,7 @@ impl FileSystemContext for RemoteFs {
     }
 }
 
-pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
+pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let fs = RemoteFs::new();
     let mut vparams = VolumeParams::default();
     vparams.sectors_per_allocation_unit(64); // Numero di settori per unità di allocazione

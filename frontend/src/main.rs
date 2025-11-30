@@ -20,5 +20,5 @@ fn main() -> anyhow::Result<()> {
     let mp = mountpoint.to_string_lossy().to_string();
     println!("Mounting filesystem at: {}", mp);
     let api = FileApi::new(&url);
-    mount_fs(&mp, api)
+    mount_fs(&mp, api, url)
 }

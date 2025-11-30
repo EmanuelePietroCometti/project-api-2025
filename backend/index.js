@@ -55,6 +55,25 @@ async function bootstrap(rootDir, dbConnection) {
 }
 
 await bootstrap(ROOT_DIR, db);
+
+async function buildMetadataPayload(absPath) {
+  const stats = await fs.stat(absPath);
+  const relPath = clean(absPath);
+  const name = path.basename(absPath);
+  const parent = path.dirname(relPath);
+  const permissions = (stats.mode & 0o777).toString(8);
+
+  return {
+    relPath,
+    name,
+    parent,
+    is_dir: stats.isDirectory(),
+    size: stats.size,
+    mtime: Math.floor(stats.mtimeMs / 1000),
+    permissions
+  };
+}
+
 export const backendChanges = new Set();
 
 const watcher = chokidar.watch(ROOT_DIR, {
@@ -132,128 +151,161 @@ let pendingUnlinkDir = null;
 const f = new FileDAO();
 watcher
   .on('add', async fPath => {
-    console.log("absPath in addDir watcher:", fPath);
+    console.log("File added:", fPath);
+
     if (backendChanges.has(fPath)) {
-      backendChanges.delete(fPath);
-      return;
+      backendChanges.delete(fPath); return;
     }
+
     if (pendingUnlink && pendingUnlink.path !== fPath) {
       clearTimeout(pendingUnlink.timer);
       const oldAbs = pendingUnlink.path;
       pendingUnlink = null;
 
-      console.log(`Detected manual rename (unlink+add): ${oldAbs} → ${fPath}`);
       await handleRename(oldAbs, fPath);
+
+      const meta = await buildMetadataPayload(fPath);
 
       io.emit('fs_change', {
         op: 'rename',
         oldPath: clean(oldAbs),
-        newPath: clean(fPath),
+        newPath: meta.relPath,
+        ...meta
       });
       return;
     }
-    console.log('File added:', fPath);
+
     await handleFileUpdate(fPath);
-    io.emit('fs_change', { op: 'add', relPath: clean(fPath) });
+    const meta = await buildMetadataPayload(fPath);
+
+    io.emit('fs_change', {
+      op: 'add',
+      ...meta
+    });
   })
   .on('write', async fPath => {
-    console.log("absPath in write watcher:", fPath);
-    if (backendChanges.has(fPath)) {
-      backendChanges.delete(fPath);
-      return;
-    }
+    if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
+
     console.log('File written:', fPath);
+
     await handleFileUpdate(fPath);
-    io.emit('fs_change', { op: 'write', relPath: clean(fPath) });
+    const meta = await buildMetadataPayload(fPath);
+
+    io.emit('fs_change', {
+      op: 'write',
+      ...meta
+    });
   })
+
   .on('addDir', async fPath => {
-    console.log("absPath in addDir watcher:", fPath);
-    if (backendChanges.has(fPath)) {
-      backendChanges.delete(fPath);
+    if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
+
+    if (pendingUnlinkDir && pendingUnlinkDir.path !== fPath) {
+      clearTimeout(pendingUnlinkDir.timer);
+
+      const oldAbs = pendingUnlinkDir.path;
+      pendingUnlinkDir = null;
+
+      await handleRename(oldAbs, fPath);
+
+      const meta = await buildMetadataPayload(fPath);
+
+      io.emit("fs_change", {
+        op: "renameDir",
+        oldPath: clean(oldAbs),
+        newPath: meta.relPath,
+        ...meta
+      });
       return;
     }
-    if (pendingUnlinkDir && pendingUnlinkDir.path !== fPath) {
-    clearTimeout(pendingUnlinkDir.timer);
 
-    const oldAbs = pendingUnlinkDir.path;
-    pendingUnlinkDir = null;
+    await handleFileUpdate(fPath);
+    const meta = await buildMetadataPayload(fPath);
 
-    console.log(`Detected manual directory rename: ${oldAbs} → ${fPath}`);
-    await handleRename(oldAbs, fPath);     // stessa handleRename dei file, funziona anche per dir
+    meta.is_dir = true; // sicurezza
 
     io.emit("fs_change", {
-      op: "renameDir",
-      oldPath: clean(oldAbs),
-      newPath: clean(fPath),
+      op: "addDir",
+      ...meta
     });
-
-    return;
-  }
-
-  // Caso: creazione manuale di una directory
-  console.log("Directory added manually:", fPath);
-  await handleFileUpdate(fPath);
-  io.emit("fs_change", { op: "addDir", relPath: clean(fPath) });
   })
+
+
   .on('unlink', async fPath => {
-    console.log("absPath in addDir watcher:", fPath);
-    if (backendChanges.has(fPath)) {
-      backendChanges.delete(fPath);
-      return;
-    }
-    if (pendingUnlink) {
-      clearTimeout(pendingUnlink.timer);
-    }
+    if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
+
+    if (pendingUnlink) clearTimeout(pendingUnlink.timer);
 
     pendingUnlink = {
       path: fPath,
       timer: setTimeout(async () => {
-        // Se dopo il timeout nessuno "add" ha consumato questo unlink,
-        // allora è una cancellazione vera.
-        if (pendingUnlink && pendingUnlink.path === fPath) {
-          console.log('Confirmed manual deletion:', fPath);
-          pendingUnlink = null;
+        if (!pendingUnlink || pendingUnlink.path !== fPath) return;
 
-          await handleFileDeletion(fPath);
-          io.emit('fs_change', { op: 'unlink', relPath: clean(fPath) });
-        }
-      }, 200), // 200ms di finestra per intercettare un eventuale add
-    };  
-  })
-  .on('unlinkDir', async fPath => {
-    console.log("absPath in addDir watcher:", fPath);
-    if (backendChanges.has(fPath)) {
-      backendChanges.delete(fPath);
-      return;
-    }
-    console.log("Directory unlinked (maybe delete or rename):", fPath);
-
-  if (pendingUnlinkDir) {
-    clearTimeout(pendingUnlinkDir.timer);
-  }
-
-  pendingUnlinkDir = {
-    path: fPath,
-    timer: setTimeout(async () => {
-      if (pendingUnlinkDir && pendingUnlinkDir.path === fPath) {
-        console.log("Confirmed manual directory deletion:", fPath);
-        pendingUnlinkDir = null;
+        pendingUnlink = null;
+        const rel = clean(fPath);
+        const name = path.basename(fPath);
+        const parent = path.dirname(rel);
 
         await handleFileDeletion(fPath);
-        io.emit("fs_change", { op: "unlinkDir", relPath: clean(fPath) });
-      }
-    }, 200)
-  };
+
+        io.emit('fs_change', {
+          op: 'unlink',
+          relPath: rel,
+          name,
+          parent,
+          is_dir: false,
+          size: 0,
+          mtime: 0,
+          permissions: "000"
+        });
+      }, 200)
+    };
   })
+
+  .on('unlinkDir', async fPath => {
+    if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
+
+    if (pendingUnlinkDir) clearTimeout(pendingUnlinkDir.timer);
+
+    pendingUnlinkDir = {
+      path: fPath,
+      timer: setTimeout(async () => {
+        if (!pendingUnlinkDir || pendingUnlinkDir.path !== fPath) return;
+
+        pendingUnlinkDir = null;
+
+        const rel = clean(fPath);
+        const name = path.basename(fPath);
+        const parent = path.dirname(rel);
+
+        await handleFileDeletion(fPath);
+
+        io.emit("fs_change", {
+          op: "unlinkDir",
+          relPath: rel,
+          name,
+          parent,
+          is_dir: true,
+          size: 0,
+          mtime: 0,
+          permissions: "000"
+        });
+      }, 200)
+    };
+  })
+
   .on('change', async fPath => {
-    console.log("absPath in change watcher:", fPath);
-    if (backendChanges.has(fPath)) {
-      backendChanges.delete(fPath);
-      return;
-    }
-    console.log('File changed:', fPath);
+    if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
+
+    console.log("File changed:", fPath);
     await handleFileUpdate(fPath);
-    io.emit('fs_change', { op: 'change', relPath: clean(fPath) });
+
+    const meta = await buildMetadataPayload(fPath);
+
+    io.emit('fs_change', {
+      op: 'change',
+      ...meta
+    });
   })
   .on('rename', async (oldP, newP) => {
     if (backendChanges.has(newP) || backendChanges.has(oldP)) {
@@ -261,14 +313,21 @@ watcher
       backendChanges.delete(oldP);
       return;
     }
+
     console.log(`Renamed from ${oldP} to ${newP}`);
     await handleRename(oldP, newP);
+
+    const meta = await buildMetadataPayload(newP);
+
     io.emit('fs_change', {
       op: 'rename',
       oldPath: clean(oldP),
-      newPath: clean(newP)
+      newPath: meta.relPath,
+      ...meta
     });
   });
+
+
 
 function clean(path) {
   return path.replace(/^.*storage\//, "");

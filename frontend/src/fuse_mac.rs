@@ -1299,7 +1299,7 @@ fn removexattr(
     }
 }
 
-pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
+pub fn mount_fs(mountpoint: &str, api: FileApi, url: Strings) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
     let fs = RemoteFs::new(api, rt);
     fs.init_cache();

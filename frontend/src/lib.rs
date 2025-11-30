@@ -19,7 +19,7 @@ pub use fuse_windows::mount_fs;
     all(target_os = "macos", feature = "macos"),
     all(target_os = "windows", feature = "windows"),
 )))]
-pub fn mount_fs(mountpoint: &str, api: file_api::FileApi) -> anyhow::Result<()> {
+pub fn mount_fs(mountpoint: &str, api: file_api::FileApi, url: String) -> anyhow::Result<()> {
     Err(anyhow::anyhow!(
         "mount_fs is only available on supported OS targets (Linux/macOS/Windows with --features windows)"
     ))
