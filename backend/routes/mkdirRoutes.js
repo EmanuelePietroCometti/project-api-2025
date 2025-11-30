@@ -1,17 +1,12 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import FileDAO from '../dao/fileDAO.js';
-import { version } from 'os';
-import { dir } from 'console';
+import { ROOT_DIR, backendChanges } from '../index.js';
 
 
 const f = new FileDAO();
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const router = express.Router();
-const ROOT_DIR = path.join(__dirname, "..", "storage");
 
 // POST /mkdir/path
 router.post("/", async (req, res) => {
@@ -21,6 +16,8 @@ router.post("/", async (req, res) => {
     const parentPathAbs = path.dirname(dirPath);
     const parentDirName = path.dirname(relPath);
     const name = path.basename(dirPath);
+    backendChanges.add(dirPath);
+    console.log("dirPath in mkdirRoutes:", dirPath);
     // Controlla se la directory padre esiste
     if (!fs.existsSync(parentPathAbs) && parentPathAbs !== ROOT_DIR) {
       return res.status(400).json({ error: "Parent directory not found" });
@@ -35,7 +32,8 @@ router.post("/", async (req, res) => {
     }
     // Crea la directory fisica
     await fs.promises.mkdir(dirPath);
-    
+    const stats = await fs.promises.stat(dirPath);
+    const permissions = (stats.mode & 0o777).toString(8);
     
     /*console.log({
       dirPath,
@@ -46,14 +44,15 @@ router.post("/", async (req, res) => {
       ROOT_DIR,
     });*/
     // Inserisci nel DB i metadata
+
     await f.createDirectory({
       path: relPath,
       parent: parentDirName,
       name: name,
       is_dir: true,
-      size: 0,
-      mtime: Math.floor(Date.now() / 1000),
-      permissions: "755"
+      size: stats.size,
+      mtime: Math.floor(stats.mtimeMs / 1000),
+      permissions
     });
 
     res.status(201).json({ message: "Directory successfully created" });

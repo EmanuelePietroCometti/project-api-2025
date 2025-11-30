@@ -1,14 +1,11 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 import FileDAO from "../dao/fileDAO.js";
+import { ROOT_DIR, backendChanges } from '../index.js';
 
 const router = express.Router();
 const f = new FileDAO();
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const ROOT_DIR = path.join(__dirname, "..", "storage");
 
 // GET /files/path
 router.get("/", async (req, res) => {
@@ -16,7 +13,7 @@ router.get("/", async (req, res) => {
     const relPath = req.query.relPath;
     const filePath = path.join(ROOT_DIR, relPath);
     const parentPath = path.dirname(filePath);
-
+    backendChanges.add(filePath);
     // Controlla che la directory padre esista
     if (!fs.existsSync(parentPath)) {
       return res
@@ -52,7 +49,7 @@ router.put("/", async (req, res) => {
     const parentPathAbs = path.dirname(filePathAbs);
     const parentPath = path.dirname(relPath);
     const name = path.basename(filePathAbs);
-
+    backendChanges.add(filePathAbs);
     /* console.log({
       relPath,
       filePathAbs,
@@ -76,6 +73,7 @@ router.put("/", async (req, res) => {
 
     writeStream.on("finish", async () => {
       const stats = await fs.promises.stat(filePathAbs);
+      const permissions = (stats.mode & 0o777).toString(8);
 
 
       // Aggiorna o inserisci metadata nel DB
@@ -86,7 +84,7 @@ router.put("/", async (req, res) => {
         is_dir: false,
         size: stats.size,
         mtime: Math.floor(stats.mtimeMs / 1000),
-        permissions: "755",
+        permissions
       });
 
       res.status(200).json({ message: "File correctly saved. " });
@@ -107,7 +105,7 @@ router.delete("/", async (req, res) => {
   try {
     const relPath = req.query.relPath;
     const filePathAbs = path.join(ROOT_DIR, relPath);
-
+    backendChanges.add(filePathAbs);
     // Controlla se esiste
     const stats = await fs.promises.stat(filePathAbs).catch(() => null);
     if (!stats) {
@@ -134,8 +132,9 @@ router.delete("/", async (req, res) => {
 router.patch("/chmod", async (req, res) => {
   try {
     const relPath = req.query.relPath;
-    const perm = req.query.perm; // stringa ottale, es. "644"
-    const filePathAbs = path.join(ROOT_DIR, relPath); // FIX: era undefined
+    const perm = req.query.perm; 
+    const filePathAbs = path.join(ROOT_DIR, relPath);
+    backendChanges.add(filePathAbs);
     await fs.promises.chmod(filePathAbs, parseInt(perm, 8));
     await f.updatePermissions(relPath, perm);
     res.status(200).json({ ok: true });
@@ -151,6 +150,7 @@ router.patch("/truncate", async (req, res) => {
     const relPath = req.query.relPath;
     const size = parseInt(req.query.size, 10);
     const filePathAbs = path.join(ROOT_DIR, relPath);
+    backendChanges.add(filePathAbs);
     await fs.promises.truncate(filePathAbs, size);
     const stats = await fs.promises.stat(filePathAbs);
     await f.updateFile({
@@ -176,6 +176,7 @@ router.patch("/utimes", async (req, res) => {
     const at = req.query.atime ? parseInt(req.query.atime, 10) : null;
     const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null;
     const filePathAbs = path.join(ROOT_DIR, relPath);
+    backendChanges.add(filePathAbs);
 
     // Se mancano, usa stat per tenere l'altro inalterato
     const stats = await fs.promises.stat(filePathAbs);
@@ -202,6 +203,8 @@ router.patch("/rename", async (req, res) => {
     const oldAbsPath = path.join(ROOT_DIR, oldRelPath);
     const newAbsPath = path.join(ROOT_DIR, newRelPath);
     const newParentDir = path.dirname(newAbsPath);
+    backendChanges.add(oldAbsPath);
+    backendChanges.add(newAbsPath);
 
     // Identifica se l'operazione di rename proviene dal Cestino (e quindi è un ripristino)
     const isRestore = oldRelPath.startsWith("/.Trash-");
