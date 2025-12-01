@@ -20,7 +20,6 @@ router.get('/', async (req, res) => {
     res.json(response);
 
   } catch (err) {
-    console.error("Errore in statfs:", err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

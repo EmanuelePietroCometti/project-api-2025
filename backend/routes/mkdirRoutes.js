@@ -18,7 +18,7 @@ router.post("/", async (req, res) => {
     const name = path.basename(dirPath);
     backendChanges.add(dirPath);
     console.log("dirPath in mkdirRoutes:", dirPath);
-    // Controlla se la directory padre esiste
+    
     if (!fs.existsSync(parentPathAbs) && parentPathAbs !== ROOT_DIR) {
       return res.status(400).json({ error: "Parent directory not found" });
     } 
@@ -26,25 +26,14 @@ router.post("/", async (req, res) => {
       await fs.promises.mkdir(parentPathAbs);
     }
 
-    // Controlla se la directory esiste già
     if (fs.existsSync(dirPath)) {
       return res.status(409).json({ error: "Directory already exist" });
     }
-    // Crea la directory fisica
+
     await fs.promises.mkdir(dirPath);
     const stats = await fs.promises.stat(dirPath);
     const permissions = (stats.mode & 0o777).toString(8);
     
-    /*console.log({
-      dirPath,
-      relPath,
-      parentPathAbs,
-      name,
-      parentDirName,
-      ROOT_DIR,
-    });*/
-    // Inserisci nel DB i metadata
-
     await f.createDirectory({
       path: relPath,
       parent: parentDirName,
@@ -58,7 +47,6 @@ router.post("/", async (req, res) => {
     res.status(201).json({ message: "Directory successfully created" });
 
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });

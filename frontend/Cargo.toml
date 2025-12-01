@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12.24", features = ["json"] }
+tokio = { version = "1.48.0", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow= "1"
@@ -15,7 +15,7 @@ winfsp={ version = "0.12.0", optional = true }
 winfsp-sys = { version = "0.12.0+winfsp-2.1", optional = true }
 widestring = "1.2.0"
 libc = "0.2.177"
-ctrlc = "3.5.0"
+ctrlc = "3.5.1"
 nix = { version = "0.30", features = ["user"], optional = true }
 d = "0.0.1"
 urlencoding = "2.1.3"

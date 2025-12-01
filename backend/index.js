@@ -12,17 +12,13 @@ import { Server as SocketIOServer } from 'socket.io';
 import http from 'http';
 import chokidar from 'chokidar';
 import FileDAO from './dao/fileDAO.js';
-import { stat } from 'fs';
 import path from 'path';
 
 export const ROOT_DIR = path.join(process.cwd(), "storage");
 async function bootstrap(rootDir, dbConnection) {
-  console.log('Running startup routine...');
   try {
     await fs.mkdir(rootDir, { recursive: true });
-    console.log(`Root directory created or already exists: ${rootDir}`);
   } catch (err) {
-    console.error('Error creating directories:', err);
     throw err;
   }
   const createTableQuery = `
@@ -42,13 +38,10 @@ async function bootstrap(rootDir, dbConnection) {
         CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
     `;
   return new Promise((resolve, reject) => {
-    // dbConnection è il tuo oggetto db (es. sqlite3.Database)
     dbConnection.exec(createTableQuery, (err) => {
       if (err) {
-        console.error("Error creating DB table:", err);
         return reject(err);
       }
-      console.log("Table 'files' created in DB.");
       resolve();
     });
   });
@@ -89,7 +82,6 @@ const watcher = chokidar.watch(ROOT_DIR, {
 
 async function handleFileUpdate(pathFile, stats) {
   try {
-    console.log(`Handling update for ${path}`);
     if (!stats) {
       stats = await fs.stat(pathFile);
     }
@@ -97,8 +89,6 @@ async function handleFileUpdate(pathFile, stats) {
     const parentPath = path.dirname(relPath);
     const name = path.basename(pathFile);
     const permissions = (stats.mode & 0o777).toString(8);
-
-
 
     const fileData = {
       path: relPath,
@@ -109,7 +99,6 @@ async function handleFileUpdate(pathFile, stats) {
       mtime: Math.floor(stats.mtimeMs / 1000),
       permissions
     }
-    console.log('File data to update:', fileData);
     await f.updateFile(fileData);
   } catch (err) {
     console.error(`Error handling update for ${pathFile}:`, err);
@@ -119,19 +108,14 @@ async function handleRename(oldAbs, newAbs) {
   try {
     const oldRel = clean(oldAbs);
     const newRel = clean(newAbs);
-    console.log(`Handling rename: ${oldRel} → ${newRel}`);
     const parts = newRel.split("/");
     const newParent = parts.length === 1 ? "." : parts.slice(0, -1).join("/");
     const newName = parts[parts.length - 1];
     const result = await f.rename(oldRel, newRel);
 
     if (result?.error) {
-      console.error(`Rename failed: ${result.error}`);
       return;
     }
-
-    console.log(`Rename updated in DB: ${oldRel} → ${newRel}`);
-
   } catch (err) {
     console.error(`Error handling rename of ${oldAbs}:`, err);
   }
@@ -140,7 +124,6 @@ async function handleRename(oldAbs, newAbs) {
 
 async function handleFileDeletion(pathFile) {
   try {
-    console.log(`Handling deletion for ${pathFile}`);
     await f.deleteFile(clean(pathFile));
   } catch (err) {
     console.error(`Error handling deletion for ${pathFile}:`, err);
@@ -151,8 +134,6 @@ let pendingUnlinkDir = null;
 const f = new FileDAO();
 watcher
   .on('add', async fPath => {
-    console.log("File added:", fPath);
-
     if (backendChanges.has(fPath)) {
       backendChanges.delete(fPath); return;
     }
@@ -185,8 +166,6 @@ watcher
   })
   .on('write', async fPath => {
     if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
-
-    console.log('File written:', fPath);
 
     await handleFileUpdate(fPath);
     const meta = await buildMetadataPayload(fPath);
@@ -222,7 +201,7 @@ watcher
     await handleFileUpdate(fPath);
     const meta = await buildMetadataPayload(fPath);
 
-    meta.is_dir = true; // sicurezza
+    meta.is_dir = true;
 
     io.emit("fs_change", {
       op: "addDir",
@@ -297,7 +276,6 @@ watcher
   .on('change', async fPath => {
     if (backendChanges.has(fPath)) { backendChanges.delete(fPath); return; }
 
-    console.log("File changed:", fPath);
     await handleFileUpdate(fPath);
 
     const meta = await buildMetadataPayload(fPath);
@@ -314,7 +292,6 @@ watcher
       return;
     }
 
-    console.log(`Renamed from ${oldP} to ${newP}`);
     await handleRename(oldP, newP);
 
     const meta = await buildMetadataPayload(newP);

@@ -14,7 +14,6 @@ router.get("/", async (req, res) => {
     const filePath = path.join(ROOT_DIR, relPath);
     const parentPath = path.dirname(filePath);
     backendChanges.add(filePath);
-    // Controlla che la directory padre esista
     if (!fs.existsSync(parentPath)) {
       return res
         .status(400)
@@ -32,11 +31,9 @@ router.get("/", async (req, res) => {
     readStream.pipe(res);
 
     readStream.on("error", (err) => {
-      console.error(err);
       res.status(500).json({ error: "Error on file reading" });
     });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -50,15 +47,7 @@ router.put("/", async (req, res) => {
     const parentPath = path.dirname(relPath);
     const name = path.basename(filePathAbs);
     backendChanges.add(filePathAbs);
-    /* console.log({
-      relPath,
-      filePathAbs,
-      parentPathAbs,
-      name,
-      ROOT_DIR,
-    }); */
-
-    // Controlla che la directory padre esista
+    
     if (!fs.existsSync(parentPathAbs)) {
       return res
         .status(400)
@@ -67,7 +56,6 @@ router.put("/", async (req, res) => {
         });
     }
 
-    // Scrivi file con streaming
     const writeStream = fs.createWriteStream(filePathAbs);
     req.pipe(writeStream);
 
@@ -75,8 +63,6 @@ router.put("/", async (req, res) => {
       const stats = await fs.promises.stat(filePathAbs);
       const permissions = (stats.mode & 0o777).toString(8);
 
-
-      // Aggiorna o inserisci metadata nel DB
       await f.updateFile({
         path: relPath,
         name: name,
@@ -91,11 +77,9 @@ router.put("/", async (req, res) => {
     });
 
     writeStream.on("error", (err) => {
-      console.error(err);
       res.status(500).json({ error: "Error on file writing" });
     });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -106,24 +90,21 @@ router.delete("/", async (req, res) => {
     const relPath = req.query.relPath;
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
-    // Controlla se esiste
+    
     const stats = await fs.promises.stat(filePathAbs).catch(() => null);
     if (!stats) {
       return res.status(404).json({ error: "File or directory not found" });
     }
 
-    // Cancella fisicamente dal filesystem
     if (stats.isDirectory()) {
       await fs.promises.rm(filePathAbs, { recursive: true, force: true });
     } else {
       await fs.promises.unlink(filePathAbs);
     }
 
-    // Cancella i metadata dal DB (ON DELETE CASCADE gestisce eventuali figli)
     await f.deleteFile(relPath);
     res.status(200).json({ message: "Deletion completed" });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -139,7 +120,6 @@ router.patch("/chmod", async (req, res) => {
     await f.updatePermissions(relPath, perm);
     res.status(200).json({ ok: true });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "chmod failed" });
   }
 });
@@ -160,11 +140,10 @@ router.patch("/truncate", async (req, res) => {
       is_dir: false,
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions: undefined, // non toccare qui
+      permissions: undefined,
     });
     res.status(200).json({ ok: true });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "truncate failed" });
   }
 });
@@ -178,7 +157,6 @@ router.patch("/utimes", async (req, res) => {
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
 
-    // Se mancano, usa stat per tenere l'altro inalterato
     const stats = await fs.promises.stat(filePathAbs);
     const atime = at ? new Date(at * 1000) : stats.atime;
     const mtime = mt ? new Date(mt * 1000) : stats.mtime;
@@ -187,7 +165,6 @@ router.patch("/utimes", async (req, res) => {
     await f.updateMtime(relPath, Math.floor(stats2.mtimeMs / 1000));
     res.status(200).json({ ok: true });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: "utimes failed" });
   }
 });
@@ -206,7 +183,6 @@ router.patch("/rename", async (req, res) => {
     backendChanges.add(oldAbsPath);
     backendChanges.add(newAbsPath);
 
-    // Identifica se l'operazione di rename proviene dal Cestino (e quindi è un ripristino)
     const isRestore = oldRelPath.startsWith("/.Trash-");
     try {
       await fs.promises.stat(newAbsPath);
@@ -223,7 +199,6 @@ router.patch("/rename", async (req, res) => {
         try {
           await fs.promises.mkdir(newParentDir, { recursive: true });
         } catch (err) {
-          console.error("Impossibile creare la directory padre durante il ripristino:", err);
           return res.status(500).json({ error: "Failed to create destination parent directory for restore" });
         }
       } else {
@@ -236,7 +211,6 @@ router.patch("/rename", async (req, res) => {
     res.status(200).json({ ok: true });
 
   } catch (err) {
-    console.error(err);
     if (err.code === 'ENOENT') {
       return res.status(404).json({ error: "File not found for rename" });
     }
