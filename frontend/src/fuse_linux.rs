@@ -4,7 +4,6 @@ use fuser016::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
     spawn_mount2,
 };
-use futures_util::{SinkExt, StreamExt};
 use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,9 +16,9 @@ use std::{
     sync::{Arc, Mutex, mpsc::channel},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{runtime::Runtime, task};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::runtime::Runtime;
 use crate::file_api::{DirectoryEntry, FileApi};
+use rust_socketio::{ClientBuilder, Payload};
 
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
@@ -170,69 +169,46 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
 }
 
 // Function that start the websocket listener, initialize the websocket connection and listen the messages
-pub fn start_websocket_listener(api_url: &str, notifier: Arc<Notifier>, fs_state: Arc<FsState>) {
-    let ws_url = api_url.replace("http", "ws") + "/socket.io/?EIO=4&transport=websocket";
-    task::spawn(async move {
-        let (ws_strem, _) = match connect_async(&ws_url).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                return;
-            }
-        };
-        let (mut write, mut read) = ws_strem.split();
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if text.starts_with('0') {
-                        if let Err(e) = write.send(Message::Text("40".into())).await {
-                            break;
-                        }
-                        continue;
-                    }
+pub fn start_websocket_listener(
+    api_url: &str,
+    notifier: Arc<Notifier>,
+    fs_state: Arc<FsState>,
+) {
+    let ws_url = format!("{}/socket.io/", api_url.trim_end_matches('/'));
 
-                    // 2 = Engine.IO ping → rispondi con 3 (pong)
-                    if text == "2" {
-                        if let Err(e) = write.send(Message::Text("3".into())).await {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    // 40 = Socket.IO connected
-                    if text == "40" {
-                        continue;
-                    }
-
-                    // 42[...] = evento Socket.IO
-                    if text.starts_with("42") {
-                        let arr: serde_json::Value = match serde_json::from_str(&text[2..]) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                eprintln!("JSON parse error in WebSocket event: {e}");
-                                continue;
+    tokio::spawn(async move {
+        let notifier_cloned = notifier.clone();
+        let fs_state_cloned = fs_state.clone();
+        let ws_url = ws_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let client = ClientBuilder::new(ws_url)
+                .on("connect", |_, _| {
+                    println!("Socket.IO connected!");
+                })
+                .on("fs_change", move |payload, _| {
+                    match payload {
+                        Payload::Text(values) => {
+                            if values.len() < 1 {
+                                eprintln!("fs_change payload senza dati");
+                                return;
                             }
-                        };
-
-                        let event_name = arr.get(0).and_then(|v| v.as_str()).unwrap_or("");
-                        let payload = arr.get(1).unwrap_or(&serde_json::Value::Null);
-
-                        if event_name == "fs_change" {
-                            handle_fs_change(payload, &notifier, &fs_state);
+                            let json_payload = &values[0];
+                            handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
+                        }
+                        _other =>{
+                            eprintln!("Binary payload non gestito");
                         }
                     }
-                }
-                Ok(Message::Close(_)) => {
-                    break;
-                }
-                Ok(other) => {
-                    eprintln!("WebSocket received non-text message: {:?}", other);
-                }
-                Err(e) => {
-                    eprintln!("WebSocket error: {:?}", e);
-                    break;
-                }
+                })
+                .on("error", |err, _| {
+                    eprintln!("Socket.IO error: {:?}", err);
+                })
+                .connect();
+
+            if let Err(err) = client {
+                eprintln!("Socket.IO connection failed: {:?}", err);
             }
-        }
+        });
     });
 }
 
@@ -944,7 +920,7 @@ impl Filesystem for RemoteFs {
                     frsize,
                 );
             }
-            Err(e) => {
+            Err(_e) => {
                 let bsize: u32 = 4096;
                 let blocks: u64 = 1_000_000;
                 let bfree: u64 = 1_000_000;
@@ -1113,7 +1089,7 @@ impl Filesystem for RemoteFs {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let temp_path = self.get_temporary_path(ino);
         if !temp_path.exists() {
-            if let Err(e) = File::create(&temp_path) {
+            if let Err(_e) = File::create(&temp_path) {
                 reply.error(libc::EIO);
                 return;
             }
