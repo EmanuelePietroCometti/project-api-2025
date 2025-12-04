@@ -33,6 +33,7 @@ use winfsp::filesystem::DirInfo;
 use winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES;
 use winfsp_sys::FspCleanupDelete;
 
+
 use std::mem::{size_of, zeroed};
 use std::ptr::addr_of_mut;
 use std::slice;
@@ -1194,6 +1195,18 @@ impl FileSystemContext for RemoteFs {
             context.ino, context.is_dir, src_rel, dst_rel, replace_if_exists
         );
 
+        // Root non rinominabile
+        if src_rel == "." {
+            println!("[RENAME] denied: source is root");
+            return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+        }
+    if let Some(attr) = self.get_attr_cache(&PathBuf::from(&src_rel)) {
+        if (attr.perm & 0o222) == 0 {
+            println!("[RENAME] denied by perm for {} perm={:#o}", src_rel, attr.perm);
+            return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+        }
+    }
+
         // 2) Parent/nome canonici
         let (src_parent_rel, src_name) = RemoteFs::split_parent_name(&src_rel);
         let (dst_parent_rel, dst_name) = RemoteFs::split_parent_name(&dst_rel);
@@ -1395,6 +1408,14 @@ impl FileSystemContext for RemoteFs {
             println!("[OPEN] upgrading FILE_READ_ATTRIBUTES -> FILE_READ_DATA");
             granted_access |= FILE_READ_DATA | GENERIC_READ;
         }*/
+
+        println!("[OPEN] .2 granted_access=0x{:08X}", granted_access);
+        println!("[OPEN] .2 granted_access binary: {:032b}", granted_access);
+        println!(
+            "[OPEN] DELETE bit (0x{:08X}): {}",
+            DELETE,
+            (granted_access & DELETE) != 0
+        );
 
         let wants_delete = (granted_access & DELETE) != 0;
         let wants_write =
@@ -1790,12 +1811,34 @@ impl FileSystemContext for RemoteFs {
                     } else {
                         de.size.max(0) as u64
                     };
-                    let perm = RemoteFs::parse_perm(&de.permissions);
+                    let backend_perm = RemoteFs::parse_perm(&de.permissions) as u16;
+                    // Prefer cached perm if available (e.g. create/set_basic_info set desired perm)
                     let ty = if RemoteFs::is_dir(&de) {
                         NodeType::Directory
                     } else {
                         NodeType::RegularFile
                     };
+                    // Check cache for an intended perm override (created earlier)
+                    let cached_perm_opt = self.get_attr_cache(&child).map(|a| a.perm);
+                    let final_perm: u16 = if let Some(cperm) = cached_perm_opt {
+                        if cperm != backend_perm {
+                            println!(
+                                "[CLOSE] backend perm {:#o} != cached perm {:#o} -> reapplying cached perm",
+                                backend_perm, cperm
+                            );
+                            // Try to reapply cached perm to backend
+                            let _ = self
+                                .rt
+                                .block_on(self.api.chmod(&rel_path, cperm as u32))
+                                .map_err(|e| eprintln!("[CLOSE] chmod post-commit failed: {}", e));
+                            cperm
+                        } else {
+                            backend_perm
+                        }
+                    } else {
+                        backend_perm
+                    };
+                    let perm = final_perm as u16;
                     let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
                     println!(
                         "[CLOSE] updating attr_cache for '{}' size={}",
@@ -1807,10 +1850,48 @@ impl FileSystemContext for RemoteFs {
                 let _ = self.update_cache(&parent_key);
             }
         }
-
-        // 3) chmod post-commit
-        let _ = self.rt.block_on(self.api.chmod(&rel_path, 0o644));
-
+        /*
+                // 3) chmod post-commit
+                // Preserve readonly if backend/cache says file was read-only (0o444).
+                let desired_mode = if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel_path)) {
+                    println!(
+                        "[CLOSE] setting permissions based on attr cache perm={:#o}",
+                        attr.perm
+                    );
+                    if (attr.perm & 0o444) == 1 {
+                        0o444
+                    } else {
+                        0o644
+                    }
+                } else {
+                    // fallback: ask backend parent listing for the entry's permissions
+                    let parent_rel = Path::new(&rel_path)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| ".".to_string());
+                    match self.rt.block_on(self.api.ls(&parent_rel)) {
+                        Ok(list) => {
+                            let name = Path::new(&rel_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if let Some(de) = list.into_iter().find(|d| d.name == name) {
+                                let perm = RemoteFs::parse_perm(&de.permissions);
+                                if (perm & 0o222) == 0 { 0o444 } else { 0o644 }
+                            } else {
+                                0o644
+                            }
+                        }
+                        Err(_) => 0o644,
+                    }
+                };
+                println!(
+                    "[CHMOD] applying chmod {} to '{}'",
+                    desired_mode, rel_path
+                );
+                let _ = self.rt.block_on(self.api.chmod(&rel_path, desired_mode));
+        */
         // 4) Pulisci il temp file
         if let Err(e) = std::fs::remove_file(&temp_write.tem_path) {
             eprintln!("[CLOSE] Errore rimozione temp file: {}", e);
@@ -1909,6 +1990,16 @@ impl FileSystemContext for RemoteFs {
             write_to_end_of_file,
             constrained_io
         );
+
+        // Check permissions: se il file è readonly (nessun bit di scrittura), rifiuta
+    if let Some(path) = self.path_of(file_context.ino) {
+        if let Some(attr) = self.get_attr_cache(&path) {
+            if (attr.perm & 0o222) == 0 {
+                println!("[WRITE] denied by perm for {:?} perm={:#o}", path, attr.perm);
+                return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+            }
+        }
+    }
 
         // ⭐ DUMP dei primi bytes per debug
         if buffer.len() > 0 {
@@ -2230,36 +2321,38 @@ impl FileSystemContext for RemoteFs {
             .block_on(self.api.write_file(&rel, &temp_path.to_str().unwrap()))
         {
             Ok(_) => {
-                // 2. Prepara la struttura per le scritture temporanee
+                // 2. Imposta mode desiderato per il nuovo file (evita ereditare 755 dalla dir)
+               /*  let desired_mode: u32 = 0o644;
+                let _ = self
+                    .rt
+                    .block_on(self.api.chmod(&rel, desired_mode))
+                    .map_err(|e| {
+                        eprintln!("[CREATE] warning: chmod after create failed: {}", e);
+                        FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                    });*/
+                let desired_mode: u32 = 0o644;
+                // 3. Prepara la struttura per le scritture temporanee (locale)
                 let temp_path = self.get_temporary_path(ino);
-
-                // Crea il file temporaneo locale vuoto
                 if let Err(e) = std::fs::File::create(&temp_path) {
                     eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
                     return Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32));
                 }
-                //3 Prepara la struttura TempWrite
                 let temp_write = TempWrite {
                     tem_path: temp_path,
                     size: 0,
                 };
+                self.writes.lock().unwrap().insert(ino, temp_write.clone());
 
-                // Salva il riferimento alle scritture temporanee
-                self.writes.lock().unwrap().insert(ino, temp_write);
-
-                // 4. Crea il contesto del file
+                // 4. Costruisci FileContext
                 let file_context = MyFileContext {
                     ino,
-                    temp_write: Some(TempWrite {
-                        tem_path: self.get_temporary_path(ino),
-                        size: 0,
-                    }),
+                    temp_write: Some(temp_write),
                     delete_on_close: AtomicBool::new(false),
                     allow_delete: (granted_access & DELETE) != 0,
                     is_dir: false,
                     needs_truncate: AtomicBool::new(false),
                 };
-
+                // 5. Popola OpenFileInfo e cache coerente (perm = desired_mode)
                 fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
                 fi.file_size = 0;
                 fi.creation_time = nt_time;
@@ -2267,14 +2360,18 @@ impl FileSystemContext for RemoteFs {
                 fi.last_write_time = nt_time;
                 fi.change_time = nt_time;
 
-                // 4) Aggiorna cache parent: ricarica elenco (Explorer leggerà subito)
-                let _ = self.update_cache(&parent_path);
-
-                // ★ NEW: crea attributi file e inserisci in cache (come FUSE create)
-                let mut attr =
-                    self.file_attr(Path::new(&path_str), NodeType::RegularFile, 0, None, 0o644);
+                let mut attr = self.file_attr(
+                    Path::new(&path_str),
+                    NodeType::RegularFile,
+                    0,
+                    None,
+                    desired_mode as u16,
+                );
                 attr.nlink = 1;
                 self.insert_attr_cache(Path::new(&rel).to_path_buf(), attr);
+
+                // 6. Aggiorna cache parent per rendere visibile la nuova entry
+                let _ = self.update_cache(&parent_path);
 
                 Ok(file_context)
             }
@@ -2389,10 +2486,15 @@ impl FileSystemContext for RemoteFs {
                     ))
                 })?;
         }
-
+        //aggiorno gli attributi in cache
+        attr.perm = mode as u16;
+        self.insert_attr_cache(rel_key.clone(), attr.clone());
+        println!(
+            "[SET_BASIC_INFO] attr_cache updated for '{}' perm={:#o} size={}",
+            rel, mode, attr.size
+        );
         //
         // 4) Aggiorna cache locale (UID/GID/Flags non gestiti su Windows)
-        //self.insert_attr_cache(path.clone(), attr.clone());
         let _ = self.update_cache(&parent_key);
 
         // 5) Aggiorna file_info WinFsp
@@ -2415,6 +2517,56 @@ impl FileSystemContext for RemoteFs {
         Ok(())
     }
 
+    fn get_dir_info_by_name(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        out_dir_info: &mut DirInfo,
+    ) -> WinFspResult<()> {
+        println!(
+            "[GET_DIR_INFO_BY_NAME] file_name={:?}",
+            file_name.to_string_lossy()
+        );
+
+        let path = self.path_from_u16(file_name);
+        let rel = RemoteFs::rel_of(std::path::Path::new(&path));
+
+        println!("[GET_DIR_INFO_BY_NAME] rel='{}'", rel);
+
+        // Root case
+        if rel == "." {
+            println!("[GET_DIR_INFO_BY_NAME] root directory");
+            return Ok(());
+        }
+
+        // Determina parent e nome
+        let parent_rel = Path::new(&rel)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+
+        let name_only = Path::new(&rel)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let parent_key = PathBuf::from(&parent_rel);
+
+        // Usa dir_entries (cache-aware)
+        let entries = self.dir_entries(&parent_key)?;
+
+        // Cerca l'entry
+        if let Some((_, de)) = entries.iter().find(|(_, d)| d.name == name_only) {
+            println!("[GET_DIR_INFO_BY_NAME] found entry: {}", de.name);
+            // DirInfo è solo un marker - non ha campi da popolare
+            // Ritorna Ok() per indicare che l'entry esiste
+            Ok(())
+        } else {
+            println!("[GET_DIR_INFO_BY_NAME] entry not found: {}", name_only);
+            Err(FspError::WIN32(ERROR_FILE_NOT_FOUND))
+        }
+    }
 
     //equivalente truncate per aumento dimensione di file in write
     fn set_file_size(
@@ -2580,6 +2732,23 @@ impl FileSystemContext for RemoteFs {
         Ok(())
     }
 
+    fn get_reparse_point(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        buffer: &mut [u8],
+    ) -> Result<u64, FspError> {
+        println!(
+            "[GET_REPARSE_POINT] ino={} file_name={}",
+            context.ino,
+            file_name.to_string_lossy()
+        );
+
+        // Non supportiamo reparse point (symlink, junction, ecc.)
+        // Ritorna 0 (nessun reparse point)
+        Ok(0)
+    }
+
     fn set_delete(
         &self,
         file_context: &MyFileContext,
@@ -2590,6 +2759,8 @@ impl FileSystemContext for RemoteFs {
             "set_delete: delete={} for path={:?}, ino={}",
             delete, file_name, file_context.ino
         );
+   
+
         let percorso = Some(file_name);
 
         let path = if let Some(name) = percorso {
@@ -2612,6 +2783,14 @@ impl FileSystemContext for RemoteFs {
 
         let rel = RemoteFs::rel_of(std::path::Path::new(&path));
 
+        //se non hai i permessi negi la cancellazione
+        if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
+            if (attr.perm & 0o222) == 0 {
+                println!("[SET_DELETE] denied by perm for {:?} perm={:#o}", path, attr.perm);
+                return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+            }
+        }
+
         if delete {
             // Prima verifica se si può cancellare
 
@@ -2633,7 +2812,12 @@ impl FileSystemContext for RemoteFs {
 
     //problema con la rimozione da windows powershell perchè rmdir non funziona per farlo funzionare bisogna chiamare cmd /c rmdir nome_cartella
     fn cleanup(&self, file_context: &MyFileContext, file_name: Option<&U16CStr>, flags: u32) {
-        println!("flag {} e fscClean val: {}", flags, FspCleanupDelete as u32);
+        println!(
+            "[CLEANUP] flags={:#x} FspCleanupDelete={:#x} delete_on_close={}",
+            flags,
+            FspCleanupDelete as u32,
+            file_context.delete_on_close.load(Ordering::Relaxed)
+        );
 
         //
         // 1) Ricava il path canonico
@@ -2654,6 +2838,17 @@ impl FileSystemContext for RemoteFs {
             return;
         }
 
+        //se non hai i permessi negi la cancellazione
+        if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
+            if (attr.perm & 0o222) == 0 {
+                println!("[SET_DELETE] denied by perm for {:?} perm={:#o}", path, attr.perm);
+                //return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+                return;
+            }
+        }
+
+
+
         //
         // 2) Determina parent e nome
         //
@@ -2668,14 +2863,6 @@ impl FileSystemContext for RemoteFs {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        //IMPORTANTE Controllareeee
-        // Normalizza la path assoluta del parent per dir_entries()
-        // questo 90% sbagliato rivedere
-        /*  let parent_path = if parent_rel == "." {
-            PathBuf::from("/")
-        } else {
-            PathBuf::from("/").join(&parent_rel)
-        };*/
         let parent_path = PathBuf::from(&parent_rel);
         println!("[CLEANUP] ParentPath : {:?} ", parent_path);
 
@@ -2807,7 +2994,7 @@ pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
     vparams.file_info_timeout(5); // seconds [attached_file:21]
 
     // Sensibilità/preservazione case e Unicode
-    vparams.case_sensitive_search(true); //senza questo non vannpo i delete
+    vparams.case_sensitive_search(true); //senza questo non vanno i delete
     vparams.case_preserved_names(true);
     vparams.unicode_on_disk(true);
 
