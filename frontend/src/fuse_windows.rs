@@ -29,6 +29,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_DATA,
 };
 //use windows_sys::Win32::System::IO::CREATE_DIRECTORY;
+use winfsp::filesystem::DirInfo;
+use winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES;
 use winfsp_sys::FspCleanupDelete;
 
 use std::mem::{size_of, zeroed};
@@ -44,6 +46,7 @@ pub struct MyFileContext {
     pub delete_on_close: AtomicBool,
     pub allow_delete: bool,
     pub is_dir: bool,
+    pub needs_truncate: AtomicBool,
 }
 //per la definizione fileAttr di file o directory
 #[derive(Clone, Debug)]
@@ -1384,14 +1387,14 @@ impl FileSystemContext for RemoteFs {
             (granted_access & GENERIC_WRITE) != 0,
             (granted_access & FILE_READ_ATTRIBUTES) != 0
         );
-        //forza a chiamare la read
+        /*     //forza a chiamare la read
         if (granted_access & FILE_READ_ATTRIBUTES) != 0
             && (granted_access & FILE_READ_DATA) == 0
             && (granted_access & GENERIC_READ) == 0
         {
             println!("[OPEN] upgrading FILE_READ_ATTRIBUTES -> FILE_READ_DATA");
-            granted_access |= FILE_READ_DATA;
-        }
+            granted_access |= FILE_READ_DATA | GENERIC_READ;
+        }*/
 
         let wants_delete = (granted_access & DELETE) != 0;
         let wants_write =
@@ -1421,6 +1424,7 @@ impl FileSystemContext for RemoteFs {
                 allow_delete: wants_delete,
                 delete_on_close: AtomicBool::new(false),
                 temp_write: None,
+                needs_truncate: AtomicBool::new(false),
             });
         }
 
@@ -1496,43 +1500,38 @@ impl FileSystemContext for RemoteFs {
                 allow_delete: wants_delete, // non bloccare DELETE/DELETE_CHILD
                 delete_on_close: AtomicBool::new(false),
                 temp_write: None,
+                needs_truncate: AtomicBool::new(false),
             });
         }
 
         // 7) File: prova attr_cache; fallback a DirectoryEntry
         if let Some(mut attr) = self.get_attr_cache(&child_path) {
             println!("[OPEN] .11 attr cache HIT for '{}'", child_path.display());
-
+            println!("[OPEN] .11 attr: size={} de.size={}", attr.size, de.size);
             // ⭐ NUOVO: Se size=0 ma il file esiste, verifica con backend
-            if attr.size == 0 {
-                println!("[OPEN] .11.1 WARNING: cached size=0, checking backend...");
+            if attr.size == 0 && de.size > 0 {
+                println!(
+                    "[OPEN] .11.1 Backend reports size={}, updating cache",
+                    de.size
+                );
+                attr.size = de.size as u64;
+                attr.blocks = (attr.size + 511) / 512;
+                attr.mtime = std::time::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_secs(de.mtime as u64))
+                    .unwrap_or_else(std::time::SystemTime::now);
 
-                // Usa DirectoryEntry dal parent appena caricato
-                if de.size > 0 {
-                    println!(
-                        "[OPEN] .11.2 Backend reports size={}, updating cache",
-                        de.size
-                    );
-                    attr.size = de.size as u64;
-                    attr.blocks = (attr.size + 511) / 512;
-                    attr.mtime = std::time::UNIX_EPOCH
-                        .checked_add(std::time::Duration::from_secs(de.mtime as u64))
-                        .unwrap_or_else(std::time::SystemTime::now);
-
-                    // Aggiorna cache con size corretta
-                    self.insert_attr_cache(child_path.clone(), attr.clone());
-                }
+                self.insert_attr_cache(child_path.clone(), attr.clone());
             }
 
             let readonly = (attr.perm & 0o222) == 0;
 
-            // ✅ IMPORTANTE: compila TUTTI i campi di OpenFileInfo
+            // ✅ USA attr AGGIORNATO
             fi.file_attributes = if readonly {
                 FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
             } else {
                 FILE_ATTRIBUTE_NORMAL
             };
-            fi.file_size = attr.size;
+            fi.file_size = attr.size; // ✅ Ora è corretto!
             fi.allocation_size = ((attr.size + 4095) / 4096) * 4096;
             fi.creation_time = RemoteFs::nt_time_from_system_time(attr.crtime);
             fi.last_access_time = RemoteFs::nt_time_from_system_time(attr.atime);
@@ -1598,40 +1597,110 @@ impl FileSystemContext for RemoteFs {
                 ino
             );
             let temp_path = self.get_temporary_path(ino);
-            if !temp_path.exists() {
+
+            let should_prepopulate = wants_read;
+            let is_truncate = wants_write && !wants_read;
+
+            if is_truncate {
+                println!("[OPEN] .13.1 TRUNCATE mode -> creating EMPTY temp file NOW");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&temp_path)
+                    .map_err(|e| {
+                        eprintln!("[OPEN] ERROR creating empty temp: {}", e);
+                        FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                    })?;
+                println!(
+                    "[OPEN] .13.2 Empty temp file created at '{}'",
+                    temp_path.display()
+                );
+
+                // ⭐ NUOVO: Log del contenuto iniziale del temp
+                if let Ok(metadata) = std::fs::metadata(&temp_path) {
+                    println!("[OPEN] .13.2.1 Temp file initial size: {}", metadata.len());
+                }
+            } else if should_prepopulate {
+                // Caso: append o read+write
+                println!("[OPEN] .13.3 wants_read=true -> pre-populating temp");
+                match self.rt.block_on(self.api.read_file(&rel)) {
+                    Ok(existing_data) if !existing_data.is_empty() => {
+                        if let Err(e) = std::fs::write(&temp_path, &existing_data) {
+                            eprintln!("[OPEN] WARN: pre-populate failed: {}", e);
+                            std::fs::File::create(&temp_path).map_err(|e| {
+                                FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                            })?;
+                        } else {
+                            println!(
+                                "[OPEN] .13.4 Pre-populated temp with {} bytes",
+                                existing_data.len()
+                            );
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        println!("[OPEN] .13.5 Backend empty/error -> create empty temp");
+                        std::fs::File::create(&temp_path).map_err(|e| {
+                            FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                        })?;
+                    }
+                }
+            } else {
+                // Fallback
+                println!("[OPEN] .13.6 Fallback: create empty temp");
                 std::fs::File::create(&temp_path).map_err(|e| {
-                    let io_err = std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e));
-                    FspError::from(io_err)
+                    FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
                 })?;
             }
+
+            // Verifica che il file esista
+            if !temp_path.exists() {
+                eprintln!(
+                    "[OPEN] CRITICAL ERROR: temp file not created at '{}'",
+                    temp_path.display()
+                );
+                return Err(FspError::WIN32(ERROR_INVALID_PARAMETER));
+            }
+
+            let size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
+
+            println!(
+                "[OPEN] .14 Temp file verified: exists={} size={}",
+                temp_path.exists(),
+                size
+            );
+
             let tw = TempWrite {
                 tem_path: temp_path,
-                size: 0,
+                size,
             };
             self.writes.lock().unwrap().insert(ino, tw.clone());
-            println!("[OPEN] .14 temp_write inserted for ino={}", ino);
+            println!("[OPEN] .15 temp_write inserted for ino={}", ino);
             Some(tw)
         } else {
             println!("[OPEN] .13 wants_write=false -> no temp file");
             None
         };
-        println!("[OPEN] .15 done for file '{}'", rel);
+
+        println!("[OPEN] .16 done for file '{}'", rel);
+
         Ok(MyFileContext {
             ino,
             is_dir: false,
             allow_delete: wants_delete,
             delete_on_close: AtomicBool::new(false),
             temp_write,
+            needs_truncate: AtomicBool::new(false), // Non serve più il flag lazy
         })
     }
 
-    // ...existing code...
     fn close(&self, file_context: Self::FileContext) {
         println!(
-            "[CLOSE] entry ino={} temp_write={}",
+            "[CLOSE] ⭐⭐⭐ ENTRY ino={} temp_write={}",
             file_context.ino,
             file_context.temp_write.is_some()
         );
+
         let temp_write = match file_context.temp_write {
             Some(tw) => tw,
             None => {
@@ -1640,11 +1709,43 @@ impl FileSystemContext for RemoteFs {
             }
         };
 
+        if !temp_write.tem_path.exists() {
+            eprintln!(
+                "[CLOSE] ERROR: temp file missing at '{}' - skipping sync",
+                temp_write.tem_path.display()
+            );
+            return;
+        }
+
+        let real_size = match std::fs::metadata(&temp_write.tem_path) {
+            Ok(m) => {
+                println!("[CLOSE] temp file metadata OK: size={}", m.len());
+                m.len()
+            }
+            Err(e) => {
+                eprintln!(
+                    "[CLOSE] Failed to get temp file metadata for '{}': {}",
+                    temp_write.tem_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+
+        // ⭐ ANALISI FINALE
+        if real_size == 0 {
+            println!("[CLOSE] ⚠️⚠️⚠️ CRITICAL: Syncing EMPTY file!");
+            println!("[CLOSE] This means write() was NEVER called");
+            println!("[CLOSE] PowerShell might be using a different API");
+        }
+
         let rel_path = RemoteFs::rel_of(&self.path_of(file_context.ino).unwrap());
+
         println!(
-            "[CLOSE] syncing rel='{}' from temp='{}'",
+            "[CLOSE] syncing rel='{}' from temp='{}' (real_size={})",
             rel_path,
-            temp_write.tem_path.display()
+            temp_write.tem_path.display(),
+            real_size
         );
 
         // 1) Commit sul backend
@@ -1653,15 +1754,15 @@ impl FileSystemContext for RemoteFs {
                 .write_file(&rel_path, &temp_write.tem_path.to_string_lossy()),
         ) {
             eprintln!("[CLOSE] Errore commit file {}: {:?}", rel_path, e);
-            // continua comunque per non bloccare il cleanup
         } else {
-            // 2) Forza aggiornamento metadata: ottieni listing del parent e aggiorna attr_cache con size/mtime reali
+            // 2) Aggiorna cache dopo commit riuscito
             let parent_rel = Path::new(&rel_path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| ".".to_string());
             let parent_key = PathBuf::from(parent_rel.clone());
+
             println!(
                 "[CLOSE] refreshing parent '{}' to update attr cache",
                 parent_rel
@@ -1675,7 +1776,6 @@ impl FileSystemContext for RemoteFs {
                             .and_then(|n| Some(n.to_string_lossy().to_string()))
                             .unwrap_or_default()
                 }) {
-                    // costruisci la chiave canonica del figlio (./name)
                     let child = if parent_rel == "." {
                         PathBuf::from(format!("./{}", de.name))
                     } else {
@@ -1703,21 +1803,15 @@ impl FileSystemContext for RemoteFs {
                         size
                     );
                     self.insert_attr_cache(child, attr);
-                } else {
-                    println!("[CLOSE] parent listing did not contain '{}'", rel_path);
                 }
-                // aggiorna anche la dir_cache del parent
-                let _ = self.update_cache(&parent_key);
-            } else {
-                // fallback: invoca la update_cache che farà ls e popolera cache
                 let _ = self.update_cache(&parent_key);
             }
         }
 
-        // 3) chmod post-commit (ignora errori)
+        // 3) chmod post-commit
         let _ = self.rt.block_on(self.api.chmod(&rel_path, 0o644));
 
-        // 4) Pulisci il temp file e il mapping
+        // 4) Pulisci il temp file
         if let Err(e) = std::fs::remove_file(&temp_write.tem_path) {
             eprintln!("[CLOSE] Errore rimozione temp file: {}", e);
         }
@@ -1803,34 +1897,109 @@ impl FileSystemContext for RemoteFs {
         file_context: &Self::FileContext,
         buffer: &[u8],
         offset: u64,
-        _write_to_end_of_file: bool,
-        _constrained_io: bool,
-        _file_info: &mut FileInfo,
+        write_to_end_of_file: bool,
+        constrained_io: bool,
+        file_info: &mut FileInfo,
     ) -> WinFspResult<u32> {
-        println!("Siamo in write");
+        println!(
+            "[WRITE] ⭐⭐⭐ CALLED! ino={} offset={} len={} write_to_eof={} constrained={}",
+            file_context.ino,
+            offset,
+            buffer.len(),
+            write_to_end_of_file,
+            constrained_io
+        );
+
+        // ⭐ DUMP dei primi bytes per debug
+        if buffer.len() > 0 {
+            let preview =
+                std::str::from_utf8(&buffer[..buffer.len().min(50)]).unwrap_or("<binary>");
+            println!("[WRITE] buffer preview: {:?}", preview);
+        }
         let tw = match &file_context.temp_write {
             Some(tw) => tw,
             None => return Err(FspError::WIN32(1)), // file opened read-only
         };
 
         let mut file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .open(&tw.tem_path)
             .map_err(|e| {
-                let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-                FspError::from(io_err)
+                eprintln!("[WRITE] ERROR opening temp: {}", e);
+                FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
             })?;
 
+        println!("[WRITE] Seeking to offset {}", offset);
+
         file.seek(std::io::SeekFrom::Start(offset)).map_err(|e| {
-            let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-            FspError::from(io_err)
-        })?;
-        file.write_all(buffer).map_err(|e| {
-            let io_err = io::Error::new(io::ErrorKind::Other, format!("{}", e));
-            FspError::from(io_err)
+            eprintln!("[WRITE] ERROR seeking: {}", e);
+            FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
         })?;
 
+        println!("[WRITE] Writing {} bytes", buffer.len());
+
+        file.write_all(buffer).map_err(|e| {
+            eprintln!("[WRITE] ERROR writing: {}", e);
+            FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })?;
+
+        file.flush().map_err(|e| {
+            eprintln!("[WRITE] ERROR flushing: {}", e);
+            FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+        })?;
+
+        if let Ok(metadata) = std::fs::metadata(&tw.tem_path) {
+            let new_size = metadata.len();
+            file_info.file_size = new_size;
+            file_info.allocation_size = ((new_size + 4095) / 4096) * 4096;
+            println!(
+                "[WRITE] ⭐ Success: wrote {} bytes, total size now {}",
+                buffer.len(),
+                new_size
+            );
+        }
+
         Ok(buffer.len() as u32)
+    }
+
+    fn overwrite(
+        &self,
+        context: &Self::FileContext,
+        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+        replace_file_attributes: bool,
+        allocation_size: u64,
+        extra_buffer: Option<&[u8]>,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        println!(
+            "[OVERWRITE] ino={} replace_attrs={} allocation_size={}",
+            context.ino, replace_file_attributes, allocation_size
+        );
+
+        if let Some(tw) = &context.temp_write {
+            println!(
+                "[OVERWRITE] truncating temp file '{}'",
+                tw.tem_path.display()
+            );
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tw.tem_path)
+                .and_then(|f| f.set_len(0));
+            if let Err(e) = result {
+                eprintln!("[OVERWRITE] ERROR truncating temp file: {}", e);
+                return Err(FspError::from(io::Error::new(
+                    io::ErrorKind::Other,
+                    e.to_string(),
+                )));
+            }
+            println!("[OVERWRITE] temp file truncated successfully");
+        } else {
+            eprintln!("[OVERWRITE] No temp_write available for truncation");
+            return Err(FspError::WIN32(1));
+        }
+
+        Ok(())
     }
 
     fn read_directory(
@@ -2025,6 +2194,7 @@ impl FileSystemContext for RemoteFs {
                         delete_on_close: std::sync::atomic::AtomicBool::new(false),
                         is_dir: true,
                         allow_delete: (granted_access & DELETE) != 0,
+                        needs_truncate: AtomicBool::new(false),
                     });
                 }
                 Err(e) => {
@@ -2087,6 +2257,7 @@ impl FileSystemContext for RemoteFs {
                     delete_on_close: AtomicBool::new(false),
                     allow_delete: (granted_access & DELETE) != 0,
                     is_dir: false,
+                    needs_truncate: AtomicBool::new(false),
                 };
 
                 fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
@@ -2244,52 +2415,132 @@ impl FileSystemContext for RemoteFs {
         Ok(())
     }
 
+
     //equivalente truncate per aumento dimensione di file in write
     fn set_file_size(
         &self,
         file_context: &Self::FileContext,
         new_size: u64,
-        _write_to_end_of_file: bool,
+        set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> WinFspResult<()> {
+        println!(
+            "[SET_FILE_SIZE] ⭐ CALLED! ino={} new_size={} set_allocation={} has_temp={}",
+            file_context.ino,
+            new_size,
+            set_allocation_size,
+            file_context.temp_write.is_some()
+        );
+
         let path = self.path_of(file_context.ino).ok_or(FspError::WIN32(
             windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
         ))?;
         let rel = RemoteFs::rel_of(&path);
 
-        // 1) Propaga al backend
+        if let Some(tw) = &file_context.temp_write {
+            println!(
+                "[SET_FILE_SIZE] temp file path: '{}'",
+                tw.tem_path.display()
+            );
+
+            // ⭐ CRITICO: Controlla se il file temp esiste e leggi il contenuto attuale
+            if tw.tem_path.exists() {
+                let current_size = std::fs::metadata(&tw.tem_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                println!(
+                    "[SET_FILE_SIZE] temp file exists: current_size={} requested_size={}",
+                    current_size, new_size
+                );
+
+                // Se la nuova size è MAGGIORE e il file è vuoto, PowerShell potrebbe star
+                // cercando di allocare spazio per poi scrivere
+                if new_size > current_size && current_size == 0 {
+                    println!("[SET_FILE_SIZE] ⚠️ PowerShell allocating space without write()!");
+                    println!("[SET_FILE_SIZE] This is the echo > file pattern");
+
+                    // NON truncare - lascia il file vuoto
+                    // PowerShell dovrebbe scrivere dopo, ma se non lo fa...
+                    // potremmo dover intercettare in flush() o close()
+                }
+
+                // Esegui il truncate/extend normale
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&tw.tem_path) {
+                    if let Err(e) = f.set_len(new_size) {
+                        eprintln!("[SET_FILE_SIZE] failed to set temp file size: {}", e);
+                        return Err(FspError::from(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        )));
+                    }
+                    println!("[SET_FILE_SIZE] temp file resized to {}", new_size);
+                }
+
+                // ⭐ VERIFICA POST-RESIZE
+                if let Ok(metadata) = std::fs::metadata(&tw.tem_path) {
+                    println!(
+                        "[SET_FILE_SIZE] temp file after resize: size={}",
+                        metadata.len()
+                    );
+                }
+            } else {
+                eprintln!("[SET_FILE_SIZE] ERROR: temp file doesn't exist!");
+            }
+        }
+
+        // Backend truncate (potrebbe non essere necessario se il file è gestito solo localmente)
         self.rt
             .block_on(self.api.truncate(&rel, new_size))
             .map_err(|e| {
+                eprintln!("[SET_FILE_SIZE] backend truncate failed: {}", e);
                 FspError::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
                 ))
             })?;
 
-        // 2) Aggiorna cache
+        // Aggiorna cache
         if let Some(mut attr) = self.get_attr_cache(&path) {
             attr.size = new_size;
             attr.blocks = (new_size + 511) / 512;
             attr.mtime = SystemTime::now();
             attr.ctime = attr.mtime;
-
-            self.insert_attr_cache(path.clone(), attr.clone());
+            self.insert_attr_cache(path.clone(), attr);
         }
 
-        // 3) Aggiorna WinFsp file_info
         file_info.file_size = new_size;
+        file_info.allocation_size = ((new_size + 4095) / 4096) * 4096;
 
+        println!(
+            "[SET_FILE_SIZE] done: file_info.file_size={}",
+            file_info.file_size
+        );
         Ok(())
     }
-
     fn flush(
         &self,
         file_context: std::option::Option<&MyFileContext>,
         _file_info: &mut FileInfo,
     ) -> WinFspResult<()> {
+        println!(
+            "[FLUSH] ⭐ CALLED! ino={} has_temp={}",
+            file_context.unwrap().ino,
+            file_context.unwrap().temp_write.is_some()
+        );
         // Se c'è un temp file, committalo subito
         if let Some(ref tw) = file_context.unwrap().temp_write {
+            println!("[FLUSH] temp file: '{}'", tw.tem_path.display());
+
+            if let Ok(metadata) = std::fs::metadata(&tw.tem_path) {
+                println!("[FLUSH] temp file size: {}", metadata.len());
+
+                // Se il file è vuoto, leggi da stdin o altra fonte?
+                if metadata.len() == 0 {
+                    println!("[FLUSH] ⚠️ WARNING: Flushing empty temp file!");
+                }
+            }
+
             let path = self
                 .path_of(file_context.unwrap().ino)
                 .ok_or(FspError::WIN32(
