@@ -33,7 +33,6 @@ use winfsp::filesystem::DirInfo;
 use winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES;
 use winfsp_sys::FspCleanupDelete;
 
-
 use std::mem::{size_of, zeroed};
 use std::ptr::addr_of_mut;
 use std::slice;
@@ -1200,12 +1199,15 @@ impl FileSystemContext for RemoteFs {
             println!("[RENAME] denied: source is root");
             return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
         }
-    if let Some(attr) = self.get_attr_cache(&PathBuf::from(&src_rel)) {
-        if (attr.perm & 0o222) == 0 {
-            println!("[RENAME] denied by perm for {} perm={:#o}", src_rel, attr.perm);
-            return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+        if let Some(attr) = self.get_attr_cache(&PathBuf::from(&src_rel)) {
+            if (attr.perm & 0o222) == 0 {
+                println!(
+                    "[RENAME] denied by perm for {} perm={:#o}",
+                    src_rel, attr.perm
+                );
+                return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+            }
         }
-    }
 
         // 2) Parent/nome canonici
         let (src_parent_rel, src_name) = RemoteFs::split_parent_name(&src_rel);
@@ -1513,16 +1515,40 @@ impl FileSystemContext for RemoteFs {
         let fi = open_info.as_mut();
         if is_dir {
             println!("[OPEN] .10 returning dir context for child");
-            fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
-            fi.file_size = 0;
-            return Ok(MyFileContext {
-                ino,
-                is_dir: true,
-                allow_delete: wants_delete, // non bloccare DELETE/DELETE_CHILD
-                delete_on_close: AtomicBool::new(false),
-                temp_write: None,
-                needs_truncate: AtomicBool::new(false),
-            });
+
+            // 🌟 PASSO CRITICO: Recupera gli attributi completi per la directory
+            if let Some(attr) = self.get_attr_cache(&child_path) {
+                fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+                fi.file_size = 0;
+
+                // ✅ IL FIX: Mappa i timestamp dalla cache a OpenFileInfo
+                fi.creation_time = RemoteFs::nt_time_from_system_time(attr.crtime);
+                fi.last_access_time = RemoteFs::nt_time_from_system_time(attr.atime);
+                fi.last_write_time = RemoteFs::nt_time_from_system_time(attr.mtime);
+                fi.change_time = RemoteFs::nt_time_from_system_time(attr.ctime);
+                fi.index_number = ino as u64;
+
+                println!(
+                    "[OPEN] .10.1 Dir OpenFileInfo: cr={:#x} wt={:#x}",
+                    fi.creation_time, fi.last_write_time
+                );
+
+                return Ok(MyFileContext {
+                    ino,
+                    is_dir: true,
+                    allow_delete: wants_delete,
+                    delete_on_close: AtomicBool::new(false),
+                    temp_write: None,
+                    needs_truncate: AtomicBool::new(false),
+                });
+            } else {
+                // Fallback in caso di cache miss per una directory
+                eprintln!(
+                    "[OPEN] .10.2 Directory '{}' not in cache after creation. Returning NOT FOUND to force re-evaluation.",
+                    rel
+                );
+                return Err(FspError::WIN32(ERROR_FILE_NOT_FOUND));
+            }
         }
 
         // 7) File: prova attr_cache; fallback a DirectoryEntry
@@ -1992,14 +2018,17 @@ impl FileSystemContext for RemoteFs {
         );
 
         // Check permissions: se il file è readonly (nessun bit di scrittura), rifiuta
-    if let Some(path) = self.path_of(file_context.ino) {
-        if let Some(attr) = self.get_attr_cache(&path) {
-            if (attr.perm & 0o222) == 0 {
-                println!("[WRITE] denied by perm for {:?} perm={:#o}", path, attr.perm);
-                return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+        if let Some(path) = self.path_of(file_context.ino) {
+            if let Some(attr) = self.get_attr_cache(&path) {
+                if (attr.perm & 0o222) == 0 {
+                    println!(
+                        "[WRITE] denied by perm for {:?} perm={:#o}",
+                        path, attr.perm
+                    );
+                    return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
+                }
             }
         }
-    }
 
         // ⭐ DUMP dei primi bytes per debug
         if buffer.len() > 0 {
@@ -2322,7 +2351,7 @@ impl FileSystemContext for RemoteFs {
         {
             Ok(_) => {
                 // 2. Imposta mode desiderato per il nuovo file (evita ereditare 755 dalla dir)
-               /*  let desired_mode: u32 = 0o644;
+                /*  let desired_mode: u32 = 0o644;
                 let _ = self
                     .rt
                     .block_on(self.api.chmod(&rel, desired_mode))
@@ -2557,11 +2586,43 @@ impl FileSystemContext for RemoteFs {
         let entries = self.dir_entries(&parent_key)?;
 
         // Cerca l'entry
-        if let Some((_, de)) = entries.iter().find(|(_, d)| d.name == name_only) {
-            println!("[GET_DIR_INFO_BY_NAME] found entry: {}", de.name);
-            // DirInfo è solo un marker - non ha campi da popolare
-            // Ritorna Ok() per indicare che l'entry esiste
-            Ok(())
+        if let Some((_, _de)) = entries.iter().find(|(_, d)| d.name == name_only) {
+            println!("[GET_DIR_INFO_BY_NAME] found entry: {}", _de.name);
+
+            // 🌟 PASSO CRITICO: Recupera gli attributi dalla cache
+            match self.get_attr_cache(Path::new(&rel)) {
+                // ✅ CORRETTO: Gestisce il caso in cui l'attributo sia in cache (Some)
+                Some(attr) => {
+                    // Popola out_dir_info con i dati della cache
+                    //out_dir_info.file_info_mut().file_attributes = attr.file_attributes;
+                    out_dir_info.file_info_mut().file_size = attr.size;
+                    out_dir_info.file_info_mut().creation_time =
+                        RemoteFs::nt_time_from_system_time(attr.ctime);
+                    out_dir_info.file_info_mut().last_write_time =
+                        RemoteFs::nt_time_from_system_time(attr.ctime);
+                    out_dir_info.file_info_mut().last_access_time =
+                        RemoteFs::nt_time_from_system_time(attr.atime);
+                    out_dir_info.file_info_mut().change_time =
+                        RemoteFs::nt_time_from_system_time(attr.ctime);
+
+                    Ok(())
+                }
+                // ✅ CORRETTO: Gestisce il caso in cui l'attributo NON sia in cache (None)
+                None => {
+                    eprintln!(
+                        "[GET_DIR_INFO_BY_NAME] Attributi mancanti in cache per '{}'.",
+                        rel
+                    );
+
+                    // Opzione 1: Prova a recuperare dal backend (consigliato per robustezza)
+                    // Se hai una funzione self.api.get_attributes_by_path(&rel) che restituisce
+                    // Result<FileAttr, E>, puoi chiamarla qui.
+
+                    // Opzione 2: Ritorna FILE_NOT_FOUND (Se la cache è l'unica fonte attendibile)
+                    // Questo potrebbe essere l'errore se la creazione è fallita, ma la dir_entries è corretta.
+                    Err(FspError::WIN32(ERROR_FILE_NOT_FOUND))
+                }
+            }
         } else {
             println!("[GET_DIR_INFO_BY_NAME] entry not found: {}", name_only);
             Err(FspError::WIN32(ERROR_FILE_NOT_FOUND))
@@ -2759,7 +2820,6 @@ impl FileSystemContext for RemoteFs {
             "set_delete: delete={} for path={:?}, ino={}",
             delete, file_name, file_context.ino
         );
-   
 
         let percorso = Some(file_name);
 
@@ -2786,7 +2846,10 @@ impl FileSystemContext for RemoteFs {
         //se non hai i permessi negi la cancellazione
         if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
             if (attr.perm & 0o222) == 0 {
-                println!("[SET_DELETE] denied by perm for {:?} perm={:#o}", path, attr.perm);
+                println!(
+                    "[SET_DELETE] denied by perm for {:?} perm={:#o}",
+                    path, attr.perm
+                );
                 return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
             }
         }
@@ -2841,13 +2904,14 @@ impl FileSystemContext for RemoteFs {
         //se non hai i permessi negi la cancellazione
         if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
             if (attr.perm & 0o222) == 0 {
-                println!("[SET_DELETE] denied by perm for {:?} perm={:#o}", path, attr.perm);
+                println!(
+                    "[SET_DELETE] denied by perm for {:?} perm={:#o}",
+                    path, attr.perm
+                );
                 //return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
                 return;
             }
         }
-
-
 
         //
         // 2) Determina parent e nome
@@ -2997,6 +3061,8 @@ pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
     vparams.case_sensitive_search(true); //senza questo non vanno i delete
     vparams.case_preserved_names(true);
     vparams.unicode_on_disk(true);
+    // 🌟 Abilita il passaggio del nome del file nelle query di directory
+    vparams.pass_query_directory_filename(true);
 
     let mut host = FileSystemHost::new(vparams, fs)?;
     host.mount(mountpoint)?;
