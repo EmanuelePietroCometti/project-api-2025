@@ -310,23 +310,34 @@ function clean(path) {
   return path.replace(/^.*storage\//, "");
 }
 
+function getPrimaryIP() {
+  const interfaces = os.networkInterfaces();
+
+  for (const name in interfaces) {
+    for (const net of interfaces[name]) {
+      if (net.family === "IPv4" && !net.internal) {
+        return net.address; 
+      }
+    }
+  }
+
+  return null;
+}
+
 // init express
 const app = new express();
 app.use(morgan('dev'));
 app.use(express.json());
 
 const port = 3001;
-const interfaces = os.networkInterfaces();
-const addresses = [];
+let IPAddress = process.argv[2];
 
-for (let iface in interfaces) {
-  for (let addr of interfaces[iface]) {
-    if (addr.family === "IPv4" && !addr.internal) {
-      addresses.push(addr.address);
-    }
-  }
+if (!IPAddress) {
+  IPAddress=getPrimaryIP();
+  console.log("Server available at IP address: ", IPAddress);
 }
-const originAddress = `http://${addresses[0]}:5173/`;
+
+const originAddress = `http://${IPAddress}:5173/`;
 
 const corsOptions = {
   origin: originAddress,
@@ -350,15 +361,9 @@ export const io = new SocketIOServer(httpServer, {
 });
 
 io.on('connection', (socket) => {
-  console.log('A user connected:', socket.id);
-
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
-  });
+  socket.on('disconnect', () => {});
 });
 
 
 // activate the server
-httpServer.listen(port, () => {
-  console.log(`Server listening at ${originAddress}`);
-});
+httpServer.listen(port);
