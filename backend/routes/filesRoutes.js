@@ -9,13 +9,18 @@ const f = new FileDAO();
 
 function parseRange(rangeHeader, fileSize) {
   const match = rangeHeader.match(/bytes=(\d*)-(\d*)/);
-  let start = match[1] ? parseInt(match[1]) : 0;
-  let end = match[2] ? parseInt(match[2]) : fileSize - 1;
+  
+  let start = match[1] ? parseInt(match[1], 10) : 0;
+  let end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+
+  if (isNaN(start)) start = 0;
+  if (isNaN(end)) end = fileSize - 1;
+
   end = Math.min(end, fileSize - 1);
+
   return [start, end];
 }
 
-// GET /files/path
 router.get("/", async (req, res) => {
   try {
     const relPath = req.query.relPath;
@@ -26,6 +31,8 @@ router.get("/", async (req, res) => {
     const stats = await fs.promises.stat(filePath);
     const fileSize = stats.size;
 
+    res.setHeader("Accept-Ranges", "bytes");
+
     const range = req.headers.range;
 
     if (range) {
@@ -34,7 +41,6 @@ router.get("/", async (req, res) => {
 
       res.writeHead(206, {
         "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
         "Content-Length": chunkSize,
         "Content-Type": "application/octet-stream"
       });

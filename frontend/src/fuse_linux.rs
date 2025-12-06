@@ -1113,34 +1113,82 @@ impl Filesystem for RemoteFs {
             reply.error(ENOENT);
             return;
         };
-        let rel_path = Self::rel_of(&path);
+        let rel = Self::rel_of(&path);
 
+        // 1) Se esiste un tempfile in scrittura, leggo da lì
         if let Some(tw) = self.state.get_write(ino) {
-            match File::open(&tw.tem_path) {
-                Ok(mut f) => {
-                    let mut buf = vec![0u8; size as usize];
-                    if f.seek(SeekFrom::Start(offset as u64)).is_ok() {
-                        let n = f.read(&mut buf).unwrap_or(0);
-                        reply.data(&buf[..n]);
-                    } else {
-                        reply.error(libc::EIO);
+            if let Ok(mut f) = File::open(&tw.tem_path) {
+                let mut buf = vec![0u8; size as usize];
+                if f.seek(SeekFrom::Start(offset.max(0) as u64)).is_ok() {
+                    let n = f.read(&mut buf).unwrap_or(0);
+                    reply.data(&buf[..n]);
+                } else {
+                    reply.error(EIO);
+                }
+                return;
+            } else {
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        // 2) Controllo dimensione file per evitare richieste infinite
+        // 1) Provo la cache
+        let mut attr = self.state.get_attr(&path);
+
+        // 2) Se cache mancante, provo a ricaricare il parent
+        if attr.is_none() {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+
+            match self.dir_entries(parent) {
+                Ok(entries) => {
+                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| *p == path) {
+                        let ty = if Self::is_dir(&de) {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let size = if ty == FileType::Directory {
+                            0
+                        } else {
+                            de.size as u64
+                        };
+
+                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
+                        self.insert_attr_cache(path.clone(), a.clone());
+                        attr = Some(a);
                     }
                 }
-                Err(_) => reply.error(libc::EIO),
+                Err(_) => {
+                    reply.error(ENOENT);
+                    return;
+                }
             }
+        }
+
+        // 3) Se ancora mancante → errore
+        let attr = match attr {
+            Some(a) => a,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // 🔥 ***FIX: Se offset >= file size → restituisci EOF***
+        if offset as u64 >= attr.size {
+            reply.data(&[]);
             return;
         }
-        
-        let start = offset.max(0) as u64;
-        let end = start + (size as u64).saturating_sub(1);
 
-        match self.rt.block_on(self.api.read_range(&rel_path, start, end)) {
-            Ok(chunk) => {
-                reply.data(&chunk);
-            }
-            Err(err) => {
-                reply.error(errno_from_anyhow(&err));
-            }
+        // Calcolo del range corretto
+        let start = offset.max(0) as u64;
+        let end = (start + size as u64 - 1).min(attr.size - 1);
+
+        match self.rt.block_on(self.api.read_range(&rel, start, end)) {
+            Ok(bytes) => reply.data(&bytes),
+            Err(err) => reply.error(errno_from_anyhow(&err)),
         }
     }
 
