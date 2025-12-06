@@ -1,10 +1,11 @@
+use crate::file_api::{DirectoryEntry, FileApi};
 use anyhow::Result;
 use fuser016::{
-    FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-    spawn_mount2,
+    spawn_mount2, FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
+use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -16,12 +17,10 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc::channel},
+    sync::{mpsc::channel, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
-use crate::file_api::{DirectoryEntry, FileApi};
-use rust_socketio::{ClientBuilder, Payload};
 
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
@@ -172,11 +171,7 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
 }
 
 // Function that start the websocket listener, initialize the websocket connection and listen the messages
-pub fn start_websocket_listener(
-    api_url: &str,
-    notifier: Arc<Notifier>,
-    fs_state: Arc<FsState>,
-) {
+pub fn start_websocket_listener(api_url: &str, notifier: Arc<Notifier>, fs_state: Arc<FsState>) {
     let ws_url = format!("{}/socket.io/", api_url.trim_end_matches('/'));
 
     tokio::spawn(async move {
@@ -188,19 +183,17 @@ pub fn start_websocket_listener(
                 .on("connect", |_, _| {
                     println!("Socket.IO connected!");
                 })
-                .on("fs_change", move |payload, _| {
-                    match payload {
-                        Payload::Text(values) => {
-                            if values.len() < 1 {
-                                eprintln!("fs_change payload senza dati");
-                                return;
-                            }
-                            let json_payload = &values[0];
-                            handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
+                .on("fs_change", move |payload, _| match payload {
+                    Payload::Text(values) => {
+                        if values.len() < 1 {
+                            eprintln!("fs_change payload senza dati");
+                            return;
                         }
-                        _other =>{
-                            eprintln!("Binary payload non gestito");
-                        }
+                        let json_payload = &values[0];
+                        handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
+                    }
+                    _other => {
+                        eprintln!("Binary payload non gestito");
                     }
                 })
                 .on("error", |err, _| {
@@ -315,7 +308,8 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
         st.insert_path_mapping(&new_abs, ino);
         ino
     } else {
-        st.ino_of(&new_abs).unwrap_or_else(|| st.allocate_ino(&new_abs))
+        st.ino_of(&new_abs)
+            .unwrap_or_else(|| st.allocate_ino(&new_abs))
     };
 
     let Some((_abs_meta, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
@@ -362,7 +356,7 @@ pub fn update_cache_from_metadata(
 
     let ino = match st.ino_of(abs) {
         Some(i) => i,
-        None => st.allocate_ino(abs), 
+        None => st.allocate_ino(abs),
     };
 
     let blocks = if size == 0 { 0 } else { (size + 511) / 512 };
@@ -549,7 +543,7 @@ impl RemoteFs {
     }
 
     // Function that init the cache
-    // It is called at the beginning 
+    // It is called at the beginning
     pub fn init_cache(&self) {
         self.state.clear_all_cache();
     }
@@ -635,7 +629,7 @@ impl RemoteFs {
             rt,
         }
     }
-     
+
     // Function that allocate the inode
     fn alloc_ino(&self, path: &Path) -> u64 {
         if let Some(ino) = self.state.ino_of(path) {
@@ -1120,12 +1114,13 @@ impl Filesystem for RemoteFs {
             return;
         };
         let rel_path = Self::rel_of(&path);
+
         if let Some(tw) = self.state.get_write(ino) {
             match File::open(&tw.tem_path) {
                 Ok(mut f) => {
                     let mut buf = vec![0u8; size as usize];
-                    if let Ok(_) = f.seek(SeekFrom::Start(offset as u64)) {
-                        let n = Read::read(&mut f, &mut buf).unwrap_or(0);
+                    if f.seek(SeekFrom::Start(offset as u64)).is_ok() {
+                        let n = f.read(&mut buf).unwrap_or(0);
                         reply.data(&buf[..n]);
                     } else {
                         reply.error(libc::EIO);
@@ -1135,19 +1130,16 @@ impl Filesystem for RemoteFs {
             }
             return;
         }
-        match self.rt.block_on(self.api.read_file(&rel_path)) {
-            Ok(data) => {
-                let off = offset.max(0) as usize;
-                if off >= data.len() {
-                    reply.data(&[]);
-                    return;
-                }
-                let end = off.saturating_add(size as usize).min(data.len());
-                reply.data(&data[off..end]);
+        
+        let start = offset.max(0) as u64;
+        let end = start + (size as u64).saturating_sub(1);
+
+        match self.rt.block_on(self.api.read_range(&rel_path, start, end)) {
+            Ok(chunk) => {
+                reply.data(&chunk);
             }
-            Err(e) => {
-                let errno = errno_from_anyhow(&e);
-                reply.error(errno);
+            Err(err) => {
+                reply.error(errno_from_anyhow(&err));
             }
         }
     }
@@ -1550,8 +1542,8 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
         let tx = tx.clone();
         let shutting_down = shutting_down.clone();
         thread::spawn(move || {
-            for _sig in signals.forever(){
-                if !shutting_down.swap(true, Ordering::SeqCst){
+            for _sig in signals.forever() {
+                if !shutting_down.swap(true, Ordering::SeqCst) {
                     let _ = tx.send(());
                 }
             }

@@ -7,38 +7,56 @@ import { ROOT_DIR, backendChanges } from '../index.js';
 const router = express.Router();
 const f = new FileDAO();
 
+function parseRange(rangeHeader, fileSize) {
+  const match = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+  let start = match[1] ? parseInt(match[1]) : 0;
+  let end = match[2] ? parseInt(match[2]) : fileSize - 1;
+  end = Math.min(end, fileSize - 1);
+  return [start, end];
+}
+
 // GET /files/path
 router.get("/", async (req, res) => {
   try {
     const relPath = req.query.relPath;
     const filePath = path.join(ROOT_DIR, relPath);
-    const parentPath = path.dirname(filePath);
+
     backendChanges.add(filePath);
-    if (!fs.existsSync(parentPath)) {
-      return res
-        .status(400)
-        .json({
-          error: "Parent directory not found. Create the directory first.",
-        });
-    }
-    if (fs.is_dir) {
-      return res
-        .status(400)
-        .json({ error: "Path is referenced to a directory." });
+
+    const stats = await fs.promises.stat(filePath);
+    const fileSize = stats.size;
+
+    const range = req.headers.range;
+
+    if (range) {
+      const [start, end] = parseRange(range, fileSize);
+      const chunkSize = end - start + 1;
+
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunkSize,
+        "Content-Type": "application/octet-stream"
+      });
+
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+      return;
     }
 
-    const readStream = fs.createReadStream(filePath);
-    readStream.pipe(res);
-
-    readStream.on("error", (err) => {
-      res.status(500).json({ error: "Error on file reading" });
+    res.writeHead(200, {
+      "Content-Length": fileSize,
+      "Content-Type": "application/octet-stream"
     });
+
+    fs.createReadStream(filePath).pipe(res);
+
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// PUT /files/path
+// PUT /files/path (write file)
 router.put("/", async (req, res) => {
   try {
     const relPath = req.query.relPath;
@@ -46,14 +64,13 @@ router.put("/", async (req, res) => {
     const parentPathAbs = path.dirname(filePathAbs);
     const parentPath = path.dirname(relPath);
     const name = path.basename(filePathAbs);
+
     backendChanges.add(filePathAbs);
-    
+
     if (!fs.existsSync(parentPathAbs)) {
-      return res
-        .status(400)
-        .json({
-          error: "Parent directory not found. Create the directory first.",
-        });
+      return res.status(400).json({
+        error: "Parent directory not found. Create the directory first."
+      });
     }
 
     const writeStream = fs.createWriteStream(filePathAbs);
@@ -61,7 +78,6 @@ router.put("/", async (req, res) => {
 
     writeStream.on("finish", async () => {
       const stats = await fs.promises.stat(filePathAbs);
-      const permissions = (stats.mode & 0o777).toString(8);
 
       await f.updateFile({
         path: relPath,
@@ -70,16 +86,18 @@ router.put("/", async (req, res) => {
         is_dir: false,
         size: stats.size,
         mtime: Math.floor(stats.mtimeMs / 1000),
-        permissions
+        permissions: (stats.mode & 0o777).toString(8)
       });
 
-      res.status(200).json({ message: "File correctly saved. " });
+      res.status(200).json({ message: "File correctly saved." });
     });
 
-    writeStream.on("error", (err) => {
-      res.status(500).json({ error: "Error on file writing" });
+    writeStream.on("error", () => {
+      res.status(500).json({ error: "Error writing file" });
     });
+
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -90,7 +108,7 @@ router.delete("/", async (req, res) => {
     const relPath = req.query.relPath;
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
-    
+
     const stats = await fs.promises.stat(filePathAbs).catch(() => null);
     if (!stats) {
       return res.status(404).json({ error: "File or directory not found" });
@@ -113,7 +131,7 @@ router.delete("/", async (req, res) => {
 router.patch("/chmod", async (req, res) => {
   try {
     const relPath = req.query.relPath;
-    const perm = req.query.perm; 
+    const perm = req.query.perm;
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
     await fs.promises.chmod(filePathAbs, parseInt(perm, 8));
