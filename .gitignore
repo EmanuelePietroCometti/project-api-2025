@@ -16,8 +16,12 @@ Cargo.lock
 .vscode/
 *.log
 *.bin
+*.db
 
-# Sistema operativo
+# Folders
+storage/
+
+# Operating system
 .DS_Store
 Thumbs.db
-
+._.DS_Store

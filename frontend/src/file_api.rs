@@ -12,7 +12,6 @@ pub struct FileApi {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct DirectoryEntry {
-    //struct in cui mettiamo i valori da stampare nel ls
     pub name: String,
     pub size: i64,
     pub mtime: i64,
@@ -43,6 +42,8 @@ impl FileApi {
             client: Client::new(),
         }
     }
+
+    // STATS /stats
     pub async fn statfs(&self) -> Result<StatsResponse> {
         let url = format!("{}/stats", self.base_url);
         let resp = self.client.get(&url).send().await?;
@@ -57,6 +58,7 @@ impl FileApi {
         }
     }
 
+    // CHMOD /files/chmod
     pub async fn chmod(&self, rel_path: &str, mode: u32) -> anyhow::Result<()> {
         let url = format!("{}/files/chmod", self.base_url);
         let perm = format!("{:o}", mode & 0o777);
@@ -75,6 +77,7 @@ impl FileApi {
         }
     }
 
+    // TRUNCATE /files/truncate
     pub async fn truncate(&self, rel_path: &str, size: u64) -> anyhow::Result<()> {
         let url = format!("{}/files/truncate", self.base_url);
         let resp = self
@@ -92,6 +95,7 @@ impl FileApi {
         }
     }
 
+    // UTIMES /files/utimes
     pub async fn utimes(
         &self,
         rel_path: &str,
@@ -99,7 +103,6 @@ impl FileApi {
         mtime: Option<SystemTime>,
     ) -> anyhow::Result<()> {
         let url = format!("{}/files/utimes", self.base_url);
-        // Converti SystemTime in secondi Unix
         let ts = |t: SystemTime| {
             t.duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
@@ -190,6 +193,7 @@ impl FileApi {
         }
     }
 
+    // MKDIR /mkdir
     pub async fn mkdir(&self, path: &str) -> Result<()> {
         let resp = self
             .client
@@ -207,6 +211,7 @@ impl FileApi {
         }
     }
 
+    // LS /list
     pub async fn ls(&self, path: &str) -> Result<Vec<DirectoryEntry>> {
         println!("PATH API ls : {}",path);
         let resp = self
@@ -219,14 +224,14 @@ impl FileApi {
         let status = resp.status();
         if resp.status().is_success() {
             let v = resp.json::<Vec<DirectoryEntry>>().await?;
-            // println!("Response text: {:?}", v);
             Ok(v)
         } else {
             let text = resp.text().await.unwrap_or_default();
-            // println!("Error response text: {}", text);
             Err(anyhow!("ls failed: {} - {}", status, text))
         }
     }
+
+    // RENAME /files/rename
     pub async fn rename(&self, old_rel_path: &str, new_rel_path: &str) -> Result<()> {
         let url = format!("{}/files/rename", self.base_url);
         let resp = self

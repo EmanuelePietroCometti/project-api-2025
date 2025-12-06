@@ -1,6 +1,8 @@
 use frontend::{file_api::FileApi, mount_fs};
 use std::{net::IpAddr, path::PathBuf};
 use std::io::{self, Write};
+
+
 fn main() -> anyhow::Result<()> {
     let mut ip_address = String::new();
     print!("Insert the backend IP address: ");
@@ -20,5 +22,5 @@ fn main() -> anyhow::Result<()> {
     let mp = mountpoint.to_string_lossy().to_string();
     println!("Mounting filesystem at: {}", mp);
     let api = FileApi::new(&url);
-    mount_fs(&mp, api)
+    mount_fs(&mp, api, url)
 }
