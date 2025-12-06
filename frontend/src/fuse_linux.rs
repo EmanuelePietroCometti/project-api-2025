@@ -1115,7 +1115,6 @@ impl Filesystem for RemoteFs {
         };
         let rel = Self::rel_of(&path);
 
-        // 1) Se esiste un tempfile in scrittura, leggo da lì
         if let Some(tw) = self.state.get_write(ino) {
             if let Ok(mut f) = File::open(&tw.tem_path) {
                 let mut buf = vec![0u8; size as usize];
@@ -1132,11 +1131,8 @@ impl Filesystem for RemoteFs {
             }
         }
 
-        // 2) Controllo dimensione file per evitare richieste infinite
-        // 1) Provo la cache
         let mut attr = self.state.get_attr(&path);
 
-        // 2) Se cache mancante, provo a ricaricare il parent
         if attr.is_none() {
             let parent = path.parent().unwrap_or(Path::new("/"));
 
@@ -1167,7 +1163,6 @@ impl Filesystem for RemoteFs {
             }
         }
 
-        // 3) Se ancora mancante → errore
         let attr = match attr {
             Some(a) => a,
             None => {
@@ -1176,13 +1171,11 @@ impl Filesystem for RemoteFs {
             }
         };
 
-        // 🔥 ***FIX: Se offset >= file size → restituisci EOF***
         if offset as u64 >= attr.size {
             reply.data(&[]);
             return;
         }
 
-        // Calcolo del range corretto
         let start = offset.max(0) as u64;
         let end = (start + size as u64 - 1).min(attr.size - 1);
 
