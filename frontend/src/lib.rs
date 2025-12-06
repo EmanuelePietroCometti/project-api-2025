@@ -1,26 +1,35 @@
 pub mod file_api;
-#[cfg(all(target_os = "linux", feature = "linux"))]
+
+#[cfg(target_os = "linux")]
 mod fuse_linux;
-#[cfg(all(target_os = "linux", feature = "linux"))]
+
+#[cfg(target_os = "linux")]
 pub use fuse_linux::mount_fs;
 
-#[cfg(all(target_os = "macos", feature = "macos"))]
+
+#[cfg(target_os = "macos")]
 mod fuse_mac;
-#[cfg(all(target_os = "macos", feature = "macos"))]
+
+#[cfg(target_os = "macos")]
 pub use fuse_mac::mount_fs;
 
-#[cfg(all(target_os = "windows", feature = "windows"))]
+#[cfg(target_os = "windows")]
 mod fuse_windows;
-#[cfg(all(target_os = "windows", feature = "windows"))]
+
+#[cfg(target_os = "windows")]
 pub use fuse_windows::mount_fs;
 
 #[cfg(not(any(
-    all(target_os = "linux", feature = "linux"),
-    all(target_os = "macos", feature = "macos"),
-    all(target_os = "windows", feature = "windows"),
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
 )))]
-pub fn mount_fs(mountpoint: &str, api: file_api::FileApi, url: String) -> anyhow::Result<()> {
+pub fn mount_fs(
+    _mountpoint: &str,
+    _api: file_api::FileApi,
+    _url: String
+) -> anyhow::Result<()> {
     Err(anyhow::anyhow!(
-        "mount_fs is only available on supported OS targets (Linux/macOS/Windows with --features windows)"
+        "mount_fs is only supported on Linux, macOS or Windows"
     ))
 }
