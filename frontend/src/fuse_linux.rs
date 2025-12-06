@@ -4,7 +4,9 @@ use fuser016::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
     spawn_mount2,
 };
-use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{ENOENT, ENOTDIR, ENOTEMPTY,EIO};
+use signal_hook::consts::signal::*;
+use signal_hook::iterator::Signals;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -1540,31 +1542,21 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
             start_websocket_listener(&url_clone, notifier_clone, fs_state);
         });
     }
+    let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
     let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
     {
         let tx = tx.clone();
         let shutting_down = shutting_down.clone();
-        ctrlc::set_handler(move || {
-            if !shutting_down.swap(true, Ordering::SeqCst) {
-                let _ = tx.send(());
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                if !shutting_down.swap(true, Ordering::SeqCst) {
+                    let _ = tx.send(());
+                }
             }
-        })
-        .expect("Error setting Ctrl-C handler");
+        });
     }
     let _ = rx.recv();
-    let ok = std::process::Command::new("fusermount")
-        .arg("-u")
-        .arg(&mountpoint)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        let _ = std::process::Command::new("umount")
-            .arg("-l")
-            .arg(&mountpoint)
-            .status();
-    }
     let _ = bg_session.join();
     Ok(())
 }
