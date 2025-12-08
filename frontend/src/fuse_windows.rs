@@ -39,6 +39,8 @@ use std::slice;
 use winfsp_sys::{FSP_FSCTL_DIR_INFO, FspFileSystemAddDirInfo};
 //use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
+use rust_socketio::{ClientBuilder, Payload};
+use serde_json::Value;
 
 pub struct MyFileContext {
     pub ino: u64,
@@ -84,19 +86,163 @@ struct FileAttr {
     flags: u32,
 }
 
+#[derive(Clone)]
+pub struct FsState {
+    /// Mappa path -> inode
+    pub ino_by_path: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    /// Mappa inode -> path
+    pub path_by_ino: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    /// Cache degli attributi dei file
+    pub attr_cache: Arc<Mutex<HashMap<PathBuf, FileAttr>>>,
+    /// Cache delle directory (contenuto + timestamp)
+    pub dir_cache: Arc<Mutex<HashMap<PathBuf, (Vec<DirectoryEntry>, SystemTime)>>>,
+    /// File aperti in scrittura con temp file
+    pub writes: Arc<Mutex<HashMap<u64, TempWrite>>>,
+    /// Prossimo inode da allocare
+    pub next_ino: Arc<Mutex<u64>>,
+    /// TTL per la cache
+    pub cache_ttl: Duration,
+    /// Set di inode già cancellati (per evitare doppie cancellazioni)
+    pub already_deleted: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl FsState {
+    pub fn new() -> Self {
+        let mut ino_by_path = HashMap::new();
+        let mut path_by_ino = HashMap::new();
+        
+        // Root sempre con inode 1
+        ino_by_path.insert(PathBuf::from("."), 1);
+        path_by_ino.insert(1, PathBuf::from("."));
+        
+        Self {
+            ino_by_path: Arc::new(Mutex::new(ino_by_path)),
+            path_by_ino: Arc::new(Mutex::new(path_by_ino)),
+            attr_cache: Arc::new(Mutex::new(HashMap::new())),
+            dir_cache: Arc::new(Mutex::new(HashMap::new())),
+            writes: Arc::new(Mutex::new(HashMap::new())),
+            next_ino: Arc::new(Mutex::new(2)),
+            already_deleted: Arc::new(Mutex::new(HashSet::new())),
+            cache_ttl: Duration::from_secs(300),
+        }
+    }
+
+    // ---- PATH ↔ INODE ----
+
+    pub fn ino_of(&self, path: &Path) -> Option<u64> {
+        self.ino_by_path.lock().unwrap().get(path).cloned()
+    }
+
+    pub fn path_of(&self, ino: u64) -> Option<PathBuf> {
+        self.path_by_ino.lock().unwrap().get(&ino).cloned()
+    }
+
+    pub fn allocate_ino(&self, path: &Path) -> u64 {
+        if let Some(ino) = self.ino_by_path.lock().unwrap().get(path).cloned() {
+            return ino;
+        }
+        
+        let mut next = self.next_ino.lock().unwrap();
+        let ino = *next;
+        *next += 1;
+        
+        self.ino_by_path.lock().unwrap().insert(path.to_path_buf(), ino);
+        self.path_by_ino.lock().unwrap().insert(ino, path.to_path_buf());
+        
+        ino
+    }
+
+    pub fn remove_path(&self, path: &Path) {
+        if let Some(ino) = self.ino_by_path.lock().unwrap().remove(path) {
+            self.path_by_ino.lock().unwrap().remove(&ino);
+        }
+    }
+
+    pub fn insert_path_mapping(&self, path: &Path, ino: u64) {
+        self.ino_by_path.lock().unwrap().insert(path.to_path_buf(), ino);
+        self.path_by_ino.lock().unwrap().insert(ino, path.to_path_buf());
+    }
+
+    // ---- CACHE ATTR ----
+
+    pub fn get_attr(&self, path: &Path) -> Option<FileAttr> {
+        self.attr_cache.lock().unwrap().get(path).cloned()
+    }
+
+    pub fn set_attr(&self, path: &Path, attr: FileAttr) {
+        self.attr_cache.lock().unwrap().insert(path.to_path_buf(), attr);
+    }
+
+    pub fn remove_attr(&self, path: &Path) {
+        self.attr_cache.lock().unwrap().remove(path);
+    }
+
+    // ---- CACHE DIRECTORY ----
+
+    pub fn get_dir_cache(&self, path: &Path) -> Option<(Vec<DirectoryEntry>, SystemTime)> {
+        self.dir_cache.lock().unwrap().get(path).cloned()
+    }
+
+    pub fn set_dir_cache(&self, path: &Path, data: (Vec<DirectoryEntry>, SystemTime)) {
+        self.dir_cache.lock().unwrap().insert(path.to_path_buf(), data);
+    }
+
+    pub fn remove_dir_cache(&self, path: &Path) {
+        self.dir_cache.lock().unwrap().remove(path);
+    }
+
+    // ---- CLEAR CACHE ----
+
+    pub fn clear_all_cache(&self) {
+        self.attr_cache.lock().unwrap().clear();
+        self.dir_cache.lock().unwrap().clear();
+    }
+
+    pub fn clear_cache(&self, path: Option<&Path>) {
+        match path {
+            Some(p) => {
+                self.remove_attr(p);
+                self.remove_dir_cache(p);
+            }
+            None => {
+                self.clear_all_cache();
+            }
+        }
+    }
+
+    // ---- WRITE TRACKING ----
+
+    pub fn insert_write(&self, ino: u64, tw: TempWrite) {
+        self.writes.lock().unwrap().insert(ino, tw);
+    }
+
+    pub fn get_write(&self, ino: u64) -> Option<TempWrite> {
+        self.writes.lock().unwrap().get(&ino).cloned()
+    }
+
+    pub fn remove_write(&self, ino: u64) -> Option<TempWrite> {
+        self.writes.lock().unwrap().remove(&ino)
+    }
+
+    // ---- DELETED TRACKING ----
+
+    pub fn mark_deleted(&self, ino: u64) {
+        self.already_deleted.lock().unwrap().insert(ino);
+    }
+
+    pub fn is_deleted(&self, ino: u64) -> bool {
+        self.already_deleted.lock().unwrap().contains(&ino)
+    }
+}
+
+
 struct RemoteFs {
+    /// Stato condiviso (cache, mappature, ecc.)
+    state: Arc<FsState>,
+    /// Client API per comunicare con il backend
     api: FileApi,
+    /// Runtime Tokio per operazioni async
     rt: Arc<Runtime>,
-    //path <-> ino
-    ino_by_path: Mutex<HashMap<PathBuf, u64>>,
-    path_by_ino: Mutex<HashMap<u64, PathBuf>>,
-    //cache attributi
-    dir_cache: Mutex<HashMap<PathBuf, (Vec<DirectoryEntry>, SystemTime)>>,
-    attr_cache: Mutex<HashMap<PathBuf, FileAttr>>,
-    cache_ttl: Duration,
-    writes: Mutex<HashMap<u64, TempWrite>>,
-    next_ino: Mutex<u64>,
-    already_deleted: Mutex<HashSet<u64>>, // tiene traccia degli inode già cancellati
 }
 
 // Costanti WinAPI che non sempre sono re-esportate dal crate
@@ -108,76 +254,47 @@ const DELETE: u32 = 0x0001_0000; //TODO vedere se si riesce ad importare
 
 impl RemoteFs {
     fn new(api: FileApi, rt: Arc<Runtime>) -> Self {
-        let mut ino_by_path = HashMap::new();
-        let mut path_by_ino = HashMap::new();
-        ino_by_path.insert(PathBuf::from("/"), 1);
-        path_by_ino.insert(1, PathBuf::from("/"));
         Self {
+            state: Arc::new(FsState::new()),
             api,
             rt,
-            ino_by_path: Mutex::new(ino_by_path),
-            path_by_ino: Mutex::new(path_by_ino),
-            attr_cache: Mutex::new(HashMap::new()),
-            dir_cache: Mutex::new(HashMap::new()),
-            writes: Mutex::new(HashMap::new()),
-            next_ino: Mutex::new(2),
-            already_deleted: Mutex::new(HashSet::new()),
-            cache_ttl: Duration::from_secs(300),
         }
     }
 
-    // Funzione che inizializza la cache
-    // Viene chiamata all'avvio del filesystem
+    // Tutti i metodi ora usano self.state invece di accedere direttamente ai campi
+    
+    fn alloc_ino(&self, path: &Path) -> u64 {
+        self.state.allocate_ino(path)
+    }
+
+    fn path_of(&self, ino: u64) -> Option<PathBuf> {
+        self.state.path_of(ino)
+    }
+
     pub fn init_cache(&self) {
-        let mut attrcache = self.attr_cache.lock().unwrap();
-        let mut dircache = self.dir_cache.lock().unwrap();
-        attrcache.clear();
-        dircache.clear();
+        self.state.clear_all_cache();
     }
 
-    // Funzione che verifica se la cache è ancora valida
-    pub fn is_cache_valid(&self, timestamp: SystemTime) -> bool {
-        println!(
-            "[CACHEVALID] timestamp :{:?}, cache ttl: {:?}",
-            SystemTime::now().duration_since(timestamp).unwrap(),
-            self.cache_ttl
-        );
-        SystemTime::now().duration_since(timestamp).unwrap() < self.cache_ttl
+    pub fn get_attr_cache(&self, path: &Path) -> Option<FileAttr> {
+        self.state.get_attr(path)
     }
 
-    // Funzione che recupera la cache di una directory
+    pub fn insert_attr_cache(&self, path: PathBuf, attr: FileAttr) {
+        self.state.set_attr(&path, attr);
+    }
+
+    pub fn insert_dir_cache(&self, path: PathBuf, data: (Vec<DirectoryEntry>, SystemTime)) {
+        self.state.set_dir_cache(&path, data);
+    }
+
     pub fn get_dir_cache(&self, path: &Path) -> Option<(Vec<DirectoryEntry>, SystemTime)> {
-        println!("[GET DIR CACHE] get from path :{:?}", path);
-        let cache_entry = self.dir_cache.lock().unwrap().get(path).cloned();
-        if let Some((en, ts)) = &cache_entry {
-            println!("[GET DIR CACHE] entry : {:?}", en);
+        let cache_entry = self.state.get_dir_cache(path);
+        if let Some((_, ts)) = &cache_entry {
             if !self.is_cache_valid(*ts) {
                 return None;
             }
         }
         cache_entry
-    }
-
-    pub fn get_attr_cache(&self, path: &Path) -> Option<FileAttr> {
-        self.attr_cache.lock().unwrap().get(path).cloned()
-    }
-
-    // Funzione che permette di svuotare la cache
-    // Se viene passato un path specifico, viene svuotata solo la cache relativa a quel path
-    // In caso contrario viene svuotata tutta la cache
-    pub fn clear_cache(&self, path: Option<&Path>) {
-        let mut attrcache = self.attr_cache.lock().unwrap();
-        let mut dircache = self.dir_cache.lock().unwrap();
-        match path {
-            Some(p) => {
-                attrcache.remove(p);
-                dircache.remove(p);
-            }
-            None => {
-                attrcache.clear();
-                dircache.clear();
-            }
-        }
     }
 
     // Funzione che effettua l'aggiornamento della cache
@@ -192,12 +309,12 @@ impl RemoteFs {
 
         // 3) aggiorna dir_cache con chiave canonica
         {
-            let mut dircache = self.dir_cache.lock().unwrap();
+            let mut dircache = self.state.dir_cache.lock().unwrap();
             dircache.insert(parent_key.clone(), (list.clone(), SystemTime::now()));
         }
 
         // 4) aggiorna attr_cache in modo coerente e non aggressivo
-        let mut attrcache = self.attr_cache.lock().unwrap();
+        let mut attrcache = self.state.attr_cache.lock().unwrap();
         for de in &list {
             // sempre forma "./..." per i figli
             let child = if rel == "." || rel.is_empty() {
@@ -229,22 +346,9 @@ impl RemoteFs {
         Ok(())
     }
 
-    // Funzione che inserisce in cache lo stato
-    pub fn insert_attr_cache(&self, path: PathBuf, attr: FileAttr) {
-        println!(
-            "[INSERT ATTR CACHE] (path , attr) : ({:?}, {:?}) ",
-            path, attr
-        );
-        self.attr_cache.lock().unwrap().insert(path, attr);
-    }
 
-    // Funzione che inserisce in cache lo stato di una directory
-    pub fn insert_dir_cache(&self, path: PathBuf, data: (Vec<DirectoryEntry>, SystemTime)) {
-        println!(
-            "[INSERT DIR CACHE] (path ,data) : ({:?}, {:?}) ",
-            path, data
-        );
-        self.dir_cache.lock().unwrap().insert(path, data);
+    pub fn is_cache_valid(&self, timestamp: SystemTime) -> bool {
+        SystemTime::now().duration_since(timestamp).unwrap() < self.state.cache_ttl
     }
 
     fn sd_from_sddl(sddl: &str) -> anyhow::Result<Vec<u8>> {
@@ -269,19 +373,19 @@ impl RemoteFs {
         }
         Ok(bytes)
     }
-
+/* 
     fn alloc_ino(&self, path: &Path) -> u64 {
-        if let Some(ino) = self.ino_by_path.lock().unwrap().get(path).cloned() {
+        if let Some(ino) = self.state.ino_by_path.lock().unwrap().get(path).cloned() {
             return ino;
         }
-        let mut next_ino = self.next_ino.lock().unwrap();
+        let mut next_ino = self.state.next_ino.lock().unwrap();
         let ino = *next_ino;
         *next_ino += 1;
-        self.ino_by_path
+        self.state.ino_by_path
             .lock()
             .unwrap()
             .insert(path.to_path_buf(), ino);
-        self.path_by_ino
+        self.state.path_by_ino
             .lock()
             .unwrap()
             .insert(ino, path.to_path_buf());
@@ -289,9 +393,9 @@ impl RemoteFs {
     }
 
     fn path_of(&self, ino: u64) -> Option<PathBuf> {
-        self.path_by_ino.lock().unwrap().get(&ino).cloned()
+        self.state.path_by_ino.lock().unwrap().get(&ino).cloned()
     }
-
+*/
     fn rel_of(path: &Path) -> String {
         // to_string_lossy è sufficiente qui perché lavori con componenti ASCII del FS virtuale
         let mut s = path.to_string_lossy().replace('\\', "/");
@@ -383,11 +487,11 @@ impl RemoteFs {
         println!("[DEBUG] dir_entries(): chiamata backend -> rel='{}'", rel);
         //1) prova cache directory
 
-        if let Some((entries, ts)) = self.dir_cache.lock().unwrap().get(Path::new(&rel)).cloned() {
+        if let Some((entries, ts)) = self.state.dir_cache.lock().unwrap().get(Path::new(&rel)).cloned() {
             if SystemTime::now()
                 .duration_since(ts)
                 .unwrap_or(Duration::ZERO)
-                < self.cache_ttl
+                < self.state.cache_ttl
             {
                 let mut out = Vec::with_capacity(entries.len());
                 for de in entries {
@@ -600,13 +704,13 @@ impl RemoteFs {
     fn evict_all_state_for(&self, path: &str) {
         //liberi la cache, mapping e temp write
         let path_buf = std::path::PathBuf::from(path);
-        if let Some(ino) = self.ino_by_path.lock().unwrap().remove(&path_buf) {
-            self.path_by_ino.lock().unwrap().remove(&ino);
-            if let Some(tw) = self.writes.lock().unwrap().remove(&ino) {
+        if let Some(ino) = self.state.ino_by_path.lock().unwrap().remove(&path_buf) {
+            self.state.path_by_ino.lock().unwrap().remove(&ino);
+            if let Some(tw) = self.state.writes.lock().unwrap().remove(&ino) {
                 let _ = std::fs::remove_file(&tw.tem_path);
             }
         }
-        self.attr_cache.lock().unwrap().remove(&path_buf);
+        self.state.attr_cache.lock().unwrap().remove(&path_buf);
     }
 
     fn can_delete(
@@ -779,6 +883,334 @@ impl RemoteFs {
         rt.block_on(fut)
     }
 }
+
+/// Normalizza path ricevuti dal WebSocket (gestisce path assoluti errati)
+fn normalize_websocket_path(raw: &str) -> String {
+    // Caso 1: Path già corretto "./file.txt"
+    if raw.starts_with("./") || raw == "." {
+        return raw.to_string();
+    }
+    
+    // Caso 2: Path assoluto Windows "C:\Users\...\storage\file.txt"
+    // Estrai solo la parte dopo "storage"
+    if raw.contains("\\storage\\") || raw.contains("/storage/") {
+        // Trova l'indice di "storage"
+        let storage_idx = raw.rfind("storage").unwrap_or(0);
+        
+        if storage_idx > 0 {
+            // Salta "storage\" o "storage/"
+            let after_storage = &raw[storage_idx + 7..]; // 7 = len("storage")
+            let clean = after_storage.trim_start_matches(['/', '\\']);
+            
+            if clean.is_empty() {
+                return ".".to_string();
+            }
+            
+            // Normalizza separatori e aggiungi prefisso
+            let normalized = clean.replace('\\', "/");
+            return format!("./{}", normalized);
+        }
+    }
+    
+    // Caso 3: Path relativo senza prefisso "file.txt" -> "./file.txt"
+    if !raw.starts_with('/') && !raw.contains(":\\") {
+        let normalized = raw.replace('\\', "/");
+        return format!("./{}", normalized);
+    }
+    
+    // Fallback: ritorna invariato con warning
+    eprintln!("[WebSocket] WARNING: Unhandled path format: '{}'", raw);
+    raw.to_string()
+}
+
+/// Estrae i metadati dal payload WebSocket
+fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16)> {
+    let raw_rel = payload["relPath"].as_str()?;
+    
+    // 🔴 NORMALIZZA: rimuovi path assoluto Windows se presente
+    let rel = normalize_websocket_path(raw_rel);
+    
+    println!("[WebSocket] metadata_from_payload: raw='{}' -> normalized='{}'", raw_rel, rel);
+    let name = payload["name"]
+        .as_str()
+        .map(|s| s.to_string())
+        .or_else(|| {
+            Path::new(&rel)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })?;
+
+    let is_dir = payload["is_dir"].as_bool().unwrap_or(false);
+    let size = payload["size"].as_u64().unwrap_or(0);
+    let mtime = payload["mtime"].as_i64().unwrap_or(0);
+
+    let perm_str = payload["permissions"].as_str().unwrap_or("644");
+    let perm = u16::from_str_radix(perm_str, 8).unwrap_or(0o644);
+
+    // Converti path relativo backend ("./a/b") in path canonico Windows (".\\a\\b")
+    let abs_path = if rel == "." || rel.is_empty() {
+        PathBuf::from(".")
+    } else if rel.starts_with("./") {
+        PathBuf::from(rel)
+    } else {
+        PathBuf::from(format!("./{}", rel))
+    };
+
+    Some((abs_path, name, is_dir, size, mtime, perm))
+}
+
+/// Avvia il listener WebSocket per ricevere notifiche di cambiamenti
+pub fn start_websocket_listener(
+    api_url: &str,
+    fs_state: Arc<FsState>,
+) {
+    let ws_url = format!("{}/socket.io/", api_url.trim_end_matches('/'));
+
+    tokio::spawn(async move {
+        let fs_state_cloned = fs_state.clone();
+        let ws_url_clone = ws_url.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let client = ClientBuilder::new(ws_url_clone)
+                .on("connect", |_, _| {
+                    println!("[WebSocket] Connected!");
+                })
+                .on("fs_change", move |payload, _| {
+                    match payload {
+                        Payload::Text(values) => {
+                            if values.len() < 1 {
+                                eprintln!("[WebSocket] fs_change without data");
+                                return;
+                            }
+                            let json_payload = &values[0];
+                            handle_fs_change(json_payload, &fs_state_cloned);
+                        }
+                        _ => {
+                            eprintln!("[WebSocket] Binary payload not supported");
+                        }
+                    }
+                })
+                .on("error", |err, _| {
+                    eprintln!("[WebSocket] Error: {:?}", err);
+                })
+                .connect();
+
+            if let Err(err) = client {
+                eprintln!("[WebSocket] Connection failed: {:?}", err);
+            }
+        });
+    });
+}
+
+/// Dispatcher principale per eventi fs_change
+fn handle_fs_change(payload: &Value, fs_state: &FsState) {
+    let op = payload["op"].as_str().unwrap_or("");
+    
+    println!("[WebSocket] Received fs_change: op={}", op);
+    
+    match op {
+        "add" | "addDir" => {
+            handle_created(payload, fs_state);
+        }
+        "write" | "change" => {
+            handle_updated(payload, fs_state);
+        }
+        "unlink" | "unlinkDir" => {
+            handle_deleted_event(payload, fs_state);
+        }
+        "rename" | "renameDir" => {
+            handle_renamed_event(payload, fs_state);
+        }
+        _ => {
+            println!("[WebSocket] Unknown op: {}", op);
+        }
+    }
+}
+
+/// Gestisce creazione di file/directory
+fn handle_created(payload: &Value, st: &FsState) {
+    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+        eprintln!("[WebSocket] handle_created: invalid metadata");
+        return;
+    };
+    
+    println!("[WebSocket] CREATE: path={:?} is_dir={}", abs, is_dir);
+    
+    // Aggiorna cache con nuovi dati
+    let _ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
+    
+    // Invalida parent directory (forza rilettura al prossimo accesso)
+    if let Some(parent) = abs.parent() {
+        st.remove_dir_cache(parent);
+        println!("[WebSocket] Invalidated parent dir cache: {:?}", parent);
+    }
+    
+    // IMPORTANTE: Windows/Explorer leggerà i nuovi dati al prossimo readdir/getattr
+}
+
+/// Gestisce aggiornamento di file
+fn handle_updated(payload: &Value, st: &FsState) {
+    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+        eprintln!("[WebSocket] handle_updated: invalid metadata");
+        return;
+    };
+    
+    println!("[WebSocket] UPDATE: path={:?} size={}", abs, size);
+    
+    // Aggiorna attributi in cache
+    update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
+    
+    // Invalida parent per forzare refresh visivo in Explorer
+    if let Some(parent) = abs.parent() {
+        st.remove_dir_cache(parent);
+    }
+}
+
+/// Gestisce cancellazione
+fn handle_deleted_event(payload: &Value, st: &FsState) {
+    if let Some(rel) = payload["relPath"].as_str() {
+        let abs = if rel == "." || rel.is_empty() {
+            PathBuf::from(".")
+        } else if rel.starts_with("./") {
+            PathBuf::from(rel)
+        } else {
+            PathBuf::from(format!("./{}", rel))
+        };
+        
+        println!("[WebSocket] DELETE: path={:?}", abs);
+        
+        handle_deleted_path(&abs, st);
+    } else {
+        eprintln!("[WebSocket] handle_deleted_event: missing relPath");
+    }
+}
+
+/// Rimuove tutti gli stati per un path cancellato
+fn handle_deleted_path(abs: &Path, st: &FsState) {
+    // Marca come cancellato PRIMA di rimuovere
+    if let Some(ino) = st.ino_of(abs) {
+        st.mark_deleted(ino);
+        println!("[WebSocket] Marked inode {} as deleted", ino);
+    }
+    
+    // Rimuovi mapping e cache
+    st.remove_path(abs);
+    st.remove_attr(abs);
+    
+    // Invalida parent directory (critico per Explorer)
+    if let Some(parent) = abs.parent() {
+        st.remove_dir_cache(parent);
+        println!("[WebSocket] Invalidated parent dir cache after delete: {:?}", parent);
+    }
+}
+
+/// Gestisce rename
+fn handle_renamed_event(payload: &Value, st: &FsState) {
+    let Some(old_rel) = payload["oldPath"].as_str() else {
+        eprintln!("[WebSocket] handle_renamed_event: missing oldPath");
+        return;
+    };
+    let Some(new_rel) = payload["newPath"].as_str() else {
+        eprintln!("[WebSocket] handle_renamed_event: missing newPath");
+        return;
+    };
+
+    // Converti entrambi i path nel formato canonico
+    let old_abs = if old_rel.starts_with("./") {
+        PathBuf::from(old_rel)
+    } else {
+        PathBuf::from(format!("./{}", old_rel))
+    };
+    
+    let new_abs = if new_rel.starts_with("./") {
+        PathBuf::from(new_rel)
+    } else {
+        PathBuf::from(format!("./{}", new_rel))
+    };
+    
+    println!("[WebSocket] RENAME: {:?} -> {:?}", old_abs, new_abs);
+
+    // Mantieni l'inode se esiste, altrimenti allocane uno nuovo
+    let ino = if let Some(ino) = st.ino_of(&old_abs) {
+        st.remove_path(&old_abs);
+        st.insert_path_mapping(&new_abs, ino);
+        ino
+    } else {
+        st.allocate_ino(&new_abs)
+    };
+
+    // Aggiorna metadata del nuovo path
+    if let Some((_, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) {
+        update_cache_from_metadata(st, &new_abs, &name, is_dir, size, mtime, perm);
+    }
+
+    // Rimuovi cache del vecchio path
+    st.remove_attr(&old_abs);
+
+    // Invalida ENTRAMBI i parent (potrebbero essere diversi in caso di move)
+    if let Some(old_parent) = old_abs.parent() {
+        st.remove_dir_cache(old_parent);
+        println!("[WebSocket] Invalidated old parent: {:?}", old_parent);
+    }
+    if let Some(new_parent) = new_abs.parent() {
+        st.remove_dir_cache(new_parent);
+        println!("[WebSocket] Invalidated new parent: {:?}", new_parent);
+    }
+}
+
+/// Aggiorna le cache da metadata ricevuti via WebSocket
+pub fn update_cache_from_metadata(
+    st: &FsState,
+    abs: &Path,
+    name: &str,
+    is_dir: bool,
+    size: u64,
+    mtime: i64,
+    perm: u16,
+) -> u64 {
+    let kind = if is_dir {
+        NodeType::Directory
+    } else {
+        NodeType::RegularFile
+    };
+
+    let ino = match st.ino_of(abs) {
+        Some(i) => i,
+        None => st.allocate_ino(abs),
+    };
+
+    let blocks = if size == 0 { 0 } else { (size + 511) / 512 };
+    let mtime_st = UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
+
+    let attr = FileAttr {
+        ino,
+        size,
+        blocks,
+        atime: mtime_st,
+        mtime: mtime_st,
+        ctime: mtime_st,
+        crtime: mtime_st,
+        kind,
+        perm,
+        nlink: if is_dir { 2 } else { 1 },
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 4096,
+        flags: 0,
+    };
+    
+    st.set_attr(abs, attr);
+    
+    // Invalida parent directory cache
+    if let Some(parent) = abs.parent() {
+        st.remove_dir_cache(parent);
+    }
+
+    ino
+}
+
 
 impl FileSystemContext for RemoteFs {
     type FileContext = MyFileContext;
@@ -1311,10 +1743,10 @@ impl FileSystemContext for RemoteFs {
         if let Some(cur) = self.path_of(context.ino) {
             if RemoteFs::rel_of(&cur) == src_rel {
                 // path_by_ino modificabile con le tue strutture
-                if let Ok(mut byino) = self.path_by_ino.lock() {
+                if let Ok(mut byino) = self.state.path_by_ino.lock() {
                     byino.insert(context.ino, PathBuf::from(dst_abs.clone()));
                 }
-                if let Ok(mut bypath) = self.ino_by_path.lock() {
+                if let Ok(mut bypath) = self.state.ino_by_path.lock() {
                     bypath.remove(&cur);
                     bypath.insert(std::path::PathBuf::from(&dst_abs), context.ino);
                 }
@@ -1394,6 +1826,7 @@ impl FileSystemContext for RemoteFs {
         // Windows file access: leggere SOLO attributi (Explorer/WinAPI spesso usa questo)
         const FILE_READ_ATTRIBUTES: u32 = 0x00000080;
         const FILE_READ_DATA: u32 = 0x00000001;
+        const FILE_DELETE_CHILD: u32 = 0x00000040;
 
         println!("[OPEN] .2 granted_access=0x{:08X}", granted_access);
         println!(
@@ -1427,10 +1860,11 @@ impl FileSystemContext for RemoteFs {
             (granted_access & FILE_READ_DATA) != 0 || (granted_access & GENERIC_READ) != 0;
         //Vuole solo leggere gli attributi (Explorer usa questo per "proprietà" senza aprire il file)
         let wants_read_attributes = (granted_access & FILE_READ_ATTRIBUTES) != 0;
+        let has_delete_child = granted_access & FILE_DELETE_CHILD != 0;
 
         println!(
-            "[OPEN] .3 wants_delete={} wants_write={} wants_read={}  wants_read_attributes={}",
-            wants_delete, wants_write, wants_read, wants_read_attributes
+            "[OPEN] .3 wants_delete={} wants_write={} wants_read={}  wants_read_attributes={} has_delete_child={}",
+            wants_delete, wants_write, wants_read, wants_read_attributes, has_delete_child
         );
 
         // 2) Root
@@ -1721,7 +2155,7 @@ impl FileSystemContext for RemoteFs {
                 tem_path: temp_path,
                 size,
             };
-            self.writes.lock().unwrap().insert(ino, tw.clone());
+            self.state.writes.lock().unwrap().insert(ino, tw.clone());
             println!("[OPEN] .15 temp_write inserted for ino={}", ino);
             Some(tw)
         } else {
@@ -1922,7 +2356,7 @@ impl FileSystemContext for RemoteFs {
         if let Err(e) = std::fs::remove_file(&temp_write.tem_path) {
             eprintln!("[CLOSE] Errore rimozione temp file: {}", e);
         }
-        self.writes.lock().unwrap().remove(&file_context.ino);
+        self.state.writes.lock().unwrap().remove(&file_context.ino);
         println!("[CLOSE] done for '{}'", rel_path);
     }
 
@@ -2370,7 +2804,7 @@ impl FileSystemContext for RemoteFs {
                     tem_path: temp_path,
                     size: 0,
                 };
-                self.writes.lock().unwrap().insert(ino, temp_write.clone());
+                self.state.writes.lock().unwrap().insert(ino, temp_write.clone());
 
                 // 4. Costruisci FileContext
                 let file_context = MyFileContext {
@@ -2931,7 +3365,7 @@ impl FileSystemContext for RemoteFs {
         println!("[CLEANUP] ParentPath : {:?} ", parent_path);
 
         // Se c'è un TempWrite pendente per questo ino, non evictare né cancellare
-        if self.writes.lock().unwrap().contains_key(&file_context.ino) {
+        if self.state.writes.lock().unwrap().contains_key(&file_context.ino) {
             println!(
                 "[CLEANUP] skip: pending TempWrite for ino {}",
                 file_context.ino
@@ -2967,8 +3401,9 @@ impl FileSystemContext for RemoteFs {
 
         //
         // 5) Verifica flag delete-on-close
-        //
+        //mettiamo il flag sempre attivo FSP_CLEANUP_DELETE per forzare la cancellazione
         let del_flag = (flags & (FspCleanupDelete as u32)) != 0;
+        //let del_flag = (flags & (FSP_CLEANUP_DELETE as u32)) != 0;
         let del_ctx = file_context.delete_on_close.load(Ordering::Relaxed);
 
         println!(
@@ -3051,37 +3486,56 @@ impl FileSystemContext for RemoteFs {
     fs.init_cache();*/
 
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
-    let fs = RemoteFs::new();
+    let rt = Arc::new(Runtime::new()?);
+    let fs = RemoteFs::new(api, rt.clone());
+    let fs_state = fs.state.clone(); // ← CRITICO: Clona lo stato per il WebSocket
+    
+    fs.init_cache();
+    
+    // Configura WinFSP
     let mut vparams = VolumeParams::default();
-
-    // Layout base
-    vparams.sectors_per_allocation_unit(64); // cluster = 64 * 4096 = 256 KiB [attached_file:21]
-    vparams.sector_size(4096); // 4 KiB [attached_file:21]
-    vparams.file_info_timeout(5); // seconds [attached_file:21]
-
-    // Sensibilità/preservazione case e Unicode
-    vparams.case_sensitive_search(true); //senza questo non vanno i delete
+    vparams.sectors_per_allocation_unit(64);
+    vparams.sector_size(4096);
+    vparams.file_info_timeout(5);
+    vparams.case_sensitive_search(true);
     vparams.case_preserved_names(true);
     vparams.unicode_on_disk(true);
-    // 🌟 Abilita il passaggio del nome del file nelle query di directory
     vparams.pass_query_directory_filename(true);
 
     let mut host = FileSystemHost::new(vparams, fs)?;
     host.mount(mountpoint)?;
     host.start()?;
 
+    // ✅ Avvia WebSocket listener in background
+    println!("[Mount] Starting WebSocket listener for: {}", url);
+    {
+        let url_clone = url.clone();
+        rt.spawn(async move {
+            start_websocket_listener(&url_clone, fs_state);
+        });
+    }
+
+    // Attendi Ctrl-C
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
-        println!("Ricevuto segnale Ctrl-C, terminazione...");
+        println!("\n[Mount] Ricevuto segnale Ctrl-C, terminazione...");
         r.store(false, Ordering::SeqCst);
     })?;
 
-    println!("Filesystem montato. Premi Ctrl-C per smontare e uscire.");
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║  Filesystem montato su: {}                         ", mountpoint);
+    println!("║  Backend URL: {}                                   ", url);
+    println!("║  WebSocket attivo per notifiche real-time                 ║");
+    println!("║                                                            ║");
+    println!("║  Premi Ctrl-C per smontare e uscire                       ║");
+    println!("║  Premi F5 in Explorer per aggiornare dopo modifiche       ║");
+    println!("╚════════════════════════════════════════════════════════════╝");
+    
     while running.load(Ordering::SeqCst) {
         thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    println!("Smonto il filesystem e termino.");
+    println!("[Mount] Smonto il filesystem...");
     Ok(())
 }
