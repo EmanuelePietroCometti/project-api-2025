@@ -1,24 +1,26 @@
+use crate::file_api::{DirectoryEntry, FileApi};
 use anyhow::Result;
 use fuser016::{
-    FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-    spawn_mount2,
+    spawn_mount2, FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
+use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::{
     collections::HashMap,
     ffi::OsStr,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc::channel},
+    sync::{mpsc::channel, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
-use crate::file_api::{DirectoryEntry, FileApi};
-use rust_socketio::{ClientBuilder, Payload};
 
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
@@ -169,11 +171,7 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
 }
 
 // Function that start the websocket listener, initialize the websocket connection and listen the messages
-pub fn start_websocket_listener(
-    api_url: &str,
-    notifier: Arc<Notifier>,
-    fs_state: Arc<FsState>,
-) {
+pub fn start_websocket_listener(api_url: &str, notifier: Arc<Notifier>, fs_state: Arc<FsState>) {
     let ws_url = format!("{}/socket.io/", api_url.trim_end_matches('/'));
 
     tokio::spawn(async move {
@@ -185,19 +183,17 @@ pub fn start_websocket_listener(
                 .on("connect", |_, _| {
                     println!("Socket.IO connected!");
                 })
-                .on("fs_change", move |payload, _| {
-                    match payload {
-                        Payload::Text(values) => {
-                            if values.len() < 1 {
-                                eprintln!("fs_change payload senza dati");
-                                return;
-                            }
-                            let json_payload = &values[0];
-                            handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
+                .on("fs_change", move |payload, _| match payload {
+                    Payload::Text(values) => {
+                        if values.len() < 1 {
+                            eprintln!("fs_change payload senza dati");
+                            return;
                         }
-                        _other =>{
-                            eprintln!("Binary payload non gestito");
-                        }
+                        let json_payload = &values[0];
+                        handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
+                    }
+                    _other => {
+                        eprintln!("Binary payload non gestito");
                     }
                 })
                 .on("error", |err, _| {
@@ -312,7 +308,8 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
         st.insert_path_mapping(&new_abs, ino);
         ino
     } else {
-        st.ino_of(&new_abs).unwrap_or_else(|| st.allocate_ino(&new_abs))
+        st.ino_of(&new_abs)
+            .unwrap_or_else(|| st.allocate_ino(&new_abs))
     };
 
     let Some((_abs_meta, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
@@ -359,7 +356,7 @@ pub fn update_cache_from_metadata(
 
     let ino = match st.ino_of(abs) {
         Some(i) => i,
-        None => st.allocate_ino(abs), 
+        None => st.allocate_ino(abs),
     };
 
     let blocks = if size == 0 { 0 } else { (size + 511) / 512 };
@@ -546,7 +543,7 @@ impl RemoteFs {
     }
 
     // Function that init the cache
-    // It is called at the beginning 
+    // It is called at the beginning
     pub fn init_cache(&self) {
         self.state.clear_all_cache();
     }
@@ -632,7 +629,7 @@ impl RemoteFs {
             rt,
         }
     }
-     
+
     // Function that allocate the inode
     fn alloc_ino(&self, path: &Path) -> u64 {
         if let Some(ino) = self.state.ino_of(path) {
@@ -1116,36 +1113,75 @@ impl Filesystem for RemoteFs {
             reply.error(ENOENT);
             return;
         };
-        let rel_path = Self::rel_of(&path);
+        let rel = Self::rel_of(&path);
+
         if let Some(tw) = self.state.get_write(ino) {
-            match File::open(&tw.tem_path) {
-                Ok(mut f) => {
-                    let mut buf = vec![0u8; size as usize];
-                    if let Ok(_) = f.seek(SeekFrom::Start(offset as u64)) {
-                        let n = Read::read(&mut f, &mut buf).unwrap_or(0);
-                        reply.data(&buf[..n]);
-                    } else {
-                        reply.error(libc::EIO);
+            if let Ok(mut f) = File::open(&tw.tem_path) {
+                let mut buf = vec![0u8; size as usize];
+                if f.seek(SeekFrom::Start(offset.max(0) as u64)).is_ok() {
+                    let n = f.read(&mut buf).unwrap_or(0);
+                    reply.data(&buf[..n]);
+                } else {
+                    reply.error(EIO);
+                }
+                return;
+            } else {
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        let mut attr = self.state.get_attr(&path);
+
+        if attr.is_none() {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+
+            match self.dir_entries(parent) {
+                Ok(entries) => {
+                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| *p == path) {
+                        let ty = if Self::is_dir(&de) {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let size = if ty == FileType::Directory {
+                            0
+                        } else {
+                            de.size as u64
+                        };
+
+                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
+                        self.insert_attr_cache(path.clone(), a.clone());
+                        attr = Some(a);
                     }
                 }
-                Err(_) => reply.error(libc::EIO),
-            }
-            return;
-        }
-        match self.rt.block_on(self.api.read_file(&rel_path)) {
-            Ok(data) => {
-                let off = offset.max(0) as usize;
-                if off >= data.len() {
-                    reply.data(&[]);
+                Err(_) => {
+                    reply.error(ENOENT);
                     return;
                 }
-                let end = off.saturating_add(size as usize).min(data.len());
-                reply.data(&data[off..end]);
             }
-            Err(e) => {
-                let errno = errno_from_anyhow(&e);
-                reply.error(errno);
+        }
+
+        let attr = match attr {
+            Some(a) => a,
+            None => {
+                reply.error(ENOENT);
+                return;
             }
+        };
+
+        if offset as u64 >= attr.size {
+            reply.data(&[]);
+            return;
+        }
+
+        let start = offset.max(0) as u64;
+        let end = (start + size as u64 - 1).min(attr.size - 1);
+
+        match self.rt.block_on(self.api.read_range(&rel, start, end)) {
+            Ok(bytes) => reply.data(&bytes),
+            Err(err) => reply.error(errno_from_anyhow(&err)),
         }
     }
 
@@ -1540,31 +1576,21 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
             start_websocket_listener(&url_clone, notifier_clone, fs_state);
         });
     }
+    let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
     let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
     {
         let tx = tx.clone();
         let shutting_down = shutting_down.clone();
-        ctrlc::set_handler(move || {
-            if !shutting_down.swap(true, Ordering::SeqCst) {
-                let _ = tx.send(());
+        thread::spawn(move || {
+            for _sig in signals.forever() {
+                if !shutting_down.swap(true, Ordering::SeqCst) {
+                    let _ = tx.send(());
+                }
             }
-        })
-        .expect("Error setting Ctrl-C handler");
+        });
     }
     let _ = rx.recv();
-    let ok = std::process::Command::new("fusermount")
-        .arg("-u")
-        .arg(&mountpoint)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        let _ = std::process::Command::new("umount")
-            .arg("-l")
-            .arg(&mountpoint)
-            .status();
-    }
     let _ = bg_session.join();
     Ok(())
 }

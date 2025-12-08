@@ -1,9 +1,10 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use reqwest::{Body, Client};
 use serde::Deserialize;
 use std::time::SystemTime;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use urlencoding::encode;
 #[derive(Clone)]
 pub struct FileApi {
     base_url: String,
@@ -127,25 +128,21 @@ impl FileApi {
     }
 
     /// GET /files?relPath=...
-    pub async fn read_file(&self, rel_path: &str) -> Result<Vec<u8>> {
-        let url = format!("{}/files", self.base_url);
+    pub async fn read_range(&self, rel: &str, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
+        let encoded = encode(rel);
+        let url = format!("{}/files?relPath={}", self.base_url, encoded);
 
-        let resp = self
+        let range_header = format!("bytes={}-{}", start, end);
+
+        let res = self
             .client
             .get(&url)
-            .query(&[("relPath", rel_path)])
+            .header("Range", range_header)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
-        let status = resp.status();
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("read_file failed: {} - {}", status, text));
-        }
-
-        let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
+        Ok(res.bytes().await?.to_vec())
     }
 
     /// PUT /files?relPath=...
