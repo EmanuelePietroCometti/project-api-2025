@@ -1,26 +1,150 @@
+use anyhow::Result;
 use frontend::{file_api::FileApi, mount_fs};
-use std::{net::IpAddr, path::PathBuf};
-use std::io::{self, Write};
+use std::{
+    env, fs,
+    io::{self, Write},
+    net::IpAddr,
+    path::PathBuf,
+    process,
+};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use daemonize::Daemonize;
 
-fn main() -> anyhow::Result<()> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::{
+    sys::signal::{kill, Signal},
+    unistd::Pid,
+};
+
+#[cfg(target_os = "windows")]
+use windows_service::{
+    service::ServiceControl,
+    service_control_handler::{self, ServiceControlHandlerResult},
+};
+
+#[cfg(target_os = "windows")]
+use winapi::um::wincon::GenerateConsoleCtrlEvent;
+
+fn pid_file() -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push("remote_fs_child.pid");
+    p
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() == 2 && !args[1].starts_with("--") {
+        let ip = args[1].trim().to_string();
+        return start_filesystem(&ip);
+    }
+
+    if args.contains(&"--stop".to_string()) {
+        println!("Unmounting remote filsystem...");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return stop_deamon();
+        #[cfg(target_os = "windows")]
+        return stop_service();
+    }
+
     let mut ip_address = String::new();
     print!("Insert the backend IP address: ");
     io::stdout().flush()?;
     std::io::stdin().read_line(&mut ip_address)?;
-    if ip_address.is_empty(){
-        return Err(anyhow::anyhow!("IP address cannot be empty"));
-    } else {
-        let ip_trimmed = ip_address.trim();
-        let _addr: IpAddr = ip_trimmed.parse().map_err(|_| anyhow::anyhow!("Invalid IP address format"))?;
-        ip_address = ip_trimmed.to_string();
-    } 
-    let url = format!("http://{}:3001", ip_address);
-    println!("Using backend URL: {}", url);
+    let ip = ip_address.trim().to_string();
+
+    ip.parse::<IpAddr>()
+        .map_err(|_| anyhow::anyhow!("Invalid IP format"))?;
+
+    if args.contains(&"--deamon".to_string()) {
+        println!("Mounting remote filsystem...");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return run_as_deamon(&ip);
+        #[cfg(target_os = "windows")]
+        return run_as_service(&ip);
+    }
+
+    start_filesystem(&ip)
+}
+
+fn start_filesystem(ip: &str) -> anyhow::Result<()> {
+    fs::write(pid_file(), process::id().to_string())?;
+    let url = format!("http://{}:3001", ip);
     let home_dir = dirs::home_dir().expect("Failed to get home directory");
-    let mountpoint = PathBuf::from(home_dir).join("mnt").join("remote-fs");
-    let mp = mountpoint.to_string_lossy().to_string();
-    println!("Mounting filesystem at: {}", mp);
+    let mp = PathBuf::from(home_dir)
+        .join("mnt")
+        .join("remote-fs")
+        .to_string_lossy()
+        .to_string();
     let api = FileApi::new(&url);
     mount_fs(&mp, api, url)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_as_deamon(ip: &str) -> anyhow::Result<()> {
+    let daemon = Daemonize::new()
+        .pid_file("/tmp/remote_fs.pid")
+        .stdout(fs::File::create("/tmp/remote_fs.out")?)
+        .stderr(fs::File::create("/tmp/remote_fs.err")?);
+
+    match daemon.start() {
+        Ok(_) => {
+            // il figlio avvia il filesystem
+            std::process::Command::new(env::current_exe()?)
+                .arg(ip)
+                .spawn()?;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("Daemon failed: {}", e)),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_as_service(ip: &str) -> anyhow::Result<()> {
+    let handler = move |event| -> ServiceControlHandlerResult {
+        match event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                unsafe {
+                    GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, 0);
+                }
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NoError,
+        }
+    };
+
+    service_control_handler::register("RemoteFsService", handler)?;
+
+    std::process::Command::new(env::current_exe()?)
+        .arg(ip)
+        .spawn()?;
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stop_deamon() -> anyhow::Result<()> {
+    let pid_str =
+        fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("PID file not found"))?;
+
+    let pid: i32 = pid_str.trim().parse()?;
+    kill(Pid::from_raw(pid), Signal::SIGTERM)?;
+
+    println!("Sent SIGTERM to PID {}\nRemote filesystem unmounted!", pid);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_service() -> anyhow::Result<()> {
+    let pid_str =
+        fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("PID file not found"))?;
+
+    let pid: u32 = pid_str.trim().parse()?;
+
+    unsafe {
+        GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, pid);
+    }
+
+    println!("Sent CTRL_BREAK_EVENT to PID {}\nRemote filesystem unmounted!", pid);
+    Ok(())
 }
