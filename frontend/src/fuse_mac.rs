@@ -653,30 +653,30 @@ impl RemoteFs {
         self.state.path_of(ino)
     }
 
-    /// Restituisce il percorso relativo da salvare nel DB
+    /// Extract relative path for db
     fn rel_for_db(path: &Path) -> String {
      let s = path.to_string_lossy();
 
     //Root case
     if s == "/"  {
-        return "".to_string();
+     return "".to_string();
     }
     else {
-    let trimmed = s.trim_start_matches("/");
-    format!("./{}", trimmed) 
+     let trimmed = s.trim_start_matches("/");
+     format!("./{}", trimmed) 
     }
     }
 
-    /// Restituisce il percorso relativo da usare nel filesystem (PathBuf)
+    /// Extract relative path for fs (PathBuf)
 
     fn rel_for_fs(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    if s == "/" {
+     let s = path.to_string_lossy();
+     if s == "/" {
         "".to_string()
-    } else {
+     } else {
         s.trim_start_matches('/').to_string()
+       }
     }
-}
 
 
 
@@ -765,7 +765,6 @@ impl RemoteFs {
             }
         }
         let list = self.rt.block_on(self.api.ls(&rel_db))?;
-        println!("rel: {}", rel_db);
         self.insert_dir_cache(dir.to_path_buf(), (list.clone(), SystemTime::now()));
         let mut out = Vec::with_capacity(list.len());
         for de in list {

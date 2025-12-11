@@ -316,7 +316,7 @@ function clean(absPath) {
 
   // Root storage -> "."
   if (relative === '' || relative === '.') {
-    return '.';
+    return absPath;
   }
 
   if (!relative.startsWith('./')) {
