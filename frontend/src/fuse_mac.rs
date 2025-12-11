@@ -19,6 +19,10 @@ use std::{
 use tokio::runtime::Runtime;
 use crate::file_api::{DirectoryEntry, FileApi};
 use rust_socketio::{ClientBuilder, Payload};
+use std::thread;
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+
 
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
@@ -835,6 +839,18 @@ impl Filesystem for RemoteFs {
         }
 
         if let Some(new_size) = size {
+            if new_size == 0 {
+        // Ignora completamente — macOS sta solo aggiornando metadata
+        reply.attr(&self.state.cache_ttl, &attr);
+        return;
+    }
+
+    // 2. Gestisci truncate solo se il file è apertamente in scrittura (fh presente)
+    if _fh.is_none() {
+        // Non è una richiesta di ftruncate() → ignoriamo
+        reply.attr(&self.state.cache_ttl, &attr);
+        return;
+    }
             match self.rt.block_on(self.api.truncate(&rel, new_size)) {
                 Ok(_) => {
                     attr.size = new_size;
@@ -1086,22 +1102,31 @@ impl Filesystem for RemoteFs {
     }
 
     // Function that open a new temporary file
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let temp_path = self.get_temporary_path(ino);
-        if !temp_path.exists() {
-            if let Err(_e) = File::create(&temp_path) {
-                reply.error(libc::EIO);
-                return;
-            }
+   fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    let temp_path = self.get_temporary_path(ino);
+    if !temp_path.exists() {
+        if let Err(_e) = File::create(&temp_path) {
+            reply.error(libc::EIO);
+            return;
         }
-        if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
-            self.state.insert_write_tempfile(ino, temp_path);
-        }
-        reply.opened(ino, flags as u32);
     }
 
+    let accmode = flags & libc::O_ACCMODE;
+
+    if accmode == libc::O_RDONLY {
+        // Read-only → NON generare un file handle (fh = 0)
+        reply.opened(0, flags as u32);
+    } else {
+        // Write mode → usa ancora ino come fh
+        self.state.insert_write_tempfile(ino, temp_path);
+        reply.opened(ino, flags as u32);
+    }
+}
+
+
+
     // Reads data from a file starting at a specified offset
-    fn read(
+   fn read(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
@@ -1116,36 +1141,75 @@ impl Filesystem for RemoteFs {
             reply.error(ENOENT);
             return;
         };
-        let rel_path = Self::rel_of(&path);
+        let rel = Self::rel_of(&path);
+
         if let Some(tw) = self.state.get_write(ino) {
-            match File::open(&tw.tem_path) {
-                Ok(mut f) => {
-                    let mut buf = vec![0u8; size as usize];
-                    if let Ok(_) = f.seek(SeekFrom::Start(offset as u64)) {
-                        let n = Read::read(&mut f, &mut buf).unwrap_or(0);
-                        reply.data(&buf[..n]);
-                    } else {
-                        reply.error(libc::EIO);
+            if let Ok(mut f) = File::open(&tw.tem_path) {
+                let mut buf = vec![0u8; size as usize];
+                if f.seek(SeekFrom::Start(offset.max(0) as u64)).is_ok() {
+                    let n = f.read(&mut buf).unwrap_or(0);
+                    reply.data(&buf[..n]);
+                } else {
+                    reply.error(EIO);
+                }
+                return;
+            } else {
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        let mut attr = self.state.get_attr(&path);
+
+        if attr.is_none() {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+
+            match self.dir_entries(parent) {
+                Ok(entries) => {
+                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| *p == path) {
+                        let ty = if Self::is_dir(&de) {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let size = if ty == FileType::Directory {
+                            0
+                        } else {
+                            de.size as u64
+                        };
+
+                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
+                        self.insert_attr_cache(path.clone(), a.clone());
+                        attr = Some(a);
                     }
                 }
-                Err(_) => reply.error(libc::EIO),
-            }
-            return;
-        }
-        match self.rt.block_on(self.api.read_file(&rel_path)) {
-            Ok(data) => {
-                let off = offset.max(0) as usize;
-                if off >= data.len() {
-                    reply.data(&[]);
+                Err(_) => {
+                    reply.error(ENOENT);
                     return;
                 }
-                let end = off.saturating_add(size as usize).min(data.len());
-                reply.data(&data[off..end]);
             }
-            Err(e) => {
-                let errno = errno_from_anyhow(&e);
-                reply.error(errno);
+        }
+
+        let attr = match attr {
+            Some(a) => a,
+            None => {
+                reply.error(ENOENT);
+                return;
             }
+        };
+
+        if offset as u64 >= attr.size {
+            reply.data(&[]);
+            return;
+        }
+
+        let start = offset.max(0) as u64;
+        let end = (start + size as u64 - 1).min(attr.size - 1);
+
+        match self.rt.block_on(self.api.read_range(&rel, start, end)) {
+            Ok(bytes) => reply.data(&bytes),
+            Err(err) => reply.error(errno_from_anyhow(&err)),
         }
     }
 
@@ -1193,7 +1257,7 @@ impl Filesystem for RemoteFs {
     }
 
     // Ensures that any buffered file data is written to storage
-    fn flush(
+   fn flush(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
@@ -1540,31 +1604,21 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
             start_websocket_listener(&url_clone, notifier_clone, fs_state);
         });
     }
+    let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
     let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
     {
         let tx = tx.clone();
         let shutting_down = shutting_down.clone();
-        ctrlc::set_handler(move || {
-            if !shutting_down.swap(true, Ordering::SeqCst) {
-                let _ = tx.send(());
+        thread::spawn(move || {
+            for _sig in signals.forever() {
+                if !shutting_down.swap(true, Ordering::SeqCst) {
+                    let _ = tx.send(());
+                }
             }
-        })
-        .expect("Error setting Ctrl-C handler");
+        });
     }
     let _ = rx.recv();
-    let ok = std::process::Command::new("fusermount")
-        .arg("-u")
-        .arg(&mountpoint)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        let _ = std::process::Command::new("umount")
-            .arg("-l")
-            .arg(&mountpoint)
-            .status();
-    }
     let _ = bg_session.join();
     Ok(())
 }
