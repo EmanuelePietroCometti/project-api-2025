@@ -306,8 +306,29 @@ watcher
 
 
 
-function clean(path) {
-  return path.replace(/^.*storage\//, "");
+//prova per essere compatibile su windows e unix
+function clean(absPath) {
+  // Node.js gestisce automaticamente i separatori OS-specific
+  let relative = path.relative(ROOT_DIR, absPath);
+
+  // Normalizza SEMPRE a Unix-style (per compatibilità client)
+  relative = relative.replace('\/g', '/');
+
+  // Root storage -> "."
+  if (relative === '' || relative === '.') {
+    return '.';
+  }
+
+  if (!relative.startsWith('./')) {
+    relative = './' + relative;
+  }
+
+  // Path fuori root -> warning + fallback
+  if (relative.includes('..')) {
+    return '.';
+  }
+
+  return relative;
 }
 
 function getPrimaryIP() {

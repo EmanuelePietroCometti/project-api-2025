@@ -22,6 +22,7 @@ use rust_socketio::{ClientBuilder, Payload};
 use std::thread;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
+use std::path::Component;
 
 
 /// A lightweight error wrapper that stores an HTTP status code.
@@ -591,8 +592,9 @@ impl RemoteFs {
 
     // Function that update the cache
     pub fn update_cache(&self, dir: &Path) -> anyhow::Result<()> {
-        let rel = Self::rel_of(dir);
-        let list = self.rt.block_on(self.api.ls(&rel))?;
+        let rel_db = Self::rel_for_db(dir);
+        let rel_fs = Self::rel_for_fs(dir);
+        let list = self.rt.block_on(self.api.ls(&rel_db))?;
         {
             self.state
                 .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
@@ -600,8 +602,8 @@ impl RemoteFs {
         let mut _attrcache = self.state.get_attr(&dir);
         for de in &list {
             let mut child = PathBuf::from("/");
-            if !rel.is_empty() {
-                child.push(&rel);
+            if !rel_fs.is_empty() {
+                child.push(&rel_fs);
             }
             child.push(&de.name);
             let isdir = Self::is_dir(&de);
@@ -651,15 +653,33 @@ impl RemoteFs {
         self.state.path_of(ino)
     }
 
-    // Function that extract the relative path
-    fn rel_of(path: &Path) -> String {
-        let s = path.to_string_lossy();
-        if s == "/" {
-            "".to_string()
-        } else {
-            s.trim_start_matches('/').to_string()
-        }
+    /// Restituisce il percorso relativo da salvare nel DB
+    fn rel_for_db(path: &Path) -> String {
+     let s = path.to_string_lossy();
+
+    //Root case
+    if s == "/"  {
+        return "".to_string();
     }
+    else {
+    let trimmed = s.trim_start_matches("/");
+    format!("./{}", trimmed) 
+    }
+    }
+
+    /// Restituisce il percorso relativo da usare nel filesystem (PathBuf)
+
+    fn rel_for_fs(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if s == "/" {
+        "".to_string()
+    } else {
+        s.trim_start_matches('/').to_string()
+    }
+}
+
+
+
 
     // Function that extract the file permissions
     fn file_attr(
@@ -714,7 +734,8 @@ impl RemoteFs {
 
     // Function that define the directory entries
     pub fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
-        let rel = Self::rel_of(dir);
+        let rel_db = Self::rel_for_db(dir);
+        let rel_fs = Self::rel_for_fs(dir);
         if let Some((entries, ts)) = self.state.get_dir_cache(&dir) {
             if SystemTime::now()
                 .duration_since(ts)
@@ -724,8 +745,8 @@ impl RemoteFs {
                 let mut out = Vec::with_capacity(entries.len());
                 for de in entries {
                     let mut child = PathBuf::from("/");
-                    if !rel.is_empty() {
-                        child.push(&rel);
+                    if !rel_fs.is_empty() {
+                        child.push(&rel_fs);
                     }
                     child.push(&de.name);
                     let is_dir = Self::is_dir(&de);
@@ -743,13 +764,14 @@ impl RemoteFs {
                 return Ok(out);
             }
         }
-        let list = self.rt.block_on(self.api.ls(&rel))?;
+        let list = self.rt.block_on(self.api.ls(&rel_db))?;
+        println!("rel: {}", rel_db);
         self.insert_dir_cache(dir.to_path_buf(), (list.clone(), SystemTime::now()));
         let mut out = Vec::with_capacity(list.len());
         for de in list {
             let mut child = PathBuf::from("/");
-            if !rel.is_empty() {
-                child.push(&rel);
+            if !rel_fs.is_empty() {
+                child.push(&rel_fs);
             }
             child.push(&de.name);
 
@@ -795,7 +817,7 @@ impl Filesystem for RemoteFs {
             return;
         };
         let parent = path.parent().unwrap_or(Path::new("/"));
-        let rel = Self::rel_of(&path);
+        let rel_db = Self::rel_for_db(&path);
 
         let mut attr = if let Some(a) = self.get_attr_cache(&path) {
             a
@@ -827,7 +849,7 @@ impl Filesystem for RemoteFs {
         };
 
         if let Some(m) = mode {
-            match self.rt.block_on(self.api.chmod(&rel, m)) {
+            match self.rt.block_on(self.api.chmod(&rel_db, m)) {
                 Ok(_) => {
                     attr.perm = (m & 0o777) as u16;
                 }
@@ -840,18 +862,18 @@ impl Filesystem for RemoteFs {
 
         if let Some(new_size) = size {
             if new_size == 0 {
-        // Ignora completamente — macOS sta solo aggiornando metadata
+    
         reply.attr(&self.state.cache_ttl, &attr);
         return;
     }
 
-    // 2. Gestisci truncate solo se il file è apertamente in scrittura (fh presente)
+ 
     if _fh.is_none() {
-        // Non è una richiesta di ftruncate() → ignoriamo
+      
         reply.attr(&self.state.cache_ttl, &attr);
         return;
     }
-            match self.rt.block_on(self.api.truncate(&rel, new_size)) {
+            match self.rt.block_on(self.api.truncate(&rel_db, new_size)) {
                 Ok(_) => {
                     attr.size = new_size;
                     attr.blocks = (new_size + 511) / 512;
@@ -887,7 +909,7 @@ impl Filesystem for RemoteFs {
         if need_utimes {
             match self
                 .rt
-                .block_on(self.api.utimes(&rel, new_atime, new_mtime))
+                .block_on(self.api.utimes(&rel_db, new_atime, new_mtime))
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -1141,7 +1163,7 @@ impl Filesystem for RemoteFs {
             reply.error(ENOENT);
             return;
         };
-        let rel = Self::rel_of(&path);
+        let rel_db = Self::rel_for_db(&path);
 
         if let Some(tw) = self.state.get_write(ino) {
             if let Ok(mut f) = File::open(&tw.tem_path) {
@@ -1207,7 +1229,7 @@ impl Filesystem for RemoteFs {
         let start = offset.max(0) as u64;
         let end = (start + size as u64 - 1).min(attr.size - 1);
 
-        match self.rt.block_on(self.api.read_range(&rel, start, end)) {
+        match self.rt.block_on(self.api.read_range(&rel_db, start, end)) {
             Ok(bytes) => reply.data(&bytes),
             Err(err) => reply.error(errno_from_anyhow(&err)),
         }
@@ -1284,10 +1306,10 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
-        let rel_path = Self::rel_of(&path);
+        let rel_db = Self::rel_for_db(&path);
         let result = self.rt.block_on(
             self.api
-                .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
+                .write_file(&rel_db, &tw.tem_path.to_string_lossy()),
         );
         match result {
             Ok(_) => reply.ok(),
@@ -1325,10 +1347,11 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
-        let rel_path = Self::rel_of(&path);
+        let rel_db = Self::rel_for_db(&path);
+     
         let result = self.rt.block_on(
             self.api
-                .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
+                .write_file(&rel_db, &tw.tem_path.to_string_lossy()),
         );
         match result {
             Ok(_) => reply.ok(),
@@ -1427,8 +1450,9 @@ impl Filesystem for RemoteFs {
         };
         let old_path = old_parent_path.join(old);
         let new_path = new_parent_path.join(new);
-        let old_rel = Self::rel_of(&old_path);
-        let new_rel = Self::rel_of(&new_path);
+        let old_rel = Self::rel_for_db(&old_path);
+        let new_rel = Self::rel_for_db(&new_path);
+
         match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
             Ok(_) => {
                 self.clear_cache(Some(&old_path));
@@ -1469,7 +1493,7 @@ impl Filesystem for RemoteFs {
             parent_path.join(name)
         };
 
-        let rel = Self::rel_of(&path);
+        let rel = Self::rel_for_db(&path);
 
         match self.rt.block_on(self.api.mkdir(&rel)) {
             Ok(_) => {
@@ -1512,7 +1536,8 @@ impl Filesystem for RemoteFs {
         } else {
             parent_path.join(name)
         };
-        let rel = Self::rel_of(&path);
+    
+        let rel = Self::rel_for_db(&path);
         match self.rt.block_on(self.api.delete(&rel)) {
             Ok(_) => {
                 self.clear_cache(Some(&path));
@@ -1569,7 +1594,8 @@ impl Filesystem for RemoteFs {
                 return;
             }
         }
-        let rel = Self::rel_of(&path);
+    
+        let rel = Self::rel_for_db(&path);
         match self.rt.block_on(self.api.delete(&rel)) {
             Ok(_) => {
                 self.clear_cache(Some(&path));
