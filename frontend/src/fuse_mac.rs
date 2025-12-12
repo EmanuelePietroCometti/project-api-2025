@@ -22,7 +22,6 @@ use rust_socketio::{ClientBuilder, Payload};
 use std::thread;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use std::path::Component;
 
 
 /// A lightweight error wrapper that stores an HTTP status code.

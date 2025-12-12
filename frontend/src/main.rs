@@ -5,7 +5,6 @@ use std::{
     io::{self, Write},
     net::IpAddr,
     path::PathBuf,
-    process,
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -27,10 +26,23 @@ use windows_service::{
 use winapi::um::wincon::GenerateConsoleCtrlEvent;
 
 fn pid_file() -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push("remote_fs_child.pid");
-    p
+    let mut dir = std::env::temp_dir();
+    dir.push("remote-fs");
+    std::fs::create_dir_all(&dir).ok();
+    dir.push("pid");
+    dir
 }
+
+fn write_pid() -> anyhow::Result<()> {
+    let pid = std::process::id();
+    std::fs::write(pid_file(), pid.to_string())?;
+    Ok(())
+}
+
+fn remove_pid() {
+    let _ = std::fs::remove_file(pid_file());
+}
+
 
 fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
@@ -68,7 +80,6 @@ fn main() -> Result<(), anyhow::Error> {
 }
 
 fn start_filesystem(ip: &str) -> anyhow::Result<()> {
-    fs::write(pid_file(), process::id().to_string())?;
     let url = format!("http://{}:3001", ip);
     let home_dir = dirs::home_dir().expect("Failed to get home directory");
     let mp = PathBuf::from(home_dir)
@@ -83,20 +94,16 @@ fn start_filesystem(ip: &str) -> anyhow::Result<()> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_as_deamon(ip: &str) -> anyhow::Result<()> {
     let daemon = Daemonize::new()
-        .pid_file("/tmp/remote_fs.pid")
+        .pid_file(pid_file())
         .stdout(fs::File::create("/tmp/remote_fs.out")?)
         .stderr(fs::File::create("/tmp/remote_fs.err")?);
 
-    match daemon.start() {
-        Ok(_) => {
-            // il figlio avvia il filesystem
-            std::process::Command::new(env::current_exe()?)
-                .arg(ip)
-                .spawn()?;
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!("Daemon failed: {}", e)),
-    }
+    daemon.start()
+        .map_err(|e| anyhow::anyhow!("Daemon failed: {}", e))?;
+    write_pid()?;
+    let res= start_filesystem(ip);
+    remove_pid();
+    res
 }
 
 #[cfg(target_os = "windows")]
@@ -115,31 +122,39 @@ fn run_as_service(ip: &str) -> anyhow::Result<()> {
 
     service_control_handler::register("RemoteFsService", handler)?;
 
-    std::process::Command::new(env::current_exe()?)
-        .arg(ip)
-        .spawn()?;
-
-    Ok(())
+    write_pid()?;
+    let res = start_filesystem(ip);
+    remove_pid();
+    res
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stop_deamon() -> anyhow::Result<()> {
-    let pid_str =
-        fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("PID file not found"))?;
+    let pid_str = fs::read_to_string(pid_file())
+        .map_err(|_| anyhow::anyhow!("PID file not found"))?;
 
     let pid: i32 = pid_str.trim().parse()?;
-    kill(Pid::from_raw(pid), Signal::SIGTERM)?;
 
-    println!("Sent SIGTERM to PID {}\nRemote filesystem unmounted!", pid);
-    Ok(())
+    match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+        Ok(_) => {
+            println!("SIGTERM sent to {}", pid);
+            Ok(())
+        }
+        Err(nix::errno::Errno::ESRCH) => {
+            remove_pid();
+            println!("Process already stopped");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn stop_service() -> anyhow::Result<()> {
-    let pid_str =
-        fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("PID file not found"))?;
+    let pid_str = fs::read_to_string(pid_file())
+        .map_err(|_| anyhow::anyhow!("PID file not found"))?;
 
-    let pid: u32 = pid_str.trim().parse()?;
+    let pid: i32 = pid_str.trim().parse()?;
 
     unsafe {
         GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, pid);
