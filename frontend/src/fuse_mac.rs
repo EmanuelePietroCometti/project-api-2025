@@ -1290,7 +1290,7 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
-        let rel_path = Self::rel_of(&path);
+        let rel_path = Self::rel_for_db(&path);
         let result = self.rt.block_on(
             self.api
                 .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
@@ -1328,7 +1328,7 @@ impl Filesystem for RemoteFs {
             }
         };
 
-        let rel = Self::rel_of(&path);
+        let rel_db = Self::rel_for_db(&path);
 
         let size = std::fs::metadata(&tw.tem_path)
             .map(|m| m.len())
@@ -1336,7 +1336,7 @@ impl Filesystem for RemoteFs {
 
         let res = self
             .rt
-            .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()));
+            .block_on(self.api.write_file(&rel_db, &tw.tem_path.to_string_lossy()));
 
         if res.is_err() {
             reply.error(libc::EIO);
@@ -1395,7 +1395,6 @@ impl Filesystem for RemoteFs {
         }
         self.state.insert_write_tempfile(ino, tmp.clone());
         let final_mode = mode & !umask;
-        //let _ = self.update_cache(&parent_path);
         let mut attr = self.file_attr(
             &path,
             FileType::RegularFile,
@@ -1405,7 +1404,7 @@ impl Filesystem for RemoteFs {
         );
         attr.nlink = 1;
         self.state.set_attr(&path, attr.clone());
-        self.update_cache(&parent_path).ok();
+        //self.update_cache(&parent_path).ok();
         reply.created(&self.state.cache_ttl, &attr, 0, ino, 0);
     }
 
@@ -1438,10 +1437,9 @@ impl Filesystem for RemoteFs {
         let old_path = old_parent.join(name);
         let new_path = new_parent.join(newname);
 
-        let old_rel = Self::rel_of(&old_path);
-        let new_rel = Self::rel_of(&new_path);
+        let old_rel = Self::rel_for_db(&old_path);
+        let new_rel = Self::rel_for_db(&new_path);
 
-        // 🔑 1. assicurati che il file temporaneo esista sul backend
         if let Some(ino) = self.state.ino_of(&old_path) {
             if let Some(tw) = self.state.get_write(ino) {
                 let _ = self.rt.block_on(
@@ -1455,7 +1453,6 @@ impl Filesystem for RemoteFs {
             }
         }
 
-        // 🔑 2. rename atomico (SENZA delete preventivo)
         match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
             Ok(_) => {
                 println!(
