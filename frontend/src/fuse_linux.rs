@@ -22,6 +22,8 @@ use std::{
 };
 use tokio::runtime::Runtime;
 
+const TTL: Duration = Duration::from_secs(10);
+
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
 /// This type is used to propagate backend HTTP errors through the `anyhow`
@@ -397,7 +399,7 @@ impl FsState {
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             writes: Arc::new(Mutex::new(HashMap::new())),
             next_ino: Arc::new(Mutex::new(2)),
-            cache_ttl: Duration::from_secs(300),
+            cache_ttl: TTL,
         }
     }
 

@@ -23,6 +23,7 @@ use std::thread;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+const TTL: Duration = Duration::from_secs(10);
 
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
@@ -404,7 +405,7 @@ impl FsState {
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             writes: Arc::new(Mutex::new(HashMap::new())),
             next_ino: Arc::new(Mutex::new(2)),
-            cache_ttl: Duration::from_secs(300),
+            cache_ttl: TTL,
         }
     }
 
