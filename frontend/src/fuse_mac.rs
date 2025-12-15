@@ -9,7 +9,7 @@ use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::{
     collections::HashMap,
@@ -91,6 +91,7 @@ pub(crate) struct FsState {
     pub writes: Arc<Mutex<HashMap<u64, TempWrite>>>,
     pub next_ino: Arc<Mutex<u64>>,
     pub cache_ttl: Duration,
+    pub next_fh: Arc<AtomicU64>,
 }
 
 /// Main FUSE filesystem implementation backed by a remote HTTP/WebSocket API.
@@ -401,6 +402,7 @@ impl FsState {
             writes: Arc::new(Mutex::new(HashMap::new())),
             next_ino: Arc::new(Mutex::new(2)),
             cache_ttl: TTL,
+            next_fh: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -559,6 +561,10 @@ impl FsState {
                 }
             }
         }
+    }
+
+    pub fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -804,6 +810,36 @@ impl RemoteFs {
         }
         Ok(out)
     }
+
+    fn commit_write(&mut self, ino: u64) -> Result<(), i32> {
+        let Some(mut tw) = self.state.get_write(ino) else {
+            return Ok(());
+        };
+        if tw.committed {
+            return Ok(());
+        }
+
+        let path = self.path_of(ino).ok_or(libc::ENOENT)?;
+        let rel = Self::rel_for_db(&path);
+
+        self.rt
+            .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()))
+            .map_err(|_| libc::EIO)?;
+
+        let size = std::fs::metadata(&tw.tem_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        if let Some(mut attr) = self.state.get_attr(&path) {
+            attr.size = size;
+            attr.mtime = SystemTime::now();
+            attr.ctime = attr.mtime;
+            self.state.set_attr(&path, attr);
+        }
+
+        tw.committed = true;
+        Ok(())
+    }
 }
 
 impl Drop for RemoteFs {
@@ -881,15 +917,17 @@ impl Filesystem for RemoteFs {
         }
 
         if let Some(new_size) = size {
-            if new_size == 0 {
+            if let Some(tw) = self.state.get_write(ino) {
+                // accetta il size anche se 0
+                attr.size = tw.size.max(new_size);
+                attr.blocks = (attr.size + 511) / 512;
+                self.insert_attr_cache(path.clone(), attr.clone());
                 reply.attr(&self.state.cache_ttl, &attr);
                 return;
             }
+        }
 
-            if _fh.is_none() {
-                reply.attr(&self.state.cache_ttl, &attr);
-                return;
-            }
+        if let Some(new_size) = size {
             match self.rt.block_on(self.api.truncate(&rel_db, new_size)) {
                 Ok(_) => {
                     attr.size = new_size;
@@ -1150,9 +1188,9 @@ impl Filesystem for RemoteFs {
                 return;
             }
         }
-
+        let fh = self.state.alloc_fh();
         // SEMPRE restituire un fh valido
-        reply.opened(ino, flags as u32);
+        reply.opened(fh, flags as u32);
     }
 
     // Reads data from a file starting at a specified offset
@@ -1260,6 +1298,11 @@ impl Filesystem for RemoteFs {
             "[WRITE] ino: {}, offset {}, data: {:?}, write_flag: {}",
             ino, offset, data, write_flags
         );
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+
         let tw = match self.state.get_write(ino) {
             Some(tw) => tw,
             None => {
@@ -1299,12 +1342,15 @@ impl Filesystem for RemoteFs {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        match self.commit_write(ino) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn fsync(
@@ -1315,49 +1361,9 @@ impl Filesystem for RemoteFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        println!("[FSYNC] fsync called on {}", ino);
-
-        let mut tw = match self.state.get_write(ino) {
-            Some(tw) => tw,
-            None => {
-                reply.ok();
-                return;
-            }
-        };
-
-        let path = match self.path_of(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let rel_path = Self::rel_for_db(&path);
-
-        match self.rt.block_on(
-            self.api
-                .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
-        ) {
-            Ok(_) => {
-                let size = std::fs::metadata(&tw.tem_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-
-                if let Some(mut attr) = self.state.get_attr(&path) {
-                    attr.size = size;
-                    attr.mtime = SystemTime::now();
-                    attr.ctime = attr.mtime;
-                    self.state.set_attr(&path, attr);
-                }
-                tw.committed = true;
-
-                reply.ok();
-            }
-            Err(e) => {
-                eprintln!("[FSYNC] commit failed {:?}: {:?}", path, e);
-                reply.error(libc::EIO);
-            }
+        match self.commit_write(ino) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1388,10 +1394,10 @@ impl Filesystem for RemoteFs {
 
             let rel = Self::rel_for_db(&path);
 
-            match self.rt.block_on(
-                self.api
-                    .write_file(&rel, &tw.tem_path.to_string_lossy()),
-            ) {
+            match self
+                .rt
+                .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()))
+            {
                 Ok(_) => {
                     let size = std::fs::metadata(&tw.tem_path)
                         .map(|m| m.len())
@@ -1497,15 +1503,12 @@ impl Filesystem for RemoteFs {
         let new_rel = Self::rel_for_db(&new_path);
 
         if let Some(ino) = self.state.ino_of(&old_path) {
-            if let Some(tw) = self.state.get_write(ino) {
+            if let Some(mut tw) = self.state.get_write(ino) {
                 let _ = self.rt.block_on(
                     self.api
                         .write_file(&old_rel, &tw.tem_path.to_string_lossy()),
                 );
-                println!(
-                    "[RENAME] upload tempfile before renaming: {:?}",
-                    tw.tem_path
-                );
+                tw.committed = true;
             }
         }
 
