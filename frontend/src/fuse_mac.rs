@@ -14,7 +14,7 @@ use std::thread;
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{self, File},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{mpsc::channel, Arc, Mutex},
@@ -58,6 +58,7 @@ impl std::error::Error for HttpStatus {}
 pub(crate) struct TempWrite {
     tem_path: PathBuf,
     size: u64,
+    committed: bool,
 }
 
 /// Central state container for inode mapping, attribute caching,
@@ -425,6 +426,7 @@ impl FsState {
             TempWrite {
                 tem_path: temp_path,
                 size: 0,
+                committed: false,
             },
         );
     }
@@ -534,6 +536,29 @@ impl FsState {
     pub fn clear_all_cache(&self) {
         self.attr_cache.lock().unwrap().clear();
         self.dir_cache.lock().unwrap().clear();
+    }
+
+    pub fn cleanup_all_tempfiles(&self) {
+        let writes = match self.writes.lock() {
+            Ok(w) => w,
+            Err(_) => return, // mutex poisoned → abort cleanup
+        };
+
+        for (ino, tw) in writes.iter() {
+            if tw.tem_path.exists() {
+                match std::fs::remove_file(&tw.tem_path) {
+                    Ok(_) => {
+                        eprintln!("[CLEANUP] removed temp file ino={} {:?}", ino, tw.tem_path);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[CLEANUP] failed to remove ino={} {:?}: {:?}",
+                            ino, tw.tem_path, e
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -781,6 +806,12 @@ impl RemoteFs {
     }
 }
 
+impl Drop for RemoteFs {
+    fn drop(&mut self) {
+        self.state.cleanup_all_tempfiles();
+    }
+}
+
 impl Filesystem for RemoteFs {
     // Function that update the file's attributes
     fn setattr(
@@ -915,7 +946,7 @@ impl Filesystem for RemoteFs {
             attr.flags = f;
         }
 
-        self.insert_attr_cache(path.clone(), attr.clone());
+        self.insert_attr_cache(path.to_path_buf(), attr.clone());
         let _ = self.update_cache(parent);
         reply.attr(&self.state.cache_ttl, &attr);
     }
@@ -990,7 +1021,7 @@ impl Filesystem for RemoteFs {
                     let perm = Self::parse_perm(&de.permissions);
                     let size = if is_dir { 0 } else { de.size.max(0) as u64 };
                     let attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                    self.insert_attr_cache(path.clone(), attr.clone());
+                    self.insert_attr_cache(path.to_path_buf(), attr.clone());
                     reply.entry(&self.state.cache_ttl, &attr, 0);
                 } else {
                     reply.error(ENOENT);
@@ -1099,7 +1130,7 @@ impl Filesystem for RemoteFs {
                     let size = if is_dir { 0 } else { de.size.max(0) as u64 };
                     let mut attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
                     attr.nlink = if is_dir { 2 } else { 1 };
-                    self.insert_attr_cache(path.clone(), attr.clone());
+                    self.insert_attr_cache(path.to_path_buf(), attr.clone());
                     reply.attr(&self.state.cache_ttl, &attr);
                 } else {
                     reply.error(ENOENT);
@@ -1112,23 +1143,16 @@ impl Filesystem for RemoteFs {
     // Function that open a new temporary file
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let temp_path = self.get_temporary_path(ino);
+
         if !temp_path.exists() {
-            if let Err(_e) = File::create(&temp_path) {
+            if let Err(_) = File::create(&temp_path) {
                 reply.error(libc::EIO);
                 return;
             }
         }
 
-        let accmode = flags & libc::O_ACCMODE;
-
-        if accmode == libc::O_RDONLY {
-            // Read-only → NON generare un file handle (fh = 0)
-            reply.opened(0, flags as u32);
-        } else {
-            // Write mode → usa ancora ino come fh
-            self.state.insert_write_tempfile(ino, temp_path);
-            reply.opened(ino, flags as u32);
-        }
+        // SEMPRE restituire un fh valido
+        reply.opened(ino, flags as u32);
     }
 
     // Reads data from a file starting at a specified offset
@@ -1214,7 +1238,7 @@ impl Filesystem for RemoteFs {
         let end = (start + size as u64 - 1).min(attr.size - 1);
 
         match self.rt.block_on(self.api.read_range(&rel_db, start, end)) {
-            Ok(bytes) => reply.data(&bytes),
+            Ok(bytes) => reply.data(&bytes[..]),
             Err(err) => reply.error(errno_from_anyhow(&err)),
         }
     }
@@ -1227,11 +1251,15 @@ impl Filesystem for RemoteFs {
         _fh: u64,
         offset: i64,
         data: &[u8],
-        _write_flags: u32,
+        write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        println!(
+            "[WRITE] ino: {}, offset {}, data: {:?}, write_flag: {}",
+            ino, offset, data, write_flags
+        );
         let tw = match self.state.get_write(ino) {
             Some(tw) => tw,
             None => {
@@ -1239,26 +1267,31 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
+        println!("[WRITE] temp write: {:?}, size {:?}", tw.tem_path, tw.size);
+
         let res = std::fs::OpenOptions::new().write(true).open(&tw.tem_path);
 
         match res {
             Ok(mut f) => {
-                if f.seek(SeekFrom::Start(offset as u64)).is_err() {
+                if f.seek(std::io::SeekFrom::Start(offset as u64)).is_err() {
+                    println!("[WRITE] error seek");
                     reply.error(libc::EIO);
                     return;
                 }
+
                 if f.write_all(data).is_err() {
+                    println!("[WRITE] error write_all");
                     reply.error(libc::EIO);
                     return;
                 }
-                let new_size = offset as u64 + data.len() as u64;
-                self.state
-                    .update_write_size(ino, new_size.saturating_sub(tw.size));
+
+                // size = max(size, offset + len)
+                let end = offset as u64 + data.len() as u64;
+                self.state.update_write_size(ino, end);
+
                 reply.written(data.len() as u32);
             }
-            Err(_) => {
-                reply.error(libc::EIO);
-            }
+            Err(_) => reply.error(libc::EIO),
         }
     }
 
@@ -1266,23 +1299,32 @@ impl Filesystem for RemoteFs {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
+        _ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        let tw = match self.state.get_write(ino) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        println!("[FSYNC] fsync called on {}", ino);
+
+        let mut tw = match self.state.get_write(ino) {
             Some(tw) => tw,
             None => {
                 reply.ok();
                 return;
             }
         };
-        if !tw.tem_path.exists() {
-            eprintln!("File temporaneo non trovato in flush: {:?}", tw.tem_path);
-            reply.error(libc::ENOENT);
-            return;
-        }
+
         let path = match self.path_of(ino) {
             Some(p) => p,
             None => {
@@ -1290,14 +1332,32 @@ impl Filesystem for RemoteFs {
                 return;
             }
         };
+
         let rel_path = Self::rel_for_db(&path);
-        let result = self.rt.block_on(
+
+        match self.rt.block_on(
             self.api
                 .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
-        );
-        match result {
-            Ok(_) => reply.ok(),
-            Err(_) => reply.error(libc::EIO),
+        ) {
+            Ok(_) => {
+                let size = std::fs::metadata(&tw.tem_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                if let Some(mut attr) = self.state.get_attr(&path) {
+                    attr.size = size;
+                    attr.mtime = SystemTime::now();
+                    attr.ctime = attr.mtime;
+                    self.state.set_attr(&path, attr);
+                }
+                tw.committed = true;
+
+                reply.ok();
+            }
+            Err(e) => {
+                eprintln!("[FSYNC] commit failed {:?}: {:?}", path, e);
+                reply.error(libc::EIO);
+            }
         }
     }
 
@@ -1312,52 +1372,48 @@ impl Filesystem for RemoteFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let tw = match self.state.take_write(ino) {
-            Some(tw) => tw,
-            None => {
-                reply.ok();
-                return;
-            }
-        };
-
-        let path = match self.path_of(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let rel_db = Self::rel_for_db(&path);
-
-        let size = std::fs::metadata(&tw.tem_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        let res = self
-            .rt
-            .block_on(self.api.write_file(&rel_db, &tw.tem_path.to_string_lossy()));
-
-        if res.is_err() {
-            reply.error(libc::EIO);
+        let Some(mut tw) = self.state.take_write(ino) else {
+            reply.ok();
             return;
-        }
+        };
 
-        // aggiorna attr
-        if let Some(mut attr) = self.state.get_attr(&path) {
-            attr.size = size;
-            attr.mtime = SystemTime::now();
-            attr.ctime = attr.mtime;
-            self.state.set_attr(&path, attr);
-        }
+        if !tw.committed {
+            let path = match self.path_of(ino) {
+                Some(p) => p,
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
 
-        // invalida solo la directory parent
-        if let Some(parent) = path.parent() {
-            self.state.remove_dir_cache(parent);
-        }
+            let rel = Self::rel_for_db(&path);
 
-        let _ = std::fs::remove_file(&tw.tem_path);
-        reply.ok();
+            match self.rt.block_on(
+                self.api
+                    .write_file(&rel, &tw.tem_path.to_string_lossy()),
+            ) {
+                Ok(_) => {
+                    let size = std::fs::metadata(&tw.tem_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    if let Some(mut attr) = self.state.get_attr(&path) {
+                        attr.size = size;
+                        attr.mtime = SystemTime::now();
+                        attr.ctime = attr.mtime;
+                        self.state.set_attr(&path, attr);
+                    }
+                    tw.committed = true;
+                    let _ = std::fs::remove_file(&tw.tem_path);
+                    reply.ok();
+                }
+                Err(e) => {
+                    eprintln!("[FSYNC] commit failed {:?}: {:?}", path, e);
+                    let _ = std::fs::remove_file(&tw.tem_path);
+                    reply.error(libc::EIO);
+                }
+            }
+        }
     }
 
     // Creates a new file with the given name and attributes
@@ -1374,26 +1430,25 @@ impl Filesystem for RemoteFs {
         let parent_path = match self.path_of(parent) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                reply.error(libc::ENOENT);
                 return;
             }
         };
-        let path = if parent_path == Path::new("/") {
-            PathBuf::from("/").join(name)
-        } else {
-            parent_path.join(name)
-        };
-        let ino = self.state.allocate_ino(&path);
-        let mut tmp = std::env::temp_dir();
-        tmp.push(format!("remote_fs_create_{:x}.part", ino));
-        let _ = fs::remove_file(&tmp);
 
-        if let Err(e) = fs::File::create(&tmp) {
-            eprintln!("create: tmp create failed {:?}: {:?}", tmp, e);
+        let path = parent_path.join(name);
+        let ino = self.state.allocate_ino(&path);
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("remote_fs_{:x}.part", ino));
+
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = std::fs::File::create(&tmp) {
+            eprintln!("[CREATE] tmp create failed {:?}: {:?}", tmp, e);
             reply.error(libc::EIO);
             return;
         }
-        self.state.insert_write_tempfile(ino, tmp.clone());
+
+        self.state.insert_write_tempfile(ino, tmp);
         let final_mode = mode & !umask;
         let mut attr = self.file_attr(
             &path,
@@ -1403,8 +1458,9 @@ impl Filesystem for RemoteFs {
             (final_mode & 0o777) as u16,
         );
         attr.nlink = 1;
+
         self.state.set_attr(&path, attr.clone());
-        //self.update_cache(&parent_path).ok();
+
         reply.created(&self.state.cache_ttl, &attr, 0, ino, 0);
     }
 
@@ -1627,6 +1683,7 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
+        MountOption::RW,
     ];
     let bg_session = spawn_mount2(remote_fs, &mp, &options).expect("Failed to mount filesystem");
     let notifier = Arc::new(bg_session.notifier());

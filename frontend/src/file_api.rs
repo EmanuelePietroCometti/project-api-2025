@@ -150,24 +150,40 @@ impl FileApi {
         let url = format!("{}/files", self.base_url);
 
         let mut file = fs::File::open(local_path).await?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
+        let mut offset: u64 = 0;
 
-        let resp = self
-            .client
-            .put(&url)
-            .query(&[("relPath", rel_path)])
-            .body(Body::from(buffer))
-            .send()
-            .await?;
+        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
+        let mut buffer = vec![0u8; CHUNK_SIZE];
 
-        let status = resp.status();
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!("write_file failed: {} - {}", status, text))
+        loop {
+            let n = file.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+
+            let resp = self
+                .client
+                .put(&url)
+                .query(&[("relPath", rel_path), ("offset", &offset.to_string())])
+                .body(Body::from(buffer[..n].to_vec()))
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "write_file failed at offset {}: {} - {}",
+                    offset,
+                    status,
+                    text
+                ));
+            }
+
+            offset += n as u64;
         }
+
+        Ok(())
     }
 
     /// DELETE /files?relPath=...
