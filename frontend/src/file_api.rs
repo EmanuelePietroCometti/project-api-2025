@@ -150,6 +150,29 @@ impl FileApi {
         let url = format!("{}/files", self.base_url);
 
         let mut file = fs::File::open(local_path).await?;
+        let metadata = file.metadata().await?;
+
+        if metadata.len() == 0 {
+            let resp = self
+                .client
+                .put(&url)
+                .query(&[("relPath", rel_path), ("offset", "0")])
+                .body(Body::from(vec![]))
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "write_file failed for empty file: {} - {}",
+                    status,
+                    text
+                ));
+            }
+
+            return Ok(());
+        }
         let mut offset: u64 = 0;
 
         const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
