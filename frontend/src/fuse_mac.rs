@@ -769,11 +769,7 @@ impl RemoteFs {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
         if let Some((entries, ts)) = self.state.get_dir_cache(&dir) {
-            if SystemTime::now()
-                .duration_since(ts)
-                .unwrap_or(Duration::ZERO)
-                < self.state.cache_ttl
-            {
+            if self.is_cache_valid(ts){
                 let mut out = Vec::with_capacity(entries.len());
                 for de in entries {
                     let mut child = PathBuf::from("/");
