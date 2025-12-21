@@ -370,28 +370,39 @@ pub fn update_cache_from_metadata(
     };
 
     let blocks = if size == 0 { 0 } else { (size + 511) / 512 };
-
-    let attr = FileAttr {
-        ino,
-        size,
-        blocks,
-        blksize: 512,
-        atime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        mtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        ctime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        crtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        kind,
-        perm,
-        nlink: if is_dir { 2 } else { 1 },
-        uid: 1000,
-        gid: 1000,
-        rdev: 0,
-        flags: 0,
-    };
-    st.set_attr(abs, attr);
-    st.insert_child(parent, name.to_string(), ino);
-    st.remove_dir_cache(parent);
-    ino
+    let uid = (unsafe { libc::getuid() }) as u32;
+    let gid = (unsafe { libc::getgid() }) as u32;
+    if st.get_attr(parent).is_none() {
+        let attr = FileAttr {
+            ino,
+            size,
+            blocks,
+            blksize: 512,
+            atime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            mtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            ctime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            crtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            kind,
+            perm,
+            nlink: if is_dir { 2 } else { 1 },
+            uid,
+            gid,
+            rdev: 0,
+            flags: 0,
+        };
+        st.set_attr(abs, attr);
+        st.insert_child(parent, name.to_string(), ino);
+        st.remove_dir_cache(parent);
+        ino
+    } else {
+        if let Some(mut attr) = st.get_attr(parent) {
+            attr.perm = perm;
+            attr.size = size;
+            attr.mtime = UNIX_EPOCH + Duration::from_secs(mtime as u64);
+            st.set_attr(parent, attr);
+        }
+        ino
+    }
 }
 
 impl FsState {
@@ -635,7 +646,12 @@ impl RemoteFs {
             self.state
                 .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
         }
-        let mut _attrcache = self.state.get_attr(&dir);
+        let nlink = list.len();
+        let parent_attr = self.get_attr_cache(dir);
+        if let Some(mut parent_attr) = parent_attr {
+            parent_attr.nlink = 2 + nlink as u32;
+            self.state.set_attr(dir, parent_attr);
+        }
         for de in &list {
             let mut child = PathBuf::from("/");
             if !rel_fs.is_empty() {
@@ -649,7 +665,7 @@ impl RemoteFs {
                 FileType::RegularFile
             };
             let perm = Self::parse_perm(&de.permissions);
-            let size = if isdir { 0 } else { de.size.max(0) as u64 };
+            let size = de.size as u64;
             let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
             self.state.set_attr(&child, attr);
         }
@@ -769,24 +785,27 @@ impl RemoteFs {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
         if let Some((entries, ts)) = self.state.get_dir_cache(&dir) {
-            if self.is_cache_valid(ts){
+            if self.is_cache_valid(ts) {
                 let mut out = Vec::with_capacity(entries.len());
+
                 for de in entries {
                     let mut child = PathBuf::from("/");
                     if !rel_fs.is_empty() {
                         child.push(&rel_fs);
                     }
                     child.push(&de.name);
-                    let is_dir = Self::is_dir(&de);
-                    let ty = if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                    let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
-                    self.insert_attr_cache(child.clone(), attr);
+                    if self.get_attr_cache(&child).is_none() {
+                        let is_dir = Self::is_dir(&de);
+                        let ty = if is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let size = de.size.max(0) as u64;
+                        let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+                        self.insert_attr_cache(child.clone(), attr);
+                    }
                     out.push((child, de));
                 }
                 return Ok(out);
@@ -801,7 +820,6 @@ impl RemoteFs {
                 child.push(&rel_fs);
             }
             child.push(&de.name);
-
             let is_dir = Self::is_dir(&de);
             let ty = if is_dir {
                 FileType::Directory
@@ -809,11 +827,29 @@ impl RemoteFs {
                 FileType::RegularFile
             };
             let perm = Self::parse_perm(&de.permissions);
-            let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
-            self.insert_attr_cache(child.clone(), attr);
-
-            out.push((child, de));
+            let size = de.size as u64;
+            let mtime = Some(de.mtime);
+            if self.get_attr_cache(&child).is_none() {
+                let attr = self.file_attr(&child, ty, size, mtime, perm);
+                self.insert_attr_cache(child.clone(), attr);
+                out.push((child, de));
+            } else {
+                let attr = self.get_attr_cache(&child);
+                let now = SystemTime::now();
+                let mtime_st = mtime
+                    .and_then(|sec| {
+                        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sec as u64))
+                    })
+                    .unwrap_or(now);
+                if let Some(mut attr) = attr {
+                    attr.size = size;
+                    attr.perm = perm;
+                    attr.mtime = mtime_st;
+                } else {
+                    eprintln!("Error: update attr cache");
+                }
+                out.push((child, de));
+            }
         }
         Ok(out)
     }
@@ -879,7 +915,7 @@ impl Filesystem for RemoteFs {
                             FileType::RegularFile
                         };
                         let perm = Self::parse_perm(&de.permissions);
-                        let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+                        let size = de.size as u64;
                         let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
                         self.insert_attr_cache(path.clone(), a.clone());
                         a
@@ -1044,7 +1080,7 @@ impl Filesystem for RemoteFs {
                         FileType::RegularFile
                     };
                     let perm = Self::parse_perm(&de.permissions);
-                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+                    let size = de.size as u64;
                     let attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
                     self.insert_attr_cache(path.to_path_buf(), attr.clone());
                     reply.entry(&self.state.cache_ttl, &attr, 0);
@@ -1167,6 +1203,11 @@ impl Filesystem for RemoteFs {
 
         match self.dir_entries(parent) {
             Ok(entries) => {
+                let nlink = entries.len();
+                let parent_attr = self.get_attr_cache(parent);
+                if let Some(mut parent_attr) = parent_attr {
+                    parent_attr.nlink = nlink as u32;
+                }
                 if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
                     let is_dir = Self::is_dir(&de);
                     let ty = if is_dir {
@@ -1175,7 +1216,7 @@ impl Filesystem for RemoteFs {
                         FileType::RegularFile
                     };
                     let perm = Self::parse_perm(&de.permissions);
-                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+                    let size = de.size as u64;
 
                     let mut attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
                     attr.nlink = if is_dir { 2 } else { 1 };
@@ -1299,12 +1340,7 @@ impl Filesystem for RemoteFs {
                         FileType::RegularFile
                     };
                     let perm = Self::parse_perm(&de.permissions);
-                    let size = if ty == FileType::Directory {
-                        0
-                    } else {
-                        de.size as u64
-                    };
-
+                    let size = de.size as u64;
                     let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
                     self.insert_attr_cache(path.clone(), a.clone());
                     attr = Some(a);
@@ -1384,7 +1420,14 @@ impl Filesystem for RemoteFs {
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 
@@ -1414,7 +1457,6 @@ impl Filesystem for RemoteFs {
 
         let rel = Self::rel_for_db(&path);
 
-        // 🔥 COMMIT UNICO E DEFINITIVO
         match self
             .rt
             .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()))
