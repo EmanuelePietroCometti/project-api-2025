@@ -19,7 +19,9 @@ pub struct DirectoryEntry {
     pub permissions: String,
     pub is_dir: i64,
     pub version: i64,
+    pub nlink: i64,
 }
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct StatsResponse {
     #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
@@ -211,7 +213,7 @@ impl FileApi {
 
     /// DELETE /files?relPath=...
     pub async fn delete(&self, rel_path: &str) -> Result<()> {
-        let url = format!("{}/files", self.base_url);
+        let url = format!("{}/files/updatedMetadata", self.base_url);
 
         let resp = self
             .client
@@ -226,6 +228,25 @@ impl FileApi {
         } else {
             let text = resp.text().await.unwrap_or_default();
             Err(anyhow!("delete failed: {} - {}", status, text))
+        }
+    }
+
+    pub async fn get_update_metadata(&self, rel_path: &str) -> Result<DirectoryEntry> {
+        let url = format!("{}/list/updatedMetadata", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("relPath", rel_path)])
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success(){
+            let v = resp.json::<DirectoryEntry>().await?;
+            println!("{:?}", v);
+            Ok(v)
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(anyhow!("get updated metadata failed: {} - {}", status, text))
         }
     }
 

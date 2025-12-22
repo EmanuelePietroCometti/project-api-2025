@@ -39,9 +39,11 @@ router.post("/", async (req, res) => {
       is_dir: true,
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions
+      permissions,
+      nlink: stats.nlink,
     });
-
+    await f.syncMetadataFromDisk(parentDirName);
+   
     res.status(201).json({ message: "Directory successfully created" });
 
   } catch (err) {

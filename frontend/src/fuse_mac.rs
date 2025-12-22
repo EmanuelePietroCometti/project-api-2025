@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::runtime::Runtime;
 
-const TTL: Duration = Duration::from_secs(10);
+const TTL: Duration = Duration::from_millis(2000);
 
 /// A lightweight error wrapper that stores an HTTP status code.
 ///
@@ -115,6 +115,7 @@ struct RemoteFs {
     state: Arc<FsState>,
     api: FileApi,
     rt: Arc<Runtime>,
+    notifier: Arc<Mutex<Option<Notifier>>>,
 }
 
 fn errno_from_anyhow(err: &anyhow::Error) -> i32 {
@@ -149,7 +150,7 @@ fn errno_from_anyhow(err: &anyhow::Error) -> i32 {
 }
 
 // Function that extract the file's metadata from the payload
-fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16)> {
+fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16, i64)> {
     let rel = payload["relPath"].as_str()?;
     let name = payload["name"]
         .as_str()
@@ -167,10 +168,10 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
 
     let perm_str = payload["permissions"].as_str().unwrap_or("644");
     let perm = u16::from_str_radix(perm_str, 8).unwrap_or(0o644);
-
+    let nlink = payload["nlink"].as_i64().unwrap_or(1);
     let abs = Path::new("/").join(rel);
 
-    Some((abs, name, is_dir, size, mtime, perm))
+    Some((abs, name, is_dir, size, mtime, perm, nlink))
 }
 
 // Function that start the websocket listener, initialize the websocket connection and listen the messages
@@ -248,25 +249,16 @@ fn handle_fs_change(payload: &serde_json::Value, notifier: &Notifier, fs_state: 
 /// Handles a "create" event by inserting the new file/dir metadata and invalidating relevant caches
 fn handle_created(payload: &Value, notifier: &Notifier, st: &FsState) {
     println!("WS DEBUG: Received Add Payload: {:?}", payload); // <--- Aggiungi questo
-    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+    let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
         eprintln!("handle_created: invalid metadata");
         return;
     };
-
-    // Aggiorna cache
-    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
-
-    // FIX CRITICO: Invalida la dentry del PADRE
+    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
     let parent = abs.parent().unwrap_or(Path::new("/"));
     if let Some(parent_ino) = st.ino_of(parent) {
-        // Rimuovi la cache della directory padre per forzare il re-download lista
         st.remove_dir_cache(parent);
-
-        // Notifica il kernel che la entry nella directory padre è cambiata/nuova
         let _ = notifier.inval_entry(parent_ino, OsStr::new(&name));
     }
-
-    // Notifica update inode stesso
     let _ = notifier.inval_inode(ino, 0, 0);
 }
 /// Handles a delete event by resolving the absolute path and delegating removal logic
@@ -322,14 +314,15 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
             .unwrap_or_else(|| st.allocate_ino(&new_abs))
     };
 
-    let Some((_abs_meta, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+    let Some((_abs_meta, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload)
+    else {
         eprintln!("handle_renamed_event: invalid metadata in payload: {payload}");
         st.remove_attr(&old_abs);
         st.remove_attr(&new_abs);
         return;
     };
     let final_abs = &new_abs;
-    let _ = update_cache_from_metadata(st, final_abs, &name, is_dir, size, mtime, perm);
+    let _ = update_cache_from_metadata(st, final_abs, &name, is_dir, size, mtime, perm, nlink);
     if let Some((new_parent_ino, _)) = resolve_parent(&new_abs, st) {
         let _ = notifier.inval_inode(new_parent_ino, 0, 0);
     }
@@ -339,11 +332,11 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
 
 /// Handles a file update event by refreshing attributes and invalidating the inode in FUSE
 fn handle_updated(payload: &Value, notifier: &Notifier, st: &FsState) {
-    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+    let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
         eprintln!("handle_updated: invalid metadata in payload: {payload}");
         return;
     };
-    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
+    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
     let _ = notifier.inval_inode(ino, 0, 0);
 }
 
@@ -356,6 +349,7 @@ pub fn update_cache_from_metadata(
     size: u64,
     mtime: i64,
     perm: u16,
+    nlink: i64,
 ) -> u64 {
     let kind = if is_dir {
         FileType::Directory
@@ -363,7 +357,6 @@ pub fn update_cache_from_metadata(
         FileType::RegularFile
     };
     let parent = abs.parent().unwrap_or(Path::new("/"));
-
     let ino = match st.ino_of(abs) {
         Some(i) => i,
         None => st.allocate_ino(abs),
@@ -384,7 +377,7 @@ pub fn update_cache_from_metadata(
             crtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
             kind,
             perm,
-            nlink: if is_dir { 2 } else { 1 },
+            nlink: nlink as u32,
             uid,
             gid,
             rdev: 0,
@@ -395,12 +388,8 @@ pub fn update_cache_from_metadata(
         st.remove_dir_cache(parent);
         ino
     } else {
-        if let Some(mut attr) = st.get_attr(parent) {
-            attr.perm = perm;
-            attr.size = size;
-            attr.mtime = UNIX_EPOCH + Duration::from_secs(mtime as u64);
-            st.set_attr(parent, attr);
-        }
+        st.remove_attr(parent);
+        st.remove_dir_cache(parent);
         ino
     }
 }
@@ -456,19 +445,6 @@ impl FsState {
     {
         let mut writes = self.writes.lock().unwrap();
         writes.get_mut(&fh).map(f)
-    }
-
-    // Accesso IMMUTABILE (raro, solo lettura)
-    pub fn has_write(&self, fh: u64) -> bool {
-        self.writes.lock().unwrap().contains_key(&fh)
-    }
-
-    // Aggiorna size correttamente
-    pub fn update_write_size(&self, fh: u64, end: u64) {
-        let mut writes = self.writes.lock().unwrap();
-        if let Some(entry) = writes.get_mut(&fh) {
-            entry.size = entry.size.max(end);
-        }
     }
 
     // Rimuove e restituisce (solo in release)
@@ -608,17 +584,6 @@ impl RemoteFs {
         SystemTime::now().duration_since(timestamp).unwrap() < self.state.cache_ttl
     }
 
-    // Functions that obtain information from the cache
-    pub fn get_dir_cache(&self, path: &Path) -> Option<(Vec<DirectoryEntry>, SystemTime)> {
-        let cache_entry = self.state.get_dir_cache(&path);
-        if let Some((_, ts)) = &cache_entry {
-            if !self.is_cache_valid(*ts) {
-                return None;
-            }
-        }
-        cache_entry
-    }
-
     pub fn get_attr_cache(&self, path: &Path) -> Option<FileAttr> {
         self.state.get_attr(&path)
     }
@@ -642,14 +607,18 @@ impl RemoteFs {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
         let list = self.rt.block_on(self.api.ls(&rel_db))?;
-        {
-            self.state
-                .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
-        }
-        let nlink = list.len();
-        let parent_attr = self.get_attr_cache(dir);
-        if let Some(mut parent_attr) = parent_attr {
-            parent_attr.nlink = 2 + nlink as u32;
+
+        self.state
+            .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
+        println!("prima di de");
+        let rel_db_parent = Self::rel_for_db(dir);
+        println!("path parent: {}", rel_db_parent);
+        let de = self.rt.block_on(self.api.get_update_metadata(&rel_db_parent))?;
+        println!("de recuperata dal backend!");
+        if let Some(mut parent_attr) = self.get_attr_cache(dir) {
+            parent_attr.nlink = de.nlink as u32;
+            parent_attr.size = de.size as u64;
+            parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
             self.state.set_attr(dir, parent_attr);
         }
         for de in &list {
@@ -658,15 +627,19 @@ impl RemoteFs {
                 child.push(&rel_fs);
             }
             child.push(&de.name);
-            let isdir = Self::is_dir(&de);
-            let ty = if isdir {
+
+            let is_dir = Self::is_dir(&de);
+            let ty = if is_dir {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             };
+            let nlink_child = de.nlink as u32;
+
             let perm = Self::parse_perm(&de.permissions);
             let size = de.size as u64;
-            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+
+            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, nlink_child);
             self.state.set_attr(&child, attr);
         }
         Ok(())
@@ -688,6 +661,7 @@ impl RemoteFs {
             state: Arc::new(FsState::new(api.clone(), rt.clone())),
             api,
             rt,
+            notifier: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -737,6 +711,7 @@ impl RemoteFs {
         size: u64,
         mtime: Option<i64>,
         perm: u16,
+        nlink: u32,
     ) -> FileAttr {
         let now = SystemTime::now();
         let mtime_st = mtime
@@ -744,6 +719,7 @@ impl RemoteFs {
             .unwrap_or(now);
         let uid = (unsafe { libc::getuid() }) as u32;
         let gid = (unsafe { libc::getgid() }) as u32;
+        println!("[FILE ATTR] uid: {} gid: {}", uid, gid);
         FileAttr {
             ino: self.alloc_ino(path),
             size,
@@ -754,11 +730,7 @@ impl RemoteFs {
             crtime: mtime_st,
             kind: ty,
             perm,
-            nlink: if matches!(ty, FileType::Directory) {
-                2
-            } else {
-                1
-            },
+            nlink,
             uid,
             gid,
             rdev: 0,
@@ -784,42 +756,39 @@ impl RemoteFs {
     pub fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
+
+        // 1. Prova a recuperare dalla cache
         if let Some((entries, ts)) = self.state.get_dir_cache(&dir) {
             if self.is_cache_valid(ts) {
                 let mut out = Vec::with_capacity(entries.len());
-
                 for de in entries {
                     let mut child = PathBuf::from("/");
                     if !rel_fs.is_empty() {
                         child.push(&rel_fs);
                     }
                     child.push(&de.name);
-                    if self.get_attr_cache(&child).is_none() {
-                        let is_dir = Self::is_dir(&de);
-                        let ty = if is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        let perm = Self::parse_perm(&de.permissions);
-                        let size = de.size.max(0) as u64;
-                        let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
-                        self.insert_attr_cache(child.clone(), attr);
-                    }
                     out.push((child, de));
                 }
+                let _ = self.update_cache(dir);
                 return Ok(out);
             }
         }
+
+        // 2. Fetch dal Backend
         let list = self.rt.block_on(self.api.ls(&rel_db))?;
+
+        // Inseriamo la lista grezza in cache
         self.insert_dir_cache(dir.to_path_buf(), (list.clone(), SystemTime::now()));
+
         let mut out = Vec::with_capacity(list.len());
-        for de in list {
+
+        for de in &list {
             let mut child = PathBuf::from("/");
             if !rel_fs.is_empty() {
                 child.push(&rel_fs);
             }
             child.push(&de.name);
+
             let is_dir = Self::is_dir(&de);
             let ty = if is_dir {
                 FileType::Directory
@@ -828,29 +797,39 @@ impl RemoteFs {
             };
             let perm = Self::parse_perm(&de.permissions);
             let size = de.size as u64;
-            let mtime = Some(de.mtime);
-            if self.get_attr_cache(&child).is_none() {
-                let attr = self.file_attr(&child, ty, size, mtime, perm);
-                self.insert_attr_cache(child.clone(), attr);
-                out.push((child, de));
-            } else {
-                let attr = self.get_attr_cache(&child);
-                let now = SystemTime::now();
-                let mtime_st = mtime
-                    .and_then(|sec| {
-                        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sec as u64))
-                    })
-                    .unwrap_or(now);
-                if let Some(mut attr) = attr {
-                    attr.size = size;
-                    attr.perm = perm;
-                    attr.mtime = mtime_st;
-                } else {
-                    eprintln!("Error: update attr cache");
-                }
-                out.push((child, de));
-            }
+
+            // Aggiorna o inserisce l'attributo del FIGLIO
+            // Nota: nlink del figlio è 2 se dir (base), 1 se file.
+            // Verrà rifinito quando si farà readdir/lookup su quel figlio specifico.
+            let child_nlink = de.nlink as u32;
+            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, child_nlink);
+            self.insert_attr_cache(child.clone(), attr);
+
+            out.push((child, de.clone()));
         }
+
+        // 3. AGGIORNAMENTO ATTR PADRE (Logica Centralizzata)
+        let rel_db_parent = Self::rel_for_db(dir);
+        let de = self.rt.block_on(self.api.get_update_metadata(&rel_db_parent))?;
+
+        if let Some(mut parent_attr) = self.state.get_attr(dir) {
+            parent_attr.nlink = de.nlink as u32;
+            parent_attr.size = de.size as u64;
+            parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
+            self.state.set_attr(dir, parent_attr);
+        } else {
+            // Se il padre non è in cache, lo creiamo (utile per la prima scansione della root)
+            let attr = self.file_attr(
+                dir,
+                FileType::Directory,
+                de.size as u64,
+                Some(de.mtime),
+                0o755,
+                de.nlink as u32,
+            );
+            self.state.set_attr(dir, attr);
+        }
+
         Ok(out)
     }
 }
@@ -887,13 +866,13 @@ impl Filesystem for RemoteFs {
         if ino == 1 {
             let uid = (unsafe { libc::getuid() }) as u32;
             let gid = (unsafe { libc::getgid() }) as u32;
-            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755);
+
+            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755, 2);
             attr.uid = uid;
             attr.gid = gid;
             reply.attr(&self.state.cache_ttl, &attr);
             return;
         }
-
         // 2. Risoluzione Path e Attributi Correnti
         let Some(path) = self.path_of(ino) else {
             reply.error(ENOENT);
@@ -901,30 +880,15 @@ impl Filesystem for RemoteFs {
         };
         let rel_db = Self::rel_for_db(&path);
 
+        // Esempio per setattr (riga 724):
         let mut attr = if let Some(a) = self.state.get_attr(&path) {
             a
         } else {
             let parent = path.parent().unwrap_or(Path::new("/"));
-            match self.dir_entries(parent) {
-                Ok(entries) => {
-                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
-                        let is_dir = Self::is_dir(&de);
-                        let ty = if is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        let perm = Self::parse_perm(&de.permissions);
-                        let size = de.size as u64;
-                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                        self.insert_attr_cache(path.clone(), a.clone());
-                        a
-                    } else {
-                        reply.error(ENOENT);
-                        return;
-                    }
-                }
-                Err(_) => {
+            let _ = self.dir_entries(parent); // Popola la cache con la logica corretta
+            match self.state.get_attr(&path) {
+                Some(a) => a,
+                None => {
                     reply.error(ENOENT);
                     return;
                 }
@@ -1038,57 +1002,32 @@ impl Filesystem for RemoteFs {
         name: &std::ffi::OsStr,
         reply: ReplyEntry,
     ) {
+        // 1. Risoluzione del path del genitore
         let Some(parent_path) = self.path_of(parent) else {
             reply.error(ENOENT);
             return;
         };
 
-        // 1. Costruisci il path assoluto del file che stiamo cercando
-        let child_path = if parent_path == Path::new("/") {
-            PathBuf::from("/").join(name)
-        } else {
-            parent_path.join(name)
-        };
+        // 2. Costruzione del path assoluto del figlio
+        let child_path = parent_path.join(name);
 
-        // 2. CHECK LOCALE: Se conosciamo già l'inode e abbiamo gli attributi (es. appena creato), usiamoli!
-        // Questo evita di chiedere al backend per file che sono ancora solo in locale/temp.
-        if let Some(_ino) = self.state.ino_of(&child_path) {
-            if let Some(attr) = self.state.get_attr(&child_path) {
-                // Se è un file aperto in scrittura, assicuriamoci che la dimensione sia quella aggiornata
-                if self.state.has_write(
-                    self.state.next_fh.load(Ordering::Relaxed), /* o logica migliore per fh */
-                ) {
-                    // Nota: qui è difficile sapere l'fh specifico senza context,
-                    // ma generalmente l'attr_cache viene aggiornata dalla write/getattr.
-                }
-                reply.entry(&self.state.cache_ttl, &attr, 0);
-                return;
-            }
-        }
-
-        // 3. Fallback al Backend (come facevi prima)
+        // 3. Fallback centralizzato
+        // Chiamiamo dir_entries per assicurarci che la cache della directory padre
+        // e degli attributi di tutti i figli sia aggiornata con la logica corretta.
         match self.dir_entries(&parent_path) {
-            Ok(entries) => {
-                let target = entries
-                    .into_iter()
-                    .find(|(p, _)| p.file_name() == Some(name));
-                if let Some((path, de)) = target {
-                    let is_dir = Self::is_dir(&de);
-                    let ty = if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = de.size as u64;
-                    let attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                    self.insert_attr_cache(path.to_path_buf(), attr.clone());
+            Ok(_) => {
+                // Se l'operazione ha avuto successo, cerchiamo il figlio nella attr_cache.
+                // Questa cache ora contiene i valori nlink e size calcolati correttamente.
+                if let Some(attr) = self.state.get_attr(&child_path) {
                     reply.entry(&self.state.cache_ttl, &attr, 0);
                 } else {
+                    // Il file non esiste nella lista restituita dal backend
                     reply.error(ENOENT);
                 }
             }
-            Err(_) => reply.error(ENOENT),
+            Err(e) => {
+                reply.error(errno_from_anyhow(&e));
+            }
         }
     }
 
@@ -1154,13 +1093,12 @@ impl Filesystem for RemoteFs {
     }
 
     // Retrieves metadata and file attributes for a given path
-    // Retrieves metadata and file attributes for a given path
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
-        // 1. GESTIONE ROOT INODE (Rimane invariata)
+        // 1. GESTIONE ROOT INODE (Invariata)
         if ino == 1 {
             let uid = (unsafe { libc::getuid() }) as u32;
             let gid = (unsafe { libc::getgid() }) as u32;
-            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755);
+            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755, 2);
             attr.uid = uid;
             attr.gid = gid;
             reply.attr(&self.state.cache_ttl, &attr);
@@ -1173,9 +1111,7 @@ impl Filesystem for RemoteFs {
             return;
         };
 
-        // 3. GESTIONE FILE IN SCRITTURA (FIX PER ECHO E FILE VUOTI)
-        // Se abbiamo un fh aperto e stiamo scrivendo, la dimensione reale è nel TempWrite.
-        // Dobbiamo usarla per evitare che il Finder veda size=0 mentre scriviamo.
+        // 3. GESTIONE FILE IN SCRITTURA
         let mut forced_size: Option<u64> = None;
         if let Some(fh_val) = fh {
             let writes = self.state.writes.lock().unwrap();
@@ -1184,60 +1120,34 @@ impl Filesystem for RemoteFs {
             }
         }
 
-        // 4. CONTROLLO CACHE LOCALE (FIX PER ERRORE -43)
-        // Se conosciamo già gli attributi (es. appena creato o letto di recente),
-        // usiamoli DIRETTAMENTE senza interrogare la lista directory del backend.
-        if let Some(mut attr) = self.state.get_attr(&path) {
-            // Se c'è una scrittura in corso, aggiorniamo la size al volo
+        // 4. CONTROLLO CACHE E FALLBACK
+        // Proviamo a prendere l'attr dalla cache. Se manca, forziamo un refresh
+        // della directory padre per popolare la cache in modo coerente.
+        let attr_opt = if let Some(a) = self.state.get_attr(&path) {
+            Some(a)
+        } else {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            // dir_entries popola internamente la cache per tutti i figli e per il padre
+            if self.dir_entries(parent).is_ok() {
+                self.state.get_attr(&path)
+            } else {
+                None
+            }
+        };
+
+        // 5. RISPOSTA
+        if let Some(mut attr) = attr_opt {
+            // Se c'è una scrittura attiva, la dimensione nel TempWrite vince sulla cache
             if let Some(real_size) = forced_size {
                 attr.size = real_size;
                 attr.blocks = (real_size + 511) / 512;
             }
             reply.attr(&self.state.cache_ttl, &attr);
-            return;
-        }
-
-        // 5. FALLBACK AL BACKEND
-        // Se non è in memoria, scarichiamo la lista della directory padre.
-        let parent = path.parent().unwrap_or(Path::new("/"));
-
-        match self.dir_entries(parent) {
-            Ok(entries) => {
-                let nlink = entries.len();
-                let parent_attr = self.get_attr_cache(parent);
-                if let Some(mut parent_attr) = parent_attr {
-                    parent_attr.nlink = nlink as u32;
-                }
-                if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
-                    let is_dir = Self::is_dir(&de);
-                    let ty = if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = de.size as u64;
-
-                    let mut attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                    attr.nlink = if is_dir { 2 } else { 1 };
-
-                    // Applichiamo eventuale size da scrittura in corso anche qui
-                    if let Some(real_size) = forced_size {
-                        attr.size = real_size;
-                        attr.blocks = (real_size + 511) / 512;
-                    }
-
-                    // Aggiorniamo la cache per le chiamate future
-                    self.insert_attr_cache(path.to_path_buf(), attr.clone());
-
-                    reply.attr(&self.state.cache_ttl, &attr);
-                } else {
-                    reply.error(ENOENT);
-                }
-            }
-            Err(_) => reply.error(ENOENT),
+        } else {
+            reply.error(ENOENT);
         }
     }
+
     // Function that open a new temporary file
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         // 1. genera fh univoco
@@ -1328,25 +1238,13 @@ impl Filesystem for RemoteFs {
         }
 
         // 🔹 fallback: backend remoto
-        let mut attr = self.state.get_attr(&path);
-
-        if attr.is_none() {
+        let attr = if let Some(a) = self.state.get_attr(&path) {
+            Some(a)
+        } else {
             let parent = path.parent().unwrap_or(Path::new("/"));
-            if let Ok(entries) = self.dir_entries(parent) {
-                if let Some((_, de)) = entries.into_iter().find(|(p, _)| *p == path) {
-                    let ty = if Self::is_dir(&de) {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = de.size as u64;
-                    let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                    self.insert_attr_cache(path.clone(), a.clone());
-                    attr = Some(a);
-                }
-            }
-        }
+            let _ = self.dir_entries(parent);
+            self.state.get_attr(&path)
+        };
 
         let Some(attr) = attr else {
             reply.error(ENOENT);
@@ -1530,16 +1428,19 @@ impl Filesystem for RemoteFs {
         );
 
         let final_mode = mode & !umask;
-        let mut attr = self.file_attr(
+        let attr = self.file_attr(
             &path,
             FileType::RegularFile,
             0,
             None,
             (final_mode & 0o777) as u16,
+            1,
         );
-        attr.nlink = 1;
 
         self.state.set_attr(&path, attr.clone());
+        if let Some(parent_path) = self.state.path_of(parent) {
+            let _ = self.update_cache(&parent_path);
+        }
 
         reply.created(&self.state.cache_ttl, &attr, 0, fh, 0);
     }
@@ -1653,9 +1554,7 @@ impl Filesystem for RemoteFs {
                 if let Some(attr) = self.state.get_attr(&path) {
                     reply.entry(&self.state.cache_ttl, &attr, 0);
                 } else {
-                    let mut attr = self.file_attr(&path, FileType::Directory, 0, None, 0o755);
-                    attr.nlink = 2;
-
+                    let attr = self.file_attr(&path, FileType::Directory, 64, None, 0o755, 2);
                     self.state.set_attr(&path, attr.clone());
                     reply.entry(&self.state.cache_ttl, &attr, 0);
                 }
@@ -1690,7 +1589,6 @@ impl Filesystem for RemoteFs {
             Ok(_) => {
                 self.clear_cache(Some(&path));
                 let _ = self.update_cache(&parent_path);
-
                 self.state.remove_path(&path);
                 reply.ok();
             }
@@ -1747,8 +1645,8 @@ impl Filesystem for RemoteFs {
         match self.rt.block_on(self.api.delete(&rel)) {
             Ok(_) => {
                 self.clear_cache(Some(&path));
-                let _ = self.update_cache(&parent_path);
                 self.state.remove_path(&path);
+                let _ = self.update_cache(&parent_path);
                 reply.ok();
             }
             Err(e) => {
@@ -1761,27 +1659,41 @@ impl Filesystem for RemoteFs {
 
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
+
     let remote_fs = RemoteFs::new(api, rt.clone());
+
+    let notifier_ptr = remote_fs.notifier.clone();
     let fs_state = remote_fs.state.clone();
+
     remote_fs.init_cache();
+
     let mp = mountpoint.to_string();
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
         MountOption::RW,
+        MountOption::AutoUnmount,
     ];
+
     let bg_session = spawn_mount2(remote_fs, &mp, &options).expect("Failed to mount filesystem");
-    let notifier = Arc::new(bg_session.notifier());
+
+    let notifier_actual = bg_session.notifier();
+    {
+        let mut lock = notifier_ptr.lock().unwrap();
+        *lock = Some(notifier_actual.clone());
+    }
     {
         let url_clone = url.clone();
-        let notifier_clone = notifier.clone();
+        let notifier_for_ws = Arc::new(notifier_actual);
         rt.spawn(async move {
-            start_websocket_listener(&url_clone, notifier_clone, fs_state);
+            start_websocket_listener(&url_clone, notifier_for_ws, fs_state);
         });
     }
+
     let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
     let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
+
     {
         let tx = tx.clone();
         let shutting_down = shutting_down.clone();
@@ -1793,7 +1705,11 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
             }
         });
     }
+
     let _ = rx.recv();
+
+    println!("\nSmontaggio in corso...");
     let _ = bg_session.join();
+
     Ok(())
 }

@@ -32,6 +32,7 @@ async function bootstrap(rootDir, dbConnection) {
             size INTEGER,
             mtime INTEGER,
             permissions TEXT,
+            nlink INTEGER,
             version INTEGER DEFAULT 1,
             FOREIGN KEY(parent_id) REFERENCES files(id) ON DELETE CASCADE
         );
@@ -63,7 +64,8 @@ async function buildMetadataPayload(absPath) {
     is_dir: stats.isDirectory(),
     size: stats.size,
     mtime: Math.floor(stats.mtimeMs / 1000),
-    permissions
+    permissions,
+    nlink: stats.nlink,
   };
 }
 
@@ -97,7 +99,8 @@ async function handleFileUpdate(pathFile, stats) {
       is_dir: stats.isDirectory(),
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions
+      permissions,
+      nlink: stats.nlink
     }
     await f.updateFile(fileData);
   } catch (err) {
@@ -235,7 +238,8 @@ watcher
           is_dir: false,
           size: 0,
           mtime: 0,
-          permissions: "000"
+          permissions: "000",
+          nlink: 0,
         });
       }, 200)
     };
@@ -267,7 +271,8 @@ watcher
           is_dir: true,
           size: 0,
           mtime: 0,
-          permissions: "000"
+          permissions: "000",
+          nlink: 0,
         });
       }, 200)
     };
