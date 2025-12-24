@@ -4,7 +4,7 @@ use fuser015::{
     spawn_mount2, FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EIO, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY};
+use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -24,13 +24,6 @@ use tokio::runtime::Runtime;
 
 const TTL: Duration = Duration::from_millis(2000);
 
-/// A lightweight error wrapper that stores an HTTP status code.
-///
-/// This type is used to propagate backend HTTP errors through the `anyhow`
-/// error stack. During error conversion (e.g., in `errno_from_anyhow`),
-/// the contained status code is mapped to the appropriate POSIX errno.
-///
-/// The value is a raw `u16` status code returned by the remote API.
 #[derive(Debug, Clone, Copy)]
 struct HttpStatus(pub u16);
 impl std::fmt::Display for HttpStatus {
@@ -41,46 +34,11 @@ impl std::fmt::Display for HttpStatus {
 
 impl std::error::Error for HttpStatus {}
 
-/// Temporary write state for an open file.
-///
-/// Whenever a file is opened for writing, a temporary local file is created
-/// in `/tmp`. All writes go into this temporary file instead of being flushed
-/// immediately to the remote backend.
-///
-/// When FUSE triggers `flush` or `release`, this temp file is uploaded to the
-/// remote storage and then removed.
-///
-/// Fields:
-/// - `tem_path`: Path of the temporary file on the local filesystem.
-/// - `size`: Total size of data written so far, used to update the backend size
-///   and track incremental writes.
-
 pub(crate) struct TempWrite {
     tem_path: PathBuf,
     size: u64,
 }
 
-/// Central state container for inode mapping, attribute caching,
-/// directory caching, and temporary write tracking.
-///
-/// This state is shared across the filesystem via `Arc<FsState>` and protected
-/// through `Mutex` to ensure thread-safety for concurrent FUSE operations.
-///
-/// Responsibilities:
-/// - Maintains a **bidirectional mapping** between paths and inode numbers.
-/// - Stores file metadata in an **attribute cache**.
-/// - Stores directory listings in a **directory cache**, with TTL expiration.
-/// - Tracks temporary write buffers via `TempWrite`.
-/// - Allocates new inode numbers when new paths appear.
-///
-/// Fields:
-/// - `ino_by_path`: Maps absolute paths → inode numbers.
-/// - `path_by_ino`: Maps inode numbers → absolute paths.
-/// - `attr_cache`: Cached `FileAttr` values for files and directories.
-/// - `dir_cache`: Cached directory listings + timestamp for TTL management.
-/// - `writes`: Tracks open writable files and their temporary files.
-/// - `next_ino`: Monotonically increasing counter for inode allocation.
-/// - `cache_ttl`: Lifetime of directory cache entries.
 #[derive(Clone)]
 pub(crate) struct FsState {
     pub ino_by_path: Arc<Mutex<HashMap<PathBuf, u64>>>,
@@ -93,24 +51,6 @@ pub(crate) struct FsState {
     pub next_fh: Arc<AtomicU64>,
 }
 
-/// Main FUSE filesystem implementation backed by a remote HTTP/WebSocket API.
-///
-/// This struct implements the `fuser016::Filesystem` trait and mediates between
-/// FUSE requests and the remote backend. It uses `FsState` internally to manage
-/// inode mappings, caching, and temporary writes.
-///
-/// Core responsibilities:
-/// - Translate FUSE operations (`lookup`, `read`, `write`, `mkdir`, ...) into
-///   API requests through `FileApi`.
-/// - Maintain an adaptive cache for directory listings and metadata.
-/// - Handle WebSocket push notifications (`fs_change`) to invalidate caches.
-/// - Create and manage temporary files for buffered writes.
-/// - Execute async API operations using the embedded Tokio runtime.
-///
-/// Fields:
-/// - `state`: Shared filesystem state and caches.
-/// - `api`: HTTP API client used to fetch metadata and contents from backend.
-/// - `rt`: Tokio runtime used to run async API calls inside synchronous FUSE.
 struct RemoteFs {
     state: Arc<FsState>,
     api: FileApi,
@@ -184,30 +124,22 @@ pub fn start_websocket_listener(api_url: &str, notifier: Arc<Notifier>, fs_state
         let ws_url = ws_url.clone();
         tokio::task::spawn_blocking(move || {
             let client = ClientBuilder::new(ws_url)
-                .on("connect", |_, _| {
-                    println!("Socket.IO connected!");
-                })
+                .on("connect", |_, _| {})
                 .on("fs_change", move |payload, _| match payload {
                     Payload::Text(values) => {
                         if values.len() < 1 {
-                            eprintln!("fs_change payload senza dati");
                             return;
                         }
                         let json_payload = &values[0];
                         handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
                     }
                     _other => {
-                        eprintln!("Binary payload non gestito");
                     }
                 })
-                .on("error", |err, _| {
-                    eprintln!("Socket.IO error: {:?}", err);
-                })
+                .on("error", |_err, _| {})
                 .connect();
 
-            if let Err(err) = client {
-                eprintln!("Socket.IO connection failed: {:?}", err);
-            }
+            if let Err(_err) = client {}
         });
     });
 }
@@ -241,16 +173,14 @@ fn handle_fs_change(payload: &serde_json::Value, notifier: &Notifier, fs_state: 
         }
 
         _ => {
-            println!("Unknown fs_change op: {:?}", op);
+            return;
         }
     }
 }
 
 /// Handles a "create" event by inserting the new file/dir metadata and invalidating relevant caches
 fn handle_created(payload: &Value, notifier: &Notifier, st: &FsState) {
-    println!("WS DEBUG: Received Add Payload: {:?}", payload); // <--- Aggiungi questo
     let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
-        eprintln!("handle_created: invalid metadata");
         return;
     };
     let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
@@ -266,8 +196,6 @@ fn handle_deleted_event(payload: &Value, notifier: &Notifier, st: &FsState) {
     if let Some(rel) = payload["relPath"].as_str() {
         let abs = Path::new("/").join(rel);
         handle_deleted_path(&abs, notifier, st);
-    } else {
-        eprintln!("handle_deleted_event: missing relPath in payload: {payload}");
     }
 }
 
@@ -289,11 +217,9 @@ fn handle_deleted_path(abs: &Path, notifier: &Notifier, st: &FsState) {
 /// Handles a rename event by updating inode-path mappings and invalidating affected caches
 fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
     let Some(old_rel) = payload["oldPath"].as_str() else {
-        eprintln!("handle_renamed_event: missing oldPath in payload: {payload}");
         return;
     };
     let Some(new_rel) = payload["newPath"].as_str() else {
-        eprintln!("handle_renamed_event: missing newPath in payload: {payload}");
         return;
     };
 
@@ -316,7 +242,6 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
 
     let Some((_abs_meta, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload)
     else {
-        eprintln!("handle_renamed_event: invalid metadata in payload: {payload}");
         st.remove_attr(&old_abs);
         st.remove_attr(&new_abs);
         return;
@@ -333,7 +258,6 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
 /// Handles a file update event by refreshing attributes and invalidating the inode in FUSE
 fn handle_updated(payload: &Value, notifier: &Notifier, st: &FsState) {
     let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
-        eprintln!("handle_updated: invalid metadata in payload: {payload}");
         return;
     };
     let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
@@ -541,20 +465,17 @@ impl FsState {
             Ok(w) => w,
             Err(_) => {
                 return;
-            } // mutex poisoned → abort cleanup
+            }
         };
 
-        for (ino, tw) in writes.iter() {
+        for (_ino, tw) in writes.iter() {
             if tw.tem_path.exists() {
                 match std::fs::remove_file(&tw.tem_path) {
                     Ok(_) => {
-                        eprintln!("[CLEANUP] removed temp file ino={} {:?}", ino, tw.tem_path);
+                        return;
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[CLEANUP] failed to remove ino={} {:?}: {:?}",
-                            ino, tw.tem_path, e
-                        );
+                    Err(_) => {
+                        return;
                     }
                 }
             }
@@ -610,11 +531,8 @@ impl RemoteFs {
 
         self.state
             .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
-        println!("prima di de");
         let rel_db_parent = Self::rel_for_db(dir);
-        println!("path parent: {}", rel_db_parent);
         let de = self.rt.block_on(self.api.get_update_metadata(&rel_db_parent))?;
-        println!("de recuperata dal backend!");
         if let Some(mut parent_attr) = self.get_attr_cache(dir) {
             parent_attr.nlink = de.nlink as u32;
             parent_attr.size = de.size as u64;
@@ -683,7 +601,6 @@ impl RemoteFs {
     fn rel_for_db(path: &Path) -> String {
         let s = path.to_string_lossy();
 
-        //Root case
         if s == "/" {
             return "".to_string();
         } else {
@@ -719,7 +636,6 @@ impl RemoteFs {
             .unwrap_or(now);
         let uid = (unsafe { libc::getuid() }) as u32;
         let gid = (unsafe { libc::getgid() }) as u32;
-        println!("[FILE ATTR] uid: {} gid: {}", uid, gid);
         FileAttr {
             ino: self.alloc_ino(path),
             size,
@@ -757,7 +673,6 @@ impl RemoteFs {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
 
-        // 1. Prova a recuperare dalla cache
         if let Some((entries, ts)) = self.state.get_dir_cache(&dir) {
             if self.is_cache_valid(ts) {
                 let mut out = Vec::with_capacity(entries.len());
@@ -774,10 +689,8 @@ impl RemoteFs {
             }
         }
 
-        // 2. Fetch dal Backend
         let list = self.rt.block_on(self.api.ls(&rel_db))?;
 
-        // Inseriamo la lista grezza in cache
         self.insert_dir_cache(dir.to_path_buf(), (list.clone(), SystemTime::now()));
 
         let mut out = Vec::with_capacity(list.len());
@@ -798,17 +711,12 @@ impl RemoteFs {
             let perm = Self::parse_perm(&de.permissions);
             let size = de.size as u64;
 
-            // Aggiorna o inserisce l'attributo del FIGLIO
-            // Nota: nlink del figlio è 2 se dir (base), 1 se file.
-            // Verrà rifinito quando si farà readdir/lookup su quel figlio specifico.
             let child_nlink = de.nlink as u32;
             let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, child_nlink);
             self.insert_attr_cache(child.clone(), attr);
 
             out.push((child, de.clone()));
         }
-
-        // 3. AGGIORNAMENTO ATTR PADRE (Logica Centralizzata)
         let rel_db_parent = Self::rel_for_db(dir);
         let de = self.rt.block_on(self.api.get_update_metadata(&rel_db_parent))?;
 
@@ -818,7 +726,7 @@ impl RemoteFs {
             parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
             self.state.set_attr(dir, parent_attr);
         } else {
-            // Se il padre non è in cache, lo creiamo (utile per la prima scansione della root)
+            
             let attr = self.file_attr(
                 dir,
                 FileType::Directory,
@@ -842,8 +750,6 @@ impl Drop for RemoteFs {
 
 impl Filesystem for RemoteFs {
     // Function that update the file's attributes
-    // Function that update the file's attributes
-    // Function that update the file's attributes
     fn setattr(
         &mut self,
         _req: &Request<'_>,
@@ -862,7 +768,6 @@ impl Filesystem for RemoteFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        // 1. Root Inode (non cambia)
         if ino == 1 {
             let uid = (unsafe { libc::getuid() }) as u32;
             let gid = (unsafe { libc::getgid() }) as u32;
@@ -873,19 +778,17 @@ impl Filesystem for RemoteFs {
             reply.attr(&self.state.cache_ttl, &attr);
             return;
         }
-        // 2. Risoluzione Path e Attributi Correnti
         let Some(path) = self.path_of(ino) else {
             reply.error(ENOENT);
             return;
         };
         let rel_db = Self::rel_for_db(&path);
 
-        // Esempio per setattr (riga 724):
         let mut attr = if let Some(a) = self.state.get_attr(&path) {
             a
         } else {
             let parent = path.parent().unwrap_or(Path::new("/"));
-            let _ = self.dir_entries(parent); // Popola la cache con la logica corretta
+            let _ = self.dir_entries(parent);
             match self.state.get_attr(&path) {
                 Some(a) => a,
                 None => {
@@ -894,23 +797,14 @@ impl Filesystem for RemoteFs {
                 }
             }
         };
-
-        // 3. Gestione MODE (chmod)
         if let Some(m) = mode {
-            // Finder usa file temporanei .sb-XXXX → chmod DEVE essere no-op
             attr.perm = (m & 0o777) as u16;
-
-            // NON chiamare il backend remoto
-            // NON restituire errori
         }
 
-        // 4. Gestione SIZE (truncate)
         if let Some(new_size) = size {
             let mut is_local_write = false;
 
-            // Gestione file in scrittura attiva (TempWrite)
             if let Some(fh_val) = fh {
-                // ... (il codice per gestire TempWrite rimane invariato) ...
                 if let Some(effective_size) = self.state.with_write_mut(fh_val, |tw| {
                     tw.size = tw.size.max(new_size);
                     tw.size
@@ -921,7 +815,6 @@ impl Filesystem for RemoteFs {
                 }
             }
 
-            // Remote truncate
             if !is_local_write {
                 match self.rt.block_on(self.api.truncate(&rel_db, new_size)) {
                     Ok(_) => {
@@ -931,17 +824,10 @@ impl Filesystem for RemoteFs {
                     Err(e) => {
                         let errno = errno_from_anyhow(&e);
 
-                        // FIX CRITICO: Ignora gli errori 404/500 tradotti in ENOENT, EIO o ENOSPC.
                         if errno == libc::ENOENT || errno == libc::EIO || errno == libc::ENOSPC {
-                            eprintln!(
-                                "TRUNCATE failed remote (ignored for new file, errno: {}): {:?}",
-                                errno, e
-                            );
-                            // Aggiorniamo la dimensione solo in locale e permettiamo l'OK al Finder
                             attr.size = new_size;
                             attr.blocks = (new_size + 511) / 512;
                         } else {
-                            // Per tutti gli altri errori, dobbiamo bloccare.
                             reply.error(errno);
                             return;
                         }
@@ -949,10 +835,6 @@ impl Filesystem for RemoteFs {
                 }
             }
         }
-
-        // 5. Gestione UTIMES (mtime/atime)
-
-        // 6. Aggiornamento e Risposta
         self.insert_attr_cache(path.to_path_buf(), attr.clone());
         reply.attr(&self.state.cache_ttl, &attr);
     }
@@ -1002,26 +884,18 @@ impl Filesystem for RemoteFs {
         name: &std::ffi::OsStr,
         reply: ReplyEntry,
     ) {
-        // 1. Risoluzione del path del genitore
         let Some(parent_path) = self.path_of(parent) else {
             reply.error(ENOENT);
             return;
         };
 
-        // 2. Costruzione del path assoluto del figlio
         let child_path = parent_path.join(name);
 
-        // 3. Fallback centralizzato
-        // Chiamiamo dir_entries per assicurarci che la cache della directory padre
-        // e degli attributi di tutti i figli sia aggiornata con la logica corretta.
         match self.dir_entries(&parent_path) {
             Ok(_) => {
-                // Se l'operazione ha avuto successo, cerchiamo il figlio nella attr_cache.
-                // Questa cache ora contiene i valori nlink e size calcolati correttamente.
                 if let Some(attr) = self.state.get_attr(&child_path) {
                     reply.entry(&self.state.cache_ttl, &attr, 0);
                 } else {
-                    // Il file non esiste nella lista restituita dal backend
                     reply.error(ENOENT);
                 }
             }
@@ -1094,7 +968,6 @@ impl Filesystem for RemoteFs {
 
     // Retrieves metadata and file attributes for a given path
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
-        // 1. GESTIONE ROOT INODE (Invariata)
         if ino == 1 {
             let uid = (unsafe { libc::getuid() }) as u32;
             let gid = (unsafe { libc::getgid() }) as u32;
@@ -1104,14 +977,10 @@ impl Filesystem for RemoteFs {
             reply.attr(&self.state.cache_ttl, &attr);
             return;
         }
-
-        // 2. RISOLUZIONE PATH
         let Some(path) = self.path_of(ino) else {
             reply.error(ENOENT);
             return;
         };
-
-        // 3. GESTIONE FILE IN SCRITTURA
         let mut forced_size: Option<u64> = None;
         if let Some(fh_val) = fh {
             let writes = self.state.writes.lock().unwrap();
@@ -1120,24 +989,17 @@ impl Filesystem for RemoteFs {
             }
         }
 
-        // 4. CONTROLLO CACHE E FALLBACK
-        // Proviamo a prendere l'attr dalla cache. Se manca, forziamo un refresh
-        // della directory padre per popolare la cache in modo coerente.
         let attr_opt = if let Some(a) = self.state.get_attr(&path) {
             Some(a)
         } else {
             let parent = path.parent().unwrap_or(Path::new("/"));
-            // dir_entries popola internamente la cache per tutti i figli e per il padre
             if self.dir_entries(parent).is_ok() {
                 self.state.get_attr(&path)
             } else {
                 None
             }
         };
-
-        // 5. RISPOSTA
         if let Some(mut attr) = attr_opt {
-            // Se c'è una scrittura attiva, la dimensione nel TempWrite vince sulla cache
             if let Some(real_size) = forced_size {
                 attr.size = real_size;
                 attr.blocks = (real_size + 511) / 512;
@@ -1150,29 +1012,22 @@ impl Filesystem for RemoteFs {
 
     // Function that open a new temporary file
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        // 1. genera fh univoco
         let fh = self.state.alloc_fh();
 
         let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
 
         if wants_write {
-            // 2. temp file PER fh
             let temp_path = self.get_temporary_path(fh);
 
             if let Err(_) = File::create(&temp_path) {
                 reply.error(libc::EIO);
                 return;
             }
-
-            // 2 copia contenuto remoto (se esiste)
             if let Some(path) = self.path_of(ino) {
-                // Ottieni attributi file
                 let Some(attr) = self.state.get_attr(&path) else {
                     reply.error(ENOENT);
                     return;
                 };
-
-                // 2 copia contenuto remoto (se esiste)
                 let rel = Self::rel_for_db(&path);
                 if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
                     if let Ok(mut f) = File::options().write(true).open(&temp_path) {
@@ -1180,12 +1035,8 @@ impl Filesystem for RemoteFs {
                     }
                 }
             }
-
-            // 3. registra lo stato di scrittura
             self.state.insert_write_tempfile(fh, temp_path);
         }
-
-        // 4. restituisci fh vero
         reply.opened(fh, flags as u32);
     }
 
@@ -1207,8 +1058,6 @@ impl Filesystem for RemoteFs {
         };
 
         let rel_db = Self::rel_for_db(&path);
-
-        // 🔹 risultato eventuale dalla temp file
         let mut tmp_result: Option<Vec<u8>> = None;
         let mut tmp_error: Option<i32> = None;
 
@@ -1226,8 +1075,6 @@ impl Filesystem for RemoteFs {
                 tmp_error = Some(EIO);
             }
         });
-
-        // 🔹 se servito dal tempfile → FINITO
         if let Some(e) = tmp_error {
             reply.error(e);
             return;
@@ -1236,8 +1083,6 @@ impl Filesystem for RemoteFs {
             reply.data(&buf);
             return;
         }
-
-        // 🔹 fallback: backend remoto
         let attr = if let Some(a) = self.state.get_attr(&path) {
             Some(a)
         } else {
@@ -1269,19 +1114,15 @@ impl Filesystem for RemoteFs {
     fn write(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
-        write_flags: u32,
+        _write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        println!(
-            "[WRITE] ino: {}, offset {}, data: {:?}, write_flag: {}",
-            ino, offset, data, write_flags
-        );
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -1378,8 +1219,7 @@ impl Filesystem for RemoteFs {
                 let _ = std::fs::remove_file(&tw.tem_path);
                 reply.ok();
             }
-            Err(e) => {
-                eprintln!("[RELEASE] commit failed {:?}: {:?}", path, e);
+            Err(_e) => {
                 let _ = std::fs::remove_file(&tw.tem_path);
                 reply.error(libc::EIO);
             }
@@ -1406,8 +1246,6 @@ impl Filesystem for RemoteFs {
         };
 
         let path = parent_path.join(name);
-        //let ino = self.state.allocate_ino(&path);
-
         let fh = self.state.alloc_fh();
 
         let mut tmp = std::env::temp_dir();
@@ -1456,7 +1294,6 @@ impl Filesystem for RemoteFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        // --- 1. Risoluzione dei Path (Rimane invariata) ---
         let old_parent = match self.path_of(parent) {
             Some(p) => p,
             None => {
@@ -1478,41 +1315,24 @@ impl Filesystem for RemoteFs {
         let old_rel = Self::rel_for_db(&old_path);
         let new_rel = Self::rel_for_db(&new_path);
 
-        // Controlla se il file di destinazione esiste (caso di sovrascrittura)
         let target_ino_opt = self.state.ino_of(&new_path);
-
-        // --- 2. Chiamata API Remota ---
         match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
             Ok(_) => {
-                // --- 3. Aggiornamento Cache Locale (Logica Unificata) ---
-
-                // 3a. Ottieni e rimuovi il mapping del vecchio inode
                 if let Some(ino) = self.state.ino_of(&old_path) {
                     self.state.remove_path(&old_path);
-
-                    // 3b. Se stiamo sovrascrivendo, pulisci la cache del file target
                     if let Some(_target_ino) = target_ino_opt {
-                        // Pulizia attributi per il file che viene sovrascritto
                         self.state.remove_attr(&new_path);
                     }
-
-                    // 3c. Sposta gli attributi dal vecchio path al nuovo path
                     if let Some(attr) = self.state.get_attr(&old_path) {
-                        self.state.remove_attr(&old_path); // Rimuovi attributi da old_path
-                        self.state.set_attr(&new_path, attr); // Inserisci attributi su new_path
+                        self.state.remove_attr(&old_path);
+                        self.state.set_attr(&new_path, attr);
                     }
-
-                    // 3d. Inserisci il nuovo path mapping con l'inode esistente
                     self.state.insert_path_mapping(&new_path, ino);
                 }
-
-                // 3e. Invalida le directory padre per forzare il refresh (CRITICO)
                 self.state.remove_dir_cache(&old_parent);
                 if old_parent != new_parent {
                     self.state.remove_dir_cache(&new_parent);
                 }
-
-                // 3f. Successo
                 reply.ok();
             }
             Err(e) => reply.error(errno_from_anyhow(&e)),
@@ -1546,8 +1366,7 @@ impl Filesystem for RemoteFs {
 
         match self.rt.block_on(self.api.mkdir(&rel)) {
             Ok(_) => {
-                if let Err(e) = self.update_cache(&parent_path) {
-                    eprintln!("update_cache failed after mkdir: {:?}", e);
+                if let Err(_e) = self.update_cache(&parent_path) {
                     reply.error(EIO);
                     return;
                 }
@@ -1589,7 +1408,7 @@ impl Filesystem for RemoteFs {
             Ok(_) => {
                 self.clear_cache(Some(&path));
                 let _ = self.update_cache(&parent_path);
-                self.state.remove_path(&path);
+                self.state.remove_path(&path); 
                 reply.ok();
             }
             Err(e) => {
@@ -1624,7 +1443,6 @@ impl Filesystem for RemoteFs {
                 }
             }
         };
-
         if !is_dir {
             reply.error(ENOTDIR);
             return;
@@ -1707,8 +1525,6 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     }
 
     let _ = rx.recv();
-
-    println!("\nSmontaggio in corso...");
     let _ = bg_session.join();
 
     Ok(())

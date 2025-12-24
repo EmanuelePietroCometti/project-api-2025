@@ -213,7 +213,7 @@ impl FileApi {
 
     /// DELETE /files?relPath=...
     pub async fn delete(&self, rel_path: &str) -> Result<()> {
-        let url = format!("{}/files/updatedMetadata", self.base_url);
+        let url = format!("{}/files", self.base_url);
 
         let resp = self
             .client
@@ -242,7 +242,6 @@ impl FileApi {
         let status = resp.status();
         if status.is_success(){
             let v = resp.json::<DirectoryEntry>().await?;
-            println!("{:?}", v);
             Ok(v)
         } else {
             let text = resp.text().await.unwrap_or_default();
@@ -306,7 +305,7 @@ impl FileApi {
     }
 
     pub async fn read_all(&self, rel_path: &str, total_size: u64) -> anyhow::Result<Vec<u8>> {
-        const CHUNK_SIZE: u64 = 64 * 1024; // 64 KiB per richiesta
+        const CHUNK_SIZE: u64 = 64 * 1024;
         let mut result = Vec::with_capacity(total_size as usize);
         let mut offset = 0;
 
@@ -314,7 +313,7 @@ impl FileApi {
             let end = (offset + CHUNK_SIZE - 1).min(total_size - 1);
             let chunk = self.read_range(rel_path, offset, end).await?;
             if chunk.is_empty() {
-                break; // EOF o backend non restituisce più dati
+                break;
             }
             result.extend_from_slice(&chunk);
             offset += chunk.len() as u64;

@@ -74,7 +74,6 @@ export default function FileDAO() {
 
                 if (err) return reject(err);
                 if (!row) return resolve(null);
-                //console.log(row.id);
                 resolve(row.id);
             });
         });
@@ -90,7 +89,6 @@ export default function FileDAO() {
         });
     };
 
-    // Correggi UPSERT per includere permissions nell’UPDATE e con binding corretti
     this.updateFile = async ({ path, name, parent, is_dir, size, mtime, permissions, nlink }) => {
         const parentPath = p.dirname(path);
         const parent_id = await this.getIdByPath(parentPath);
@@ -132,7 +130,6 @@ export default function FileDAO() {
     }
 
     this.syncMetadataFromDisk = async (relPath) => {
-        // Corretto il riferimento da 'path.join' a 'p.join'
         const absPath = (relPath === '.' || relPath === '/')
             ? p.join(process.cwd(), "storage")
             : p.join(p.join(process.cwd(), "storage"), relPath);

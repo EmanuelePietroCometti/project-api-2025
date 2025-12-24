@@ -24,13 +24,10 @@ router.get('/', async (req, res) => {
 router.get("/updatedMetadata", async (req, res) => {
     try {
         let path = req.query.relPath;
-        console.log("path: ", path);
         if (!path || path === "") {
             path = ROOT_DIR;
         }
-        console.log("path after: ", path);
         const f = await file.getFileByPath(path);
-
         res.json(f);
     } catch (err) {
         res.status(500).json({ error: err.message });
