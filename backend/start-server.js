@@ -17,7 +17,7 @@ function getPrimaryIP() {
 const args = process.argv.slice(2);
 if (args.includes("--stop")) {
   console.log("=================================================");
-  console.log("   Starting backend API...");
+  console.log("   Stopping Server...");
   console.log("=================================================");
 
   try {
@@ -31,7 +31,7 @@ if (args.includes("--stop")) {
   const ip = getPrimaryIP();
 
   console.log("=================================================");
-  console.log("   Starting backend API...");
+  console.log("   Starting Server...");
 
   if (ip) {
     console.log("   Server avilable at IP address:", ip);

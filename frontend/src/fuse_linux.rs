@@ -882,6 +882,7 @@ impl Filesystem for RemoteFs {
                     namelen,
                     frsize,
                 );
+                return;
             }
             Err(_e) => {
                 let bsize: u32 = 4096;
@@ -893,6 +894,7 @@ impl Filesystem for RemoteFs {
                 let namelen: u32 = 255;
                 let frsize: u32 = bsize;
                 reply.statfs(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize);
+                return;
             }
         }
     }
@@ -916,12 +918,15 @@ impl Filesystem for RemoteFs {
             Ok(_) => {
                 if let Some(attr) = self.state.get_attr(&child_path) {
                     reply.entry(&self.state.cache_ttl, &attr, 0);
+                    return;
                 } else {
                     reply.error(ENOENT);
+                    return;
                 }
             }
             Err(e) => {
                 reply.error(errno_from_anyhow(&e));
+                return;
             }
         }
     }

@@ -43,7 +43,6 @@ fn remove_pid() {
     let _ = std::fs::remove_file(pid_file());
 }
 
-
 fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
     if args.len() == 2 && !args[1].starts_with("--") {
@@ -95,13 +94,14 @@ fn start_filesystem(ip: &str) -> anyhow::Result<()> {
 fn run_as_deamon(ip: &str) -> anyhow::Result<()> {
     let daemon = Daemonize::new()
         .pid_file(pid_file())
+        .working_directory(env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
         .stdout(fs::File::create("/tmp/remote_fs.out")?)
         .stderr(fs::File::create("/tmp/remote_fs.err")?);
-
-    daemon.start()
+    daemon
+        .start()
         .map_err(|e| anyhow::anyhow!("Daemon failed: {}", e))?;
     write_pid()?;
-    let res= start_filesystem(ip);
+    let res = start_filesystem(ip);
     remove_pid();
     res
 }
@@ -130,8 +130,8 @@ fn run_as_service(ip: &str) -> anyhow::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stop_deamon() -> anyhow::Result<()> {
-    let pid_str = fs::read_to_string(pid_file())
-        .map_err(|_| anyhow::anyhow!("PID file not found"))?;
+    let pid_str =
+        fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("PID file not found"))?;
 
     let pid: i32 = pid_str.trim().parse()?;
 
@@ -151,8 +151,8 @@ fn stop_deamon() -> anyhow::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn stop_service() -> anyhow::Result<()> {
-    let pid_str = fs::read_to_string(pid_file())
-        .map_err(|_| anyhow::anyhow!("PID file not found"))?;
+    let pid_str =
+        fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("PID file not found"))?;
 
     let pid: i32 = pid_str.trim().parse()?;
 
@@ -160,6 +160,9 @@ fn stop_service() -> anyhow::Result<()> {
         GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, pid);
     }
 
-    println!("Sent CTRL_BREAK_EVENT to PID {}\nRemote filesystem unmounted!", pid);
+    println!(
+        "Sent CTRL_BREAK_EVENT to PID {}\nRemote filesystem unmounted!",
+        pid
+    );
     Ok(())
 }
