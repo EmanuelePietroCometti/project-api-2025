@@ -38,6 +38,7 @@ impl std::error::Error for HttpStatus {}
 pub(crate) struct TempWrite {
     tem_path: PathBuf,
     size: u64,
+    dirty: bool,
 }
 
 #[derive(Clone)]
@@ -280,42 +281,53 @@ pub fn update_cache_from_metadata(
     } else {
         FileType::RegularFile
     };
+
     let parent = abs.parent().unwrap_or(Path::new("/"));
     let ino = match st.ino_of(abs) {
         Some(i) => i,
         None => st.allocate_ino(abs),
     };
 
+    // Prepariamo i dati comuni
     let blocks = if size == 0 { 0 } else { (size + 511) / 512 };
     let uid = (unsafe { libc::getuid() }) as u32;
     let gid = (unsafe { libc::getgid() }) as u32;
+    let mtime_ts = UNIX_EPOCH + Duration::from_secs(mtime as u64);
+
+    // 1. CREIAMO SEMPRE GLI ATTRIBUTI AGGIORNATI
+    let attr = FileAttr {
+        ino,
+        size,
+        blocks,
+        blksize: 512,
+        atime: mtime_ts,
+        mtime: mtime_ts,
+        ctime: mtime_ts,
+        crtime: mtime_ts,
+        kind,
+        perm,
+        nlink: nlink as u32,
+        uid,
+        gid,
+        rdev: 0,
+        flags: 0,
+    };
+
+    // 2. SALVIAMO SEMPRE GLI ATTRIBUTI NELLA CACHE DEL FILE
+    st.set_attr(abs, attr);
+
+    // 3. GESTIAMO LA CACHE DEL GENITORE
     if st.get_attr(parent).is_none() {
-        let attr = FileAttr {
-            ino,
-            size,
-            blocks,
-            blksize: 512,
-            atime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-            mtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-            ctime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-            crtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-            kind,
-            perm,
-            nlink: nlink as u32,
-            uid,
-            gid,
-            rdev: 0,
-            flags: 0,
-        };
-        st.set_attr(abs, attr);
+        // Se il genitore non è in cache, mappiamo il figlio nel grafico dei percorsi
         st.insert_child(parent, name.to_string(), ino);
         st.remove_dir_cache(parent);
-        ino
     } else {
+        // Se è già in cache, la invalidiamo per forzare il refresh della lista file
         st.remove_attr(parent);
         st.remove_dir_cache(parent);
-        ino
     }
+
+    ino
 }
 
 impl FsState {
@@ -351,13 +363,14 @@ impl FsState {
         path_by_ino.insert(ino, child);
     }
 
-    pub fn insert_write_tempfile(&self, fh: u64, temp_path: PathBuf) {
+    pub fn insert_write_tempfile(&self, fh: u64, temp_path: PathBuf, dirty: bool) {
         let mut writes = self.writes.lock().unwrap();
         writes.insert(
             fh,
             TempWrite {
                 tem_path: temp_path,
                 size: 0,
+                dirty,
             },
         );
     }
@@ -1020,6 +1033,7 @@ impl Filesystem for RemoteFs {
 
     // Function that open a new temporary file
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        println!("[OPEN] ino: {}, flags: {:#o}", ino, flags);
         let fh = self.state.alloc_fh();
 
         let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
@@ -1042,8 +1056,9 @@ impl Filesystem for RemoteFs {
                         let _ = f.write_all(&bytes);
                     }
                 }
+                //let _ = self.rt.block_on(self.api.truncate(&rel, 0));
             }
-            self.state.insert_write_tempfile(fh, temp_path);
+            self.state.insert_write_tempfile(fh, temp_path, false);
         }
         reply.opened(fh, flags as u32);
     }
@@ -1131,6 +1146,12 @@ impl Filesystem for RemoteFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        println!(
+            "[WRITE] fh: {}, offset: {}, size: {}",
+            fh,
+            offset,
+            data.len()
+        );
         if offset < 0 {
             reply.error(libc::EINVAL);
             return;
@@ -1143,6 +1164,7 @@ impl Filesystem for RemoteFs {
                 if f.seek(SeekFrom::Start(offset as u64)).is_ok() && f.write_all(data).is_ok() {
                     let end = (offset as u64) + (data.len() as u64);
                     tw.size = tw.size.max(end);
+                    tw.dirty = true;
                     wrote = true;
                 }
             }
@@ -1164,17 +1186,31 @@ impl Filesystem for RemoteFs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        println!("[FLUSH]");
         reply.ok();
     }
 
-    fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _datasync: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        println!("[FSYNC] ino: {}, fh: {}", ino, fh);
+        let write_info = {
+            let writes = self.state.writes.lock().unwrap();
+            writes.get(&fh).map(|tw| tw.tem_path.clone())
+        };
+
+        if let Some(tmp_path) = write_info {
+            if let Some(path) = self.path_of(ino) {
+                let rel = Self::rel_for_db(&path);
+                // Sincronizza i dati col backend
+                if let Err(e) = self
+                    .rt
+                    .block_on(self.api.write_file(&rel, &tmp_path.to_string_lossy()))
+                {
+                    reply.error(errno_from_anyhow(&e));
+                    return;
+                }
+                self.state.with_write_mut(fh, |tw| tw.dirty = false);
+            }
+        }
         reply.ok();
     }
 
@@ -1189,6 +1225,7 @@ impl Filesystem for RemoteFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        println!("[RELEASE] ino: {}, fh: {}", ino, fh);
         let Some(tw) = self.state.take_write(fh) else {
             reply.ok();
             return;
@@ -1204,34 +1241,39 @@ impl Filesystem for RemoteFs {
 
         let rel = Self::rel_for_db(&path);
 
-        match self
-            .rt
-            .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()))
-        {
-            Ok(_) => {
-                let size = std::fs::metadata(&tw.tem_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+        if tw.dirty {
+            match self
+                .rt
+                .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()))
+            {
+                Ok(_) => {
+                    let size = std::fs::metadata(&tw.tem_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
 
-                if let Some(mut attr) = self.state.get_attr(&path) {
-                    attr.size = size;
-                    attr.mtime = SystemTime::now();
-                    attr.ctime = attr.mtime;
-                    self.state.set_attr(&path, attr);
+                    if let Some(mut attr) = self.state.get_attr(&path) {
+                        attr.size = size;
+                        attr.mtime = SystemTime::now();
+                        attr.ctime = attr.mtime;
+                        self.state.set_attr(&path, attr);
+                    }
+
+                    if let Some(parent) = path.parent() {
+                        self.state.remove_dir_cache(parent);
+                    }
+                    println!("File {:?} written successfully.", path);
+                    let _ = std::fs::remove_file(&tw.tem_path);
+                    self.state.with_write_mut(fh, |tw| tw.dirty = false);
+                    println!("Temporary file {:?} deleted.", tw.tem_path);
                 }
-
-                if let Some(parent) = path.parent() {
-                    self.state.remove_dir_cache(parent);
+                Err(_e) => {
+                    let _ = std::fs::remove_file(&tw.tem_path);
+                    reply.error(libc::EIO);
+                    return;
                 }
-
-                let _ = std::fs::remove_file(&tw.tem_path);
-                reply.ok();
-            }
-            Err(_e) => {
-                let _ = std::fs::remove_file(&tw.tem_path);
-                reply.error(libc::EIO);
             }
         }
+        reply.ok()
     }
 
     // Creates a new file with the given name and attributes
@@ -1245,6 +1287,10 @@ impl Filesystem for RemoteFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        println!(
+            "[CREATE] parent: {}, name: {:?}, mode: {:#o}, umask: {:#o}",
+            parent, name, mode, umask
+        );
         let parent_path = match self.path_of(parent) {
             Some(p) => p,
             None => {
@@ -1265,13 +1311,7 @@ impl Filesystem for RemoteFs {
             return;
         }
 
-        self.state.writes.lock().unwrap().insert(
-            fh,
-            TempWrite {
-                tem_path: tmp,
-                size: 0,
-            },
-        );
+        self.state.insert_write_tempfile(fh, tmp.clone(), true);
 
         let final_mode = mode & !umask;
         let attr = self.file_attr(
@@ -1302,6 +1342,10 @@ impl Filesystem for RemoteFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        println!(
+            "[RENAME] Requested rename: parent ino {}, name {:?}, new parent ino {}, new name {:?}",
+            parent, name, newparent, newname
+        );
         let old_parent = match self.path_of(parent) {
             Some(p) => p,
             None => {
@@ -1322,7 +1366,6 @@ impl Filesystem for RemoteFs {
 
         let old_rel = Self::rel_for_db(&old_path);
         let new_rel = Self::rel_for_db(&new_path);
-
         let target_ino_opt = self.state.ino_of(&new_path);
         match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
             Ok(_) => {
