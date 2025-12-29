@@ -1545,6 +1545,7 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
+        MountOption::Async,
     ];
 
     let bg_session = spawn_mount2(remote_fs, &mp, &options).expect("Failed to mount filesystem");
