@@ -2132,25 +2132,98 @@ impl FileSystemContext for RemoteFs {
             } else if should_prepopulate {
                 // Caso: append o read+write
                 println!("[OPEN] .13.3 wants_read=true -> pre-populating temp");
-                match self.rt.block_on(self.api.read_file(&rel)) {
-                    Ok(existing_data) if !existing_data.is_empty() => {
-                        if let Err(e) = std::fs::write(&temp_path, &existing_data) {
-                            eprintln!("[OPEN] WARN: pre-populate failed: {}", e);
-                            std::fs::File::create(&temp_path).map_err(|e| {
-                                FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
-                            })?;
-                        } else {
-                            println!(
-                                "[OPEN] .13.4 Pre-populated temp with {} bytes",
-                                existing_data.len()
-                            );
-                        }
-                    }
-                    Ok(_) | Err(_) => {
-                        println!("[OPEN] .13.5 Backend empty/error -> create empty temp");
+
+                // Ensure we have attributes (size) available for this entry
+                let mut attr = self.get_attr_cache(&child_path);
+                if attr.is_none() {
+                    let is_dir = Self::is_dir(&de);
+                    let ty = if is_dir { NodeType::Directory } else { NodeType::RegularFile };
+                    let perm = Self::parse_perm(&de.permissions);
+                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+                    let a = self.file_attr(&child_path, ty, size, Some(de.mtime), perm);
+                    self.insert_attr_cache(child_path.clone(), a.clone());
+                    attr = Some(a);
+                }
+
+                let attr = match attr {
+                    Some(a) => a,
+                    None => {
+                        println!("[OPEN] .13.3 No attr available -> create empty temp");
                         std::fs::File::create(&temp_path).map_err(|e| {
                             FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
                         })?;
+                        // Build a minimal FileAttr for the newly-created empty temp
+                        let is_dir = Self::is_dir(&de);
+                        let ty = if is_dir { NodeType::Directory } else { NodeType::RegularFile };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let a = self.file_attr(&child_path, ty, 0, Some(de.mtime), perm);
+                        self.insert_attr_cache(child_path.clone(), a.clone());
+                        a
+                    }
+                };
+
+                if attr.size == 0 {
+                    println!("[OPEN] .13.4 attr.size==0 -> create empty temp");
+                    std::fs::File::create(&temp_path).map_err(|e| {
+                        FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                    })?;
+                } else {
+                    let start_u64 = 0u64;
+                    let end_u64 = attr.size.saturating_sub(1);
+                    match self.rt.block_on(self.api.read_range(&rel, start_u64, end_u64)) {
+                        Ok(existing_data) if !existing_data.is_empty() => {
+                            if let Err(e) = std::fs::write(&temp_path, &existing_data) {
+                                eprintln!("[OPEN] WARN: pre-populate failed: {}", e);
+                                std::fs::File::create(&temp_path).map_err(|e| {
+                                    FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                                })?;
+                            } else {
+                                println!(
+                                    "[OPEN] .13.4 Pre-populated temp with {} bytes",
+                                    existing_data.len()
+                                );
+                            }
+                        }
+                        Ok(_) => {
+                            // Backend returned an empty body -> create empty temp
+                            println!("[OPEN] .13.5 Backend returned empty -> create empty temp");
+                            std::fs::File::create(&temp_path).map_err(|e| {
+                                FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                            })?;
+                        }
+                        Err(e) => {
+                            eprintln!("[OPEN] .13.5 Backend read failed: {} -> trying fallback", e);
+                            // fallback rel form
+                            let alt = if rel.starts_with("./") {
+                                rel.trim_start_matches("./").to_string()
+                            } else {
+                                format!("./{}", rel.trim_start_matches("./"))
+                            };
+                            match self.rt.block_on(self.api.read_range(&alt, start_u64, end_u64)) {
+                                Ok(d2) if !d2.is_empty() => {
+                                    if let Err(e) = std::fs::write(&temp_path, &d2) {
+                                        eprintln!("[OPEN] WARN: fallback pre-populate failed: {}", e);
+                                        std::fs::File::create(&temp_path).map_err(|e| {
+                                            FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                                        })?;
+                                    } else {
+                                        println!("[OPEN] .13.4 Fallback pre-populated temp with {} bytes", d2.len());
+                                    }
+                                }
+                                Ok(_) => {
+                                    println!("[OPEN] .13.6 Fallback returned empty -> create empty temp");
+                                    std::fs::File::create(&temp_path).map_err(|e| {
+                                        FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                                    })?;
+                                }
+                                Err(e2) => {
+                                    eprintln!("[OPEN] fallback read also failed: {} -> create empty temp", e2);
+                                    std::fs::File::create(&temp_path).map_err(|e| {
+                                        FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
+                                    })?;
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -2404,6 +2477,59 @@ impl FileSystemContext for RemoteFs {
         let rel_path = RemoteFs::rel_of(&path);
         println!("[READ] rel='{}'", rel_path);
 
+        // Ensure we have attributes (size) for this path; if missing, try to populate from parent listing
+        let mut attr = self.get_attr_cache(&path);
+
+        if attr.is_none() {
+            let parent_rel = Path::new(&rel_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".".to_string());
+            let parent_key = PathBuf::from(parent_rel.clone());
+
+            match self.dir_entries(&parent_key) {
+                Ok(entries) => {
+                    if let Some((child_path, de)) = entries.into_iter().find(|(p, _)| *p == path)
+                    {
+                        let is_dir = Self::is_dir(&de);
+                        let ty = if is_dir {
+                            NodeType::Directory
+                        } else {
+                            NodeType::RegularFile
+                        };
+                        let perm = Self::parse_perm(&de.permissions);
+                        let size = if is_dir { 0 } else { de.size.max(0) as u64 };
+
+                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
+                        self.insert_attr_cache(path.clone(), a.clone());
+                        attr = Some(a);
+                    }
+                }
+                Err(_) => {
+                    return Err(FspError::WIN32(ERROR_FILE_NOT_FOUND));
+                }
+            }
+        }
+
+        let attr = match attr {
+            Some(a) => a,
+            None => return Err(FspError::WIN32(ERROR_FILE_NOT_FOUND)),
+        };
+
+        // If offset beyond EOF, return 0 bytes
+        if offset as u64 >= attr.size {
+            return Ok(0);
+        }
+
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        // Compute start/end for backend range reads
+        let start_u64 = offset as u64;
+        let end_u64 = (start_u64 + (buffer.len() as u64) - 1).min(attr.size.saturating_sub(1));
+
         let data: Vec<u8> = if let Some(tw) = &file_context.temp_write {
             println!("[READ] reading from temp '{}'", tw.tem_path.display());
             match std::fs::read(&tw.tem_path) {
@@ -2418,7 +2544,7 @@ impl FileSystemContext for RemoteFs {
             }
         } else {
             println!("[READ] reading from backend with rel='{}'", rel_path);
-            match self.rt.block_on(self.api.read_file(&rel_path)) {
+            match self.rt.block_on(self.api.read_range(&rel_path, start_u64, end_u64)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("[READ] backend read failed for '{}': {}", rel_path, e);
@@ -2429,7 +2555,7 @@ impl FileSystemContext for RemoteFs {
                         format!("./{}", rel_path.trim_start_matches("./"))
                     };
                     eprintln!("[READ] trying fallback rel='{}'", alt);
-                    match self.rt.block_on(self.api.read_file(&alt)) {
+                    match self.rt.block_on(self.api.read_range(&alt, start_u64, end_u64)) {
                         Ok(d2) => d2,
                         Err(e2) => {
                             eprintln!("[READ] backend read fallback failed for '{}': {}", alt, e2);
@@ -2443,19 +2569,25 @@ impl FileSystemContext for RemoteFs {
             }
         };
 
-        let start = offset as usize;
-        if start >= data.len() {
-            println!("[READ] offset >= data.len -> return 0");
-            return Ok(0);
+        let bytes_to_copy: &[u8];
+        if file_context.temp_write.is_some() {
+            let start = offset as usize;
+            if start >= data.len() {
+                println!("[READ] offset >= data.len -> return 0");
+                return Ok(0);
+            }
+            let end = std::cmp::min(start + buffer.len(), data.len());
+            bytes_to_copy = &data[start..end];
+        } else {
+            // backend returned exactly the requested window starting at `start_u64`
+            let end = std::cmp::min(buffer.len(), data.len());
+            bytes_to_copy = &data[0..end];
         }
-        let end = std::cmp::min(start + buffer.len(), data.len());
-        let bytes_to_copy = &data[start..end];
         buffer[..bytes_to_copy.len()].copy_from_slice(bytes_to_copy);
         println!(
-            "[READ] copied {} bytes ({}..{} of {})",
+            "[READ] copied {} bytes ({} of {})",
             bytes_to_copy.len(),
-            start,
-            end,
+            offset,
             data.len()
         );
         Ok(bytes_to_copy.len() as u32)
