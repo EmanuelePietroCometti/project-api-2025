@@ -17,8 +17,6 @@ router.post("/", async (req, res) => {
     const parentDirName = path.dirname(relPath);
     const name = path.basename(dirPath);
     backendChanges.add(dirPath);
-    console.log("dirPath in mkdirRoutes:", dirPath);
-    
     if (!fs.existsSync(parentPathAbs) && parentPathAbs !== ROOT_DIR) {
       return res.status(400).json({ error: "Parent directory not found" });
     } 
@@ -41,9 +39,11 @@ router.post("/", async (req, res) => {
       is_dir: true,
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions
+      permissions,
+      nlink: stats.nlink,
     });
-
+    await f.syncMetadataFromDisk(parentDirName);
+   
     res.status(201).json({ message: "Directory successfully created" });
 
   } catch (err) {

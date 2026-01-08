@@ -7,30 +7,44 @@ function getPrimaryIP() {
   for (const name in interfaces) {
     for (const net of interfaces[name]) {
       if (net.family === "IPv4" && !net.internal) {
-        return net.address; 
+        return net.address;
       }
     }
   }
 
   return null;
 }
+const args = process.argv.slice(2);
+if (args.includes("--stop")) {
+  console.log("=================================================");
+  console.log("   Stopping Server...");
+  console.log("=================================================");
 
-const ip = getPrimaryIP();
-
-console.log("=================================================");
-console.log("   Starting backend API...");
-
-if (ip) {
-  console.log("   Server avilable at IP address:", ip);
+  try {
+    execSync("pm2 stop server && pm2 delete server", { stdio: "inherit" });
+    process.exit(0);
+  } catch (err) {
+    console.error("   Error during stop:", err.message);
+    process.exit(1);
+  }
 } else {
-  console.log("   No IPv4 address detected.");
-}
+  const ip = getPrimaryIP();
 
-console.log("=================================================");
+  console.log("=================================================");
+  console.log("   Starting Server...");
 
-try {
-  execSync(`pm2 start index.js --name server -- ${ip}`, { stdio: "inherit" });
-} catch (err) {
-  console.error("Error starting PM2:", err.message);
-  process.exit(1);
+  if (ip) {
+    console.log("   Server avilable at IP address:", ip);
+  } else {
+    console.log("   No IPv4 address detected.");
+  }
+
+  console.log("=================================================");
+
+  try {
+    execSync(`pm2 start index.js --name server -- ${ip}`, { stdio: "inherit" });
+  } catch (err) {
+    console.error("Error starting PM2:", err.message);
+    process.exit(1);
+  }
 }
