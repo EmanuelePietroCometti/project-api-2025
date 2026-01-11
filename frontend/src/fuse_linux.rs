@@ -695,19 +695,14 @@ impl RemoteFs {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
 
-        // 1. Scarica la lista dei file
         let list = self.rt.block_on(self.api.ls(&rel_db))?;
         self.state
             .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
-
-        // 2. Scarica i metadati aggiornati della directory stessa
         let dir_meta = self.rt.block_on(self.api.get_update_metadata(&rel_db))?;
 
-        // Costruisci gli attributi aggiornati per la directory
         let mut dir_attr = if let Some(attr) = self.get_attr_cache(dir) {
             attr
         } else {
-            // Se mancano, creali da zero invece di loggare a vuoto
             self.file_attr(
                 dir,
                 FileType::Directory,
@@ -724,12 +719,10 @@ impl RemoteFs {
 
         self.state.set_attr(dir, dir_attr);
 
-        // NOTIFICA: Invalida l'inode della directory nel kernel
         if let Some(n) = self.notifier.lock().unwrap().as_ref() {
             let _ = n.inval_inode(dir_attr.ino, 0, 0);
         }
 
-        // 3. Aggiorna i figli
         for child_de in &list {
             let mut child_path = PathBuf::from("/");
             if !rel_fs.is_empty() {
@@ -753,7 +746,6 @@ impl RemoteFs {
 
             self.state.set_attr(&child_path, attr);
 
-            // NOTIFICA: Invalida anche l'inode del figlio
             if let Some(n) = self.notifier.lock().unwrap().as_ref() {
                 let _ = n.inval_inode(attr.ino, 0, 0);
             }
