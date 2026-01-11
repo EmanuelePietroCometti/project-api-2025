@@ -2,7 +2,7 @@ use crate::file_api::{DirectoryEntry, FileApi};
 use anyhow::Result;
 use fuser015::{
     spawn_mount2, FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, ReplyStatfs
 };
 use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use rust_socketio::{ClientBuilder, Payload};
@@ -1107,7 +1107,7 @@ impl Filesystem for RemoteFs {
         reply.attr(&self.state.cache_ttl, &attr);
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser015::ReplyStatfs) {
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         if cfg!(debug_assertions) {
             println!("[STATFS] Statfs called");
         }
@@ -1426,6 +1426,7 @@ impl Filesystem for RemoteFs {
         let fh = self.state.alloc_fh();
 
         let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+        let is_trunc = (flags & libc::O_TRUNC) != 0;
 
         if wants_write {
             if cfg!(debug_assertions) {
@@ -1446,47 +1447,26 @@ impl Filesystem for RemoteFs {
                 reply.error(libc::EIO);
                 return;
             }
-            if let Some(path) = self.path_of(ino) {
-                if cfg!(debug_assertions) {
-                    println!(
-                        "[OPEN] Loading existing file data into tempfile for path: {:?}",
-                        path
-                    );
-                }
-                let Some(attr) = self.state.get_attr(&path) else {
-                    if cfg!(debug_assertions) {
-                        eprintln!("[OPEN] Attributes not found in cache for path: {:?}", path);
-                    }
-                    reply.error(ENOENT);
-                    return;
-                };
-                let rel = Self::rel_for_db(&path);
-                if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
-                    if cfg!(debug_assertions) {
-                        println!(
-                            "[OPEN] Writing {} bytes to tempfile at path: {:?}",
-                            bytes.len(),
-                            temp_path
-                        );
-                    }
-                    if let Ok(mut f) = File::options().write(true).open(&temp_path) {
-                        if cfg!(debug_assertions) {
-                            println!(
-                                "[OPEN] Opened tempfile for writing at path: {:?}",
-                                temp_path
-                            );
+            let mut initial_size = 0;
+            if !is_trunc {
+                if let Some(path) = self.path_of(ino) {
+                    if let Some(attr) = self.state.get_attr(&path) {
+                        let rel = Self::rel_for_db(&path);
+                        if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
+                            if let Ok(mut f) = File::options().write(true).open(&temp_path) {
+                                let _ = f.write_all(&bytes);
+                                initial_size = bytes.len() as u64;
+                            }
                         }
-                        let _ = f.write_all(&bytes);
                     }
                 }
+                self.state.insert_write_tempfile(fh, temp_path, false);
+            } else {
+                self.state.insert_write_tempfile(fh, temp_path, true);
             }
-            if cfg!(debug_assertions) {
-                println!(
-                    "[OPEN] Inserting write tempfile into state for fh: {}, path: {:?}",
-                    fh, temp_path
-                );
-            }
-            self.state.insert_write_tempfile(fh, temp_path, true);
+            self.state.with_write_mut(fh, |tw| {
+                tw.size = initial_size;
+            });
         }
         if cfg!(debug_assertions) {
             println!("[OPEN] File opened with fh: {}", fh);
