@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use reqwest::{Body, Client};
 use serde::Deserialize;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use urlencoding::encode;
@@ -240,12 +240,18 @@ impl FileApi {
             .send()
             .await?;
         let status = resp.status();
-        if status.is_success(){
-            let v = resp.json::<DirectoryEntry>().await?;
-            Ok(v)
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            match serde_json::from_str::<DirectoryEntry>(&text) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(anyhow!("JSON structure mismatch: {}. Body: {}", e, text)),
+            }
         } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!("get updated metadata failed: {} - {}", status, text))
+            Err(anyhow!(
+                "Get updated metadata failed: {} - {}",
+                status,
+                text
+            ))
         }
     }
 
@@ -320,5 +326,31 @@ impl FileApi {
         }
 
         Ok(result)
+    }
+
+    pub async fn health(ip: &str) -> anyhow::Result<(), anyhow::Error> {
+        let url = format!("http://{}:3001/health", ip);
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .build()?;
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend unreachable at IP address {}", ip))?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            if body["service"] == "project-api-2025" {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Correct IP address, wrong service 'project-api-2025'",
+                ))
+            }
+        } else {
+            Err(anyhow!("Backend answered with error: {}", resp.status()))
+        }
     }
 }

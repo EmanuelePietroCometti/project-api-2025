@@ -22,6 +22,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
+use std::process::Command;
 
 const TTL: Duration = Duration::from_millis(2000);
 
@@ -1531,6 +1532,26 @@ impl Filesystem for RemoteFs {
     }
 }
 
+pub fn is_mountpoint_busy(path: &str) -> bool {
+    let output = Command::new("lsof")
+        .arg("+D")
+        .arg(path)
+        .output();
+
+    match output {
+        Ok(out) => {
+            out.status.success()
+        }
+        Err(_) => {
+            Command::new("fuser")
+                .arg(path)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+}
+
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
 
@@ -1570,17 +1591,26 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     {
         let tx = tx.clone();
         let shutting_down = shutting_down.clone();
+        let mp_for_signals = mp.clone();
         thread::spawn(move || {
             for _sig in signals.forever() {
-                if !shutting_down.swap(true, Ordering::SeqCst) {
-                    let _ = tx.send(());
+                if is_mountpoint_busy(&mp_for_signals) {
+                    eprintln!("\n[STOP] Signal ignored: Mountpoint {} is busy.", mp_for_signals);
+                    eprintln!("Please close open terminals or files in that directory to unmount.");
+                } else {
+                    if !shutting_down.swap(true, Ordering::SeqCst) {
+                        println!("\n[STOP] Mountpoint clear. Initiating safe unmount...");
+                        let _ = tx.send(());
+                        break;
+                    }
                 }
             }
         });
     }
 
     let _ = rx.recv();
+    println!("Unmounting filesystem...");
     let _ = bg_session.join();
-
+    println!("Filesystem unmounted successfully.");
     Ok(())
 }

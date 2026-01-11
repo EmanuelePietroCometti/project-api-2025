@@ -1,5 +1,5 @@
 use anyhow::Result;
-use frontend::{file_api::FileApi, mount_fs};
+use frontend::{file_api::FileApi, is_mountpoint_busy, mount_fs};
 use std::{
     env, fs,
     io::{self, Write},
@@ -51,7 +51,19 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     if args.contains(&"--stop".to_string()) {
-        println!("Unmounting remote filsystem...");
+        println!("Checking if the filesystem is busy...");
+
+        let home_dir = dirs::home_dir().expect("Failed to get home directory");
+        let mp = home_dir.join("mnt").join("remote-fs");
+        let mp_str = mp.to_string_lossy();
+
+        if is_mountpoint_busy(&mp_str) {
+            eprintln!("Error: The filesystem at {} is currently busy.", mp_str);
+            eprintln!("Please close any open terminals or applications using this directory and try again.");
+            return Ok(());
+        }
+
+        println!("Unmounting remote filesystem...");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return stop_deamon();
         #[cfg(target_os = "windows")]
@@ -64,9 +76,19 @@ fn main() -> Result<(), anyhow::Error> {
     std::io::stdin().read_line(&mut ip_address)?;
     let ip = ip_address.trim().to_string();
 
-    ip.parse::<IpAddr>()
-        .map_err(|_| anyhow::anyhow!("Invalid IP format"))?;
+    let ip_result = ip
+        .parse::<IpAddr>()
+        .map_err(|_| anyhow::anyhow!("Invalid IP format"));
 
+    let ip = match ip_result {
+        Ok(ip) => ip.to_string(),
+        Err(e) => {
+            if cfg!(debug_assertions) {
+                eprintln!("[MAIN] Invalid IP address {}", e);
+            }
+            return Err(e);
+        }
+    };
     if args.contains(&"--deamon".to_string()) {
         println!("Mounting remote filsystem...");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -80,13 +102,28 @@ fn main() -> Result<(), anyhow::Error> {
 
 fn start_filesystem(ip: &str) -> anyhow::Result<()> {
     let url = format!("http://{}:3001", ip);
+    let api = FileApi::new(&url);
+    let rt = tokio::runtime::Runtime::new()?;
+    let res = rt.block_on(FileApi::health(ip));
+    match res {
+        Ok(_) => {
+            if cfg!(debug_assertions) {
+                println!("[START_FILESYSTEM] Successfully connected to DB");
+            }
+        }
+        Err(e) => {
+            if cfg!(debug_assertions) {
+                eprintln!("[START_FILESYSTEM] Health check failed: {}", e);
+            }
+            return Err(e);
+        }
+    }
     let home_dir = dirs::home_dir().expect("Failed to get home directory");
     let mp = PathBuf::from(home_dir)
         .join("mnt")
         .join("remote-fs")
         .to_string_lossy()
         .to_string();
-    let api = FileApi::new(&url);
     mount_fs(&mp, api, url)
 }
 

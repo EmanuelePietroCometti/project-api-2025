@@ -3,7 +3,7 @@ use widestring::U16CStr;
 use std::time::Duration;
 use winfsp::filesystem::{DirMarker, FileSecurity, FileSystemContext, OpenFileInfo, FileInfo};
 use winfsp::host::{FileSystemHost, VolumeParams};
-
+use std::process::Command;
 use winfsp::FspError;
 
 pub struct MyFileContext;
@@ -111,6 +111,23 @@ impl FileSystemContext for RemoteFs {
         // -> se è file: PUT /files/<path> con body vuoto
         // TODO: chiamare self.api_create_directory() o self.api_write_file()
         unimplemented!()
+    }
+}
+
+pub fn is_mountpoint_busy(path: &str) -> bool {
+    let script = format!(
+        "if (Get-Process | Where-Object {{ $_.Path -like '*{path}*' -or (Get-WmiObject Win32_Process -Filter \"ProcessId=$($_.Id)\").ExecutablePath -like '*{path}*' }}) {{ exit 0 }} else {{ exit 1 }}",
+        path = path.replace("\\", "\\\\")
+    );
+
+    let output = Command::new("powershell")
+        .arg("-Command")
+        .arg(&script)
+        .output();
+
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
     }
 }
 
