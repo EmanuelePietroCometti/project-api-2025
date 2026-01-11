@@ -85,7 +85,7 @@ router.put("/", async (req, res) => {
       });
     }
 
-    fd = await fs.promises.open(filePathAbs, "a+");
+    fd = await fs.promises.open(filePathAbs, "w+");
 
     let writtenTotal = 0;
     let currentOffset = offset;

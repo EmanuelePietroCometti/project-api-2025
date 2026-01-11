@@ -1041,7 +1041,10 @@ impl Filesystem for RemoteFs {
                     );
                 }
                 if let Some(effective_size) = self.state.with_write_mut(fh_val, |tw| {
-                    tw.size = tw.size.max(new_size);
+                    tw.size = new_size;
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tw.tem_path) {
+                        let _ = f.set_len(new_size);
+                    }
                     tw.size
                 }) {
                     if cfg!(debug_assertions) {
