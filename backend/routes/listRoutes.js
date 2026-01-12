@@ -24,9 +24,7 @@ router.get('/', async (req, res) => {
 router.get("/updatedMetadata", async (req, res) => {
     try {
         let path = req.query.relPath;
-        console.log(" Requested path: ", path);
         if (!path || path === "./storage" || path=="") {
-            console.log(" relpath: ", path);
             path = ".";
         }
         const f = await file.getFileByPath(path);
