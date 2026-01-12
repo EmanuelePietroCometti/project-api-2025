@@ -1163,11 +1163,6 @@ impl Filesystem for RemoteFs {
         name: &std::ffi::OsStr,
         reply: ReplyEntry,
     ) {
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with("._") || name_str == ".DS_Store" || name_str == ".hidden" {
-            reply.error(libc::ENOENT);
-            return;
-        }
         if cfg!(debug_assertions) {
             println!(
                 "[LOOKUP] Lookup called for parent ino: {}, name: {:?}",
@@ -2226,6 +2221,44 @@ impl Filesystem for RemoteFs {
             }
         }
     }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser015::ReplyXattr,
+    ) {
+        reply.error(libc::ENOATTR);
+    }
+
+    fn listxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _size: u32,
+        reply: fuser015::ReplyXattr,
+    ) {
+        reply.size(0);
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.ok();
+    }
 }
 
 pub fn is_mountpoint_busy(path: &str) -> bool {
@@ -2255,8 +2288,6 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
-        MountOption::CUSTOM("noappledouble".to_string()),
-        MountOption::CUSTOM("noapplexattr".to_string()),
     ];
 
     let bg_session = spawn_mount2(remote_fs, &mp, &options).expect("Failed to mount filesystem");
