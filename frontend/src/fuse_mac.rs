@@ -2,8 +2,7 @@ use crate::file_api::{DirectoryEntry, FileApi};
 use anyhow::Result;
 use fuser015::{
     spawn_mount2, FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use rust_socketio::{ClientBuilder, Payload};
@@ -692,62 +691,53 @@ impl RemoteFs {
     pub fn update_cache(&self, dir: &Path) -> anyhow::Result<()> {
         let rel_db = Self::rel_for_db(dir);
         let rel_fs = Self::rel_for_fs(dir);
-
         let list = self.rt.block_on(self.api.ls(&rel_db))?;
+
         self.state
             .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
-
-        let dir_meta = self.rt.block_on(self.api.get_update_metadata(&rel_db))?;
-
-        let mut dir_attr = if let Some(attr) = self.get_attr_cache(dir) {
-            attr
-        } else {
-            self.file_attr(
-                dir,
-                FileType::Directory,
-                dir_meta.size as u64,
-                Some(dir_meta.mtime),
-                0o755,
-                dir_meta.nlink as u32,
-            )
-        };
-
-        dir_attr.nlink = dir_meta.nlink as u32;
-        dir_attr.size = dir_meta.size as u64;
-        dir_attr.mtime = UNIX_EPOCH + Duration::from_secs(dir_meta.mtime as u64);
-
-        self.state.set_attr(dir, dir_attr);
-
-        if let Some(n) = self.notifier.lock().unwrap().as_ref() {
-            let _ = n.inval_inode(dir_attr.ino, 0, 0);
-        }
-
-        for child_de in &list {
-            let mut child_path = PathBuf::from("/");
-            if !rel_fs.is_empty() {
-                child_path.push(&rel_fs);
+        let rel_db_parent = Self::rel_for_db(dir);
+        let de = self
+            .rt
+            .block_on(self.api.get_update_metadata(&rel_db_parent))?;
+        if let Some(mut parent_attr) = self.get_attr_cache(dir) {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[UPDATE_CACHE] Updating parent attr in cache for dir: {:?}",
+                    dir
+                );
             }
-            child_path.push(&child_de.name);
+            parent_attr.nlink = de.nlink as u32;
+            parent_attr.size = de.size as u64;
+            parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
+            self.state.set_attr(dir, parent_attr);
+        } else {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[UPDATE_CACHE] Parent attr not found in cache for dir: {:?}, creating new attr",
+                    dir
+                );
+            }
+        }
+        for de in &list {
+            let mut child = PathBuf::from("/");
+            if !rel_fs.is_empty() {
+                child.push(&rel_fs);
+            }
+            child.push(&de.name);
 
-            let ty = if Self::is_dir(&child_de) {
+            let is_dir = Self::is_dir(&de);
+            let ty = if is_dir {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             };
-            let attr = self.file_attr(
-                &child_path,
-                ty,
-                child_de.size as u64,
-                Some(child_de.mtime),
-                Self::parse_perm(&child_de.permissions),
-                child_de.nlink as u32,
-            );
+            let nlink_child = de.nlink as u32;
 
-            self.state.set_attr(&child_path, attr);
+            let perm = Self::parse_perm(&de.permissions);
+            let size = de.size as u64;
 
-            if let Some(n) = self.notifier.lock().unwrap().as_ref() {
-                let _ = n.inval_inode(attr.ino, 0, 0);
-            }
+            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, nlink_child);
+            self.state.set_attr(&child, attr);
         }
         Ok(())
     }
@@ -1117,7 +1107,7 @@ impl Filesystem for RemoteFs {
         reply.attr(&self.state.cache_ttl, &attr);
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser015::ReplyStatfs) {
         if cfg!(debug_assertions) {
             println!("[STATFS] Statfs called");
         }
@@ -1436,7 +1426,6 @@ impl Filesystem for RemoteFs {
         let fh = self.state.alloc_fh();
 
         let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
-        let is_trunc = (flags & libc::O_TRUNC) != 0;
 
         if wants_write {
             if cfg!(debug_assertions) {
@@ -1457,26 +1446,47 @@ impl Filesystem for RemoteFs {
                 reply.error(libc::EIO);
                 return;
             }
-            let mut initial_size = 0;
-            if !is_trunc {
-                if let Some(path) = self.path_of(ino) {
-                    if let Some(attr) = self.state.get_attr(&path) {
-                        let rel = Self::rel_for_db(&path);
-                        if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
-                            if let Ok(mut f) = File::options().write(true).open(&temp_path) {
-                                let _ = f.write_all(&bytes);
-                                initial_size = bytes.len() as u64;
-                            }
+            if let Some(path) = self.path_of(ino) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[OPEN] Loading existing file data into tempfile for path: {:?}",
+                        path
+                    );
+                }
+                let Some(attr) = self.state.get_attr(&path) else {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[OPEN] Attributes not found in cache for path: {:?}", path);
+                    }
+                    reply.error(ENOENT);
+                    return;
+                };
+                let rel = Self::rel_for_db(&path);
+                if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[OPEN] Writing {} bytes to tempfile at path: {:?}",
+                            bytes.len(),
+                            temp_path
+                        );
+                    }
+                    if let Ok(mut f) = File::options().write(true).open(&temp_path) {
+                        if cfg!(debug_assertions) {
+                            println!(
+                                "[OPEN] Opened tempfile for writing at path: {:?}",
+                                temp_path
+                            );
                         }
+                        let _ = f.write_all(&bytes);
                     }
                 }
-                self.state.insert_write_tempfile(fh, temp_path, false);
-            } else {
-                self.state.insert_write_tempfile(fh, temp_path, true);
             }
-            self.state.with_write_mut(fh, |tw| {
-                tw.size = initial_size;
-            });
+            if cfg!(debug_assertions) {
+                println!(
+                    "[OPEN] Inserting write tempfile into state for fh: {}, path: {:?}",
+                    fh, temp_path
+                );
+            }
+            self.state.insert_write_tempfile(fh, temp_path, true);
         }
         if cfg!(debug_assertions) {
             println!("[OPEN] File opened with fh: {}", fh);
