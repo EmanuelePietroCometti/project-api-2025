@@ -84,8 +84,17 @@ router.put("/", async (req, res) => {
         error: "Parent directory not found. Create the directory first."
       });
     }
-
-    fd = await fs.promises.open(filePathAbs, "w+");
+    const flag = (offset === 0) ? "w+" : "r+";
+    
+    try {
+        fd = await fs.promises.open(filePathAbs, flag);
+    } catch (err) {
+        if (err.code === 'ENOENT') {
+            fd = await fs.promises.open(filePathAbs, "w+");
+        } else {
+            throw err;
+        }
+    }
 
     let writtenTotal = 0;
     let currentOffset = offset;

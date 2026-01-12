@@ -782,6 +782,8 @@ impl RemoteFs {
 
         if s == "/" {
             return "".to_string();
+        } else if s.starts_with("/storage")  {
+            return "".to_string();
         } else {
             let trimmed = s.trim_start_matches("/");
             format!("./{}", trimmed)
