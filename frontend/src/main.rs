@@ -157,7 +157,7 @@ fn stop_service() -> anyhow::Result<()> {
     let pid: i32 = pid_str.trim().parse()?;
 
     unsafe {
-        GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, pid);
+        GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, pid as u32);
     }
 
     println!(

@@ -1,7 +1,7 @@
 use ctrlc;
 use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
-use std::io::{self, Seek, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -2276,7 +2276,9 @@ impl FileSystemContext for RemoteFs {
         })
     }
 
-    fn close(&self, file_context: Self::FileContext) {
+    fn close(&self,
+            file_context: Self::FileContext) 
+    {
         println!(
             "[CLOSE] ⭐⭐⭐ ENTRY ino={} temp_write={}",
             file_context.ino,
@@ -2687,30 +2689,54 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> Result<(), FspError> {
         println!(
-            "[OVERWRITE] ino={} replace_attrs={} allocation_size={}",
+            "[OVERWRITE] ⭐ ino={} replace_attrs={} allocation_size={}",
             context.ino, replace_file_attributes, allocation_size
         );
 
         if let Some(tw) = &context.temp_write {
             println!(
-                "[OVERWRITE] truncating temp file '{}'",
+                "[OVERWRITE] truncating temp file '{}' to 0",
                 tw.tem_path.display()
             );
+            
+            // ✅ FIX: Usa OpenOptions con truncate(true)
             let result = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&tw.tem_path)
-                .and_then(|f| f.set_len(0));
-            if let Err(e) = result {
-                eprintln!("[OVERWRITE] ERROR truncating temp file: {}", e);
-                return Err(FspError::from(io::Error::new(
-                    io::ErrorKind::Other,
-                    e.to_string(),
-                )));
+                .write(true) 
+                .truncate(true) 
+                .open(&tw.tem_path);
+
+            match result {
+                Ok(_) => {
+                    println!("[OVERWRITE] ✅ Temp file truncated successfully");
+                    
+                    // ✅ Aggiorna il FileInfo per riflettere il truncate
+                    file_info.file_size = 0;
+                    file_info.allocation_size = 0;
+                    
+                    // ✅ Aggiorna la cache locale
+                    let path = self.path_of(context.ino).ok_or(FspError::WIN32(
+                        windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
+                    ))?;
+                    
+                    if let Some(mut attr) = self.get_attr_cache(&path) {
+                        attr.size = 0;
+                        attr.blocks = 0;
+                        attr.mtime = SystemTime::now();
+                        attr.ctime = attr.mtime;
+                        self.insert_attr_cache(path, attr);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[OVERWRITE] ❌ ERROR truncating temp file: {}", e);
+                    return Err(FspError::from(io::Error::new(
+                        io::ErrorKind::Other,
+                        e.to_string(),
+                    )));
+                }
             }
-            println!("[OVERWRITE] temp file truncated successfully");
         } else {
-            eprintln!("[OVERWRITE] No temp_write available for truncation");
-            return Err(FspError::WIN32(1));
+            eprintln!("[OVERWRITE] ❌ No temp_write available for truncation");
+            return Err(FspError::WIN32(ERROR_INVALID_PARAMETER));
         }
 
         Ok(())
@@ -3281,8 +3307,22 @@ impl FileSystemContext for RemoteFs {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> WinFspResult<()> {
+
+        if set_allocation_size {
+            println!(
+                "[SET_FILE_SIZE] 🚫 Allocation-only request ignored ({} bytes)",
+                new_size
+            );
+
+            // Aggiorna solo allocation_size (opzionale)
+            file_info.allocation_size =
+                file_info.allocation_size.max(new_size);
+
+            // ⚠️ RETURN IMMEDIATO — niente altro deve essere eseguito
+            return Ok(());
+        }
         println!(
-            "[SET_FILE_SIZE] ⭐ CALLED! ino={} new_size={} set_allocation={} has_temp={}",
+            "[SET_FILE_SIZE] ⭐ ino={} new_size={} set_allocation={} has_temp={}",
             file_context.ino,
             new_size,
             set_allocation_size,
@@ -3292,72 +3332,77 @@ impl FileSystemContext for RemoteFs {
         let path = self.path_of(file_context.ino).ok_or(FspError::WIN32(
             windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
         ))?;
-        let rel = RemoteFs::rel_of(&path);
+
+        // ============================================================
+        // ✅ CASE 1: PRE-ALLOCATION ONLY (DO NOT TOUCH FILE SIZE)
+        // ============================================================
+        if set_allocation_size {
+            println!(
+                "[SET_FILE_SIZE] 📦 Preallocation request: {} bytes (ignored logically)",
+                new_size
+            );
+
+            // Aggiorna solo allocation_size per WinFsp
+            file_info.allocation_size = new_size.max(file_info.allocation_size);
+
+            // NON aggiornare:
+            // - temp file size
+            // - backend
+            // - attr.size
+            // - file_info.file_size
+
+            return Ok(());
+        }
+
+        // ============================================================
+        // ✅ CASE 2: REAL FILE RESIZE (truncate / extend)
+        // ============================================================
 
         if let Some(tw) = &file_context.temp_write {
             println!(
-                "[SET_FILE_SIZE] temp file path: '{}'",
-                tw.tem_path.display()
+                "[SET_FILE_SIZE] ✂️ Resizing TEMP file '{}' to {}",
+                tw.tem_path.display(),
+                new_size
             );
 
-            // ⭐ CRITICO: Controlla se il file temp esiste e leggi il contenuto attuale
-            if tw.tem_path.exists() {
-                let current_size = std::fs::metadata(&tw.tem_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tw.tem_path)
+                .map_err(|e| {
+                    eprintln!("[SET_FILE_SIZE] open temp failed: {}", e);
+                    FspError::from(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
 
-                println!(
-                    "[SET_FILE_SIZE] temp file exists: current_size={} requested_size={}",
-                    current_size, new_size
-                );
-
-                // Se la nuova size è MAGGIORE e il file è vuoto, PowerShell potrebbe star
-                // cercando di allocare spazio per poi scrivere
-                if new_size > current_size && current_size == 0 {
-                    println!("[SET_FILE_SIZE] ⚠️ PowerShell allocating space without write()!");
-                    println!("[SET_FILE_SIZE] This is the echo > file pattern");
-
-                    // NON truncare - lascia il file vuoto
-                    // PowerShell dovrebbe scrivere dopo, ma se non lo fa...
-                    // potremmo dover intercettare in flush() o close()
-                }
-
-                // Esegui il truncate/extend normale
-                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&tw.tem_path) {
-                    if let Err(e) = f.set_len(new_size) {
-                        eprintln!("[SET_FILE_SIZE] failed to set temp file size: {}", e);
-                        return Err(FspError::from(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )));
-                    }
-                    println!("[SET_FILE_SIZE] temp file resized to {}", new_size);
-                }
-
-                // ⭐ VERIFICA POST-RESIZE
-                if let Ok(metadata) = std::fs::metadata(&tw.tem_path) {
-                    println!(
-                        "[SET_FILE_SIZE] temp file after resize: size={}",
-                        metadata.len()
-                    );
-                }
-            } else {
-                eprintln!("[SET_FILE_SIZE] ERROR: temp file doesn't exist!");
-            }
-        }
-
-        // Backend truncate (potrebbe non essere necessario se il file è gestito solo localmente)
-        self.rt
-            .block_on(self.api.truncate(&rel, new_size))
-            .map_err(|e| {
-                eprintln!("[SET_FILE_SIZE] backend truncate failed: {}", e);
+            f.set_len(new_size).map_err(|e| {
+                eprintln!("[SET_FILE_SIZE] set_len failed: {}", e);
                 FspError::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
                 ))
             })?;
+        } else {
+            // Raro: file aperto senza temp_write (read-only path)
+            println!("[SET_FILE_SIZE] ✂️ Resizing BACKEND directly to {}", new_size);
 
-        // Aggiorna cache
+            let rel = RemoteFs::rel_of(&path);
+            self.rt
+                .block_on(self.api.truncate(&rel, new_size))
+                .map_err(|e| {
+                    eprintln!("[SET_FILE_SIZE] backend truncate failed: {}", e);
+                    FspError::from(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
+        }
+
+        // ============================================================
+        // ✅ Update local cache
+        // ============================================================
+
         if let Some(mut attr) = self.get_attr_cache(&path) {
             attr.size = new_size;
             attr.blocks = (new_size + 511) / 512;
@@ -3366,15 +3411,22 @@ impl FileSystemContext for RemoteFs {
             self.insert_attr_cache(path.clone(), attr);
         }
 
+        // ============================================================
+        // ✅ Update WinFsp FileInfo
+        // ============================================================
+
         file_info.file_size = new_size;
         file_info.allocation_size = ((new_size + 4095) / 4096) * 4096;
 
         println!(
-            "[SET_FILE_SIZE] done: file_info.file_size={}",
-            file_info.file_size
+            "[SET_FILE_SIZE] ✅ Done: file_size={} allocation_size={}",
+            file_info.file_size,
+            file_info.allocation_size
         );
+
         Ok(())
     }
+
     fn flush(
         &self,
         file_context: std::option::Option<&MyFileContext>,

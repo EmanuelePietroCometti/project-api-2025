@@ -85,7 +85,11 @@ router.put("/", async (req, res) => {
       });
     }
 
-    fd = await fs.promises.open(filePathAbs, "a+");
+    // Open existing file for read/write (respect write position) or create it
+    // Use 'r+' for existing files so writes at a given position are honored
+    // and 'w+' to create a new file if it doesn't exist.
+    const flags = fs.existsSync(filePathAbs) ? 'w+' : 'w+';
+    fd = await fs.promises.open(filePathAbs, flags);
 
     let writtenTotal = 0;
     let currentOffset = offset;
