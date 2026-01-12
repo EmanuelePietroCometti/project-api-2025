@@ -1,5 +1,5 @@
 use anyhow::Result;
-use frontend::{file_api::FileApi, is_mountpoint_busy, mount_fs};
+use frontend::{file_api::FileApi,mount_fs};
 use std::{
     env, fs,
     io::{self, Write},
@@ -28,7 +28,7 @@ use winapi::um::wincon::GenerateConsoleCtrlEvent;
 fn pid_file() -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push("remote-fs");
-    std::fs::create_dir_all(&dir).ok();
+    let _ = std::fs::create_dir_all(&dir);
     dir.push("pid");
     dir
 }
@@ -43,124 +43,146 @@ fn remove_pid() {
     let _ = std::fs::remove_file(pid_file());
 }
 
-fn main() -> Result<(), anyhow::Error> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() == 2 && !args[1].starts_with("--") {
-        let ip = args[1].trim().to_string();
-        return start_filesystem(&ip);
+fn get_resolved_mountpoint() -> Result<String> {
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Impossibile trovare la Home directory"))?;
+    let mp = home_dir.join("mnt").join("remote-fs");
+    
+    if !mp.exists() {
+        fs::create_dir_all(&mp)?;
+    }
+    
+    Ok(mp.to_string_lossy().to_string())
+}
+
+fn is_mountpoint_busy(path: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("fuser")
+            .arg("-m")
+            .arg(path)
+            .output();
+        return match output {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("lsof")
+            .arg("-wn")
+            .arg("+d")
+            .arg(path)
+            .output();
+        return match output {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "if (Get-Process | Where-Object {{ $_.Path -like '*{path}*' -or (Get-WmiObject Win32_Process -Filter \"ProcessId=$($_.Id)\").ExecutablePath -like '*{path}*' }}) {{ exit 0 }} else {{ exit 1 }}",
+            path = path.replace("\\", "\\\\")
+        );
+        let output = std::process::Command::new("powershell")
+            .arg("-Command")
+            .arg(&script)
+            .output();
+        return match output {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    false
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    let args: Vec<String> = env::args().collect();
+    
     if args.contains(&"--stop".to_string()) {
-        println!("Checking if the filesystem is busy...");
-
-        let home_dir = dirs::home_dir().expect("Failed to get home directory");
-        let mp = home_dir.join("mnt").join("remote-fs");
-        let mp_str = mp.to_string_lossy();
-
-        if is_mountpoint_busy(&mp_str) {
-            eprintln!("Error: The filesystem at {} is currently busy.", mp_str);
-            eprintln!("Please close any open terminals or applications using this directory and try again.");
+        let mp = get_resolved_mountpoint()?;
+        if is_mountpoint_busy(&mp) {
+            eprintln!("Errore: Il filesystem in {} è occupato.", mp);
             return Ok(());
         }
-
-        println!("Unmounting remote filesystem...");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return stop_deamon();
         #[cfg(target_os = "windows")]
         return stop_service();
     }
 
-    let mut ip_address = String::new();
-    print!("Insert the backend IP address: ");
+    let mut ip_input = String::new();
+    print!("Inserisci l'indirizzo IP del backend: ");
     io::stdout().flush()?;
-    std::io::stdin().read_line(&mut ip_address)?;
-    let ip = ip_address.trim().to_string();
+    io::stdin().read_line(&mut ip_input)?;
+    let ip = ip_input.trim().to_string();
 
-    let ip_result = ip
-        .parse::<IpAddr>()
-        .map_err(|_| anyhow::anyhow!("Invalid IP format"));
+    ip.parse::<IpAddr>().map_err(|_| anyhow::anyhow!("Formato IP non valido: {}", ip))?;
 
-    let ip = match ip_result {
-        Ok(ip) => ip.to_string(),
-        Err(e) => {
-            if cfg!(debug_assertions) {
-                eprintln!("[MAIN] Invalid IP address {}", e);
-            }
-            return Err(e);
-        }
-    };
+    let mp = get_resolved_mountpoint()?;
+
     if args.contains(&"--deamon".to_string()) {
-        println!("Mounting remote filsystem...");
+        println!("Avvio del filesystem in background su {}...", mp);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        return run_as_deamon(&ip);
+        return run_as_deamon(&ip, &mp);
+        
         #[cfg(target_os = "windows")]
-        return run_as_service(&ip);
+        return run_as_service(&ip, &mp);
     }
 
-    start_filesystem(&ip)
+    start_filesystem(&ip, &mp)
 }
 
-fn start_filesystem(ip: &str) -> anyhow::Result<()> {
+fn start_filesystem(ip: &str, mp: &str) -> anyhow::Result<()> {
     let url = format!("http://{}:3001", ip);
     let api = FileApi::new(&url);
     let rt = tokio::runtime::Runtime::new()?;
-    let res = rt.block_on(FileApi::health(ip));
-    match res {
-        Ok(_) => {
-            if cfg!(debug_assertions) {
-                println!("[START_FILESYSTEM] Successfully connected to DB");
-            }
-        }
-        Err(e) => {
-            if cfg!(debug_assertions) {
-                eprintln!("[START_FILESYSTEM] Health check failed: {}", e);
-            }
-            return Err(e);
-        }
+    
+    rt.block_on(FileApi::health(ip))?;
+    
+    if cfg!(debug_assertions) {
+        println!("[START] Connesso al backend. Mountpoint: {}", mp);
     }
-    let home_dir = dirs::home_dir().expect("Failed to get home directory");
-    let mp = PathBuf::from(home_dir)
-        .join("mnt")
-        .join("remote-fs")
-        .to_string_lossy()
-        .to_string();
-    mount_fs(&mp, api, url)
+
+    mount_fs(mp, api, url)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_as_deamon(ip: &str) -> anyhow::Result<()> {
+fn run_as_deamon(ip: &str, mp: &str) -> anyhow::Result<()> {
     let daemon = Daemonize::new()
         .pid_file(pid_file())
         .working_directory(env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
         .stdout(fs::File::create("/tmp/remote_fs.out")?)
         .stderr(fs::File::create("/tmp/remote_fs.err")?);
-    daemon
-        .start()
-        .map_err(|e| anyhow::anyhow!("Daemon failed: {}", e))?;
-    write_pid()?;
-    let res = start_filesystem(ip);
+
+    daemon.start().map_err(|e| anyhow::anyhow!("Errore demone: {}", e))?;
+    
+    let _ = write_pid();
+    let res = start_filesystem(ip, mp);
     remove_pid();
     res
 }
 
 #[cfg(target_os = "windows")]
-fn run_as_service(ip: &str) -> anyhow::Result<()> {
+fn run_as_service(ip: &str, mp: &str) -> anyhow::Result<()> {
     let handler = move |event| -> ServiceControlHandlerResult {
         match event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
-                unsafe {
-                    GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, 0);
-                }
+                unsafe { GenerateConsoleCtrlEvent(winapi::um::wincon::CTRL_BREAK_EVENT, 0); }
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NoError,
         }
     };
 
-    service_control_handler::register("RemoteFsService", handler)?;
-
-    write_pid()?;
-    let res = start_filesystem(ip);
+    let _status_handle = service_control_handler::register("RemoteFsService", handler)?;
+    
+    let _ = write_pid();
+    let res = start_filesystem(ip, mp);
     remove_pid();
     res
 }
