@@ -7,14 +7,8 @@ export default function FileDAO() {
         return new Promise((resolve, reject) => {
             const query = 'SELECT * FROM files WHERE parent=?';
             db.all(query, [parent], (err, rows) => {
-                if (err) {
-                    reject(err);
-                }
-                if (!rows) {
-                    resolve({ error: 'Directory not found.' });
-                } else {
-                    resolve(rows);
-                }
+                if (err) return reject(err);
+                resolve(rows || []);
             });
         });
     }
@@ -23,14 +17,8 @@ export default function FileDAO() {
         return new Promise((resolve, reject) => {
             const query = 'SELECT * FROM files WHERE path=?';
             db.get(query, [path], (err, row) => {
-                if (err) {
-                    reject(err);
-                }
-                if (!row) {
-                    resolve({ error: 'Directory not found.' });
-                } else {
-                    resolve(row);
-                }
+                if (err) return reject(err);
+                resolve(row || null);
             });
         });
     };
@@ -40,15 +28,9 @@ export default function FileDAO() {
         const parent_id = await this.getIdByPath(parentPath);
         const query = 'INSERT INTO files(path, parent_id,parent, name, is_dir, size, mtime, permissions, nlink, version) VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, 1)'
         return new Promise((resolve, reject) => {
-            db.run(query, [path, parent_id, parent, name, is_dir, size, mtime, permissions, nlink], (err, row) => {
-                if (err) {
-                    reject(err);
-                }
-                if (!row) {
-                    resolve({ error: 'File not found.' });
-                } else {
-                    resolve();
-                }
+            db.run(query, [path, parent_id, parent, name, is_dir, size, mtime, permissions, nlink], function (err) {
+                if (err) return reject(err);
+                resolve({ id: this.lastID });
             });
         });
     }
@@ -71,14 +53,12 @@ export default function FileDAO() {
         return new Promise((resolve, reject) => {
             const query = 'SELECT * FROM files WHERE path=?';
             db.get(query, [path], (err, row) => {
-
                 if (err) return reject(err);
-                if (!row) return resolve(null);
-                resolve(row.id);
+                resolve(row.id || null);
             });
         });
     }
-    // Aggiorna solo permissions
+
     this.updatePermissions = (path, permissions) => {
         const q = 'UPDATE files SET permissions=?, version=version+1 WHERE path=?';
         return new Promise((resolve, reject) => {

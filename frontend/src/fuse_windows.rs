@@ -16,7 +16,7 @@ use winfsp::filesystem::{
     DirBuffer, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
 };
 use winfsp::host::{FileSystemHost, VolumeParams};
-use winfsp::{FspError, Result as WinFspResult};
+use std::process::Command;use winfsp::{FspError, Result as WinFspResult};
 // API Windows per convertire SDDL -> SECURITY_DESCRIPTOR (self-relative)
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND,

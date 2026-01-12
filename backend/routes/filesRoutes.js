@@ -84,12 +84,17 @@ router.put("/", async (req, res) => {
         error: "Parent directory not found. Create the directory first."
       });
     }
-
-    // Open existing file for read/write (respect write position) or create it
-    // Use 'r+' for existing files so writes at a given position are honored
-    // and 'w+' to create a new file if it doesn't exist.
-    const flags = fs.existsSync(filePathAbs) ? 'w+' : 'w+';
-    fd = await fs.promises.open(filePathAbs, flags);
+    const flag = (offset === 0) ? "w+" : "r+";
+    
+    try {
+        fd = await fs.promises.open(filePathAbs, flag);
+    } catch (err) {
+        if (err.code === 'ENOENT') {
+            fd = await fs.promises.open(filePathAbs, "w+");
+        } else {
+            throw err;
+        }
+    }
 
     let writtenTotal = 0;
     let currentOffset = offset;
