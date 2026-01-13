@@ -43,12 +43,38 @@ fn remove_pid() {
     let _ = std::fs::remove_file(pid_file());
 }
 
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn get_resolved_mountpoint() -> Result<String> {
     let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Impossibile trovare la Home directory"))?;
     let mp = home_dir.join("mnt").join("remote-fs");
     
     if !mp.exists() {
         fs::create_dir_all(&mp)?;
+    }
+    
+    Ok(mp.to_string_lossy().to_string())
+}
+
+#[cfg(target_os="windows")]
+fn get_resolved_mountpoint() -> Result<String> {
+    let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Impossibile trovare la Home directory"))?;
+    let mnt_dir = home_dir.join("mnt");
+    let mp = mnt_dir.join("remote-fs");
+
+    if !mnt_dir.exists() {
+        fs::create_dir_all(&mnt_dir)?;
+    }
+
+    if mp.exists() {
+        println!("[INFO] Il path {} esiste già. Pulizia in corso...", mp.display());
+        if let Err(e) = fs::remove_dir(&mp) {
+            println!("[WARN] remove_dir fallito (motivo: {}). Tento remove_dir_all...", e);
+            if let Err(e2) = fs::remove_dir_all(&mp) {
+                return Err(anyhow::anyhow!("CRITICO: Impossibile liberare il mountpoint {}: {}", mp.display(), e2));
+            }
+        }
+        println!("[INFO] Mountpoint pulito con successo.");
     }
     
     Ok(mp.to_string_lossy().to_string())
