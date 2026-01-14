@@ -299,6 +299,10 @@ impl RemoteFs {
     }
 
     pub fn insert_attr_cache(&self, path: PathBuf, attr: FileAttr) {
+        println!(
+            "[INSERT ATTR CACHE] (path , attr) : ({:?}, {:?}) ",
+            path, attr
+        );
         self.state.set_attr(&path, attr);
     }
 
@@ -331,7 +335,7 @@ impl RemoteFs {
             let mut dircache = self.state.dir_cache.lock().unwrap();
             dircache.insert(parent_key.clone(), (list.clone(), SystemTime::now()));
         }
-
+        let dir_meta = self.rt.block_on(self.api.get_update_metadata(&rel))?; 
         // 4) aggiorna attr_cache in modo coerente e non aggressivo
         let mut attrcache = self.state.attr_cache.lock().unwrap();
         for de in &list {
@@ -352,10 +356,11 @@ impl RemoteFs {
                     NodeType::RegularFile
                 };
                 let perm = Self::parse_perm(&de.permissions);
-                let size = if isdir { 0 } else { de.size.max(0) as u64 };
-                let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+                let size = if isdir { 0 } else { dir_meta.size.max(0) as u64 };
+                let nlink= 1;
+                let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, nlink);
                 println!(
-                    "[INSERT ATTR CACHE] (path , attr) : ({:?}, {:?}) ",
+                    "[INSERT ATTR CACHE/Update] (path , attr) : ({:?}, {:?}) ",
                     child, attr
                 );
                 attrcache.insert(child.clone(), attr);
@@ -460,6 +465,7 @@ impl RemoteFs {
         size: u64,
         mtime: Option<i64>,
         perm: u16,
+        nlink: u32,
     ) -> FileAttr {
         let now = SystemTime::now();
         let mtime_st = mtime
@@ -478,7 +484,7 @@ impl RemoteFs {
             crtime: mtime_st,
             kind: ty,
             perm,
-            nlink: 1,
+            nlink,
             uid,
             gid,
             rdev: 0,
@@ -537,7 +543,7 @@ impl RemoteFs {
                         };
                         let perm = Self::parse_perm(&de.permissions);
                         let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                        let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+                        let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, de.nlink as u32);
                         self.insert_attr_cache(child.clone(), attr);
                     }
                     out.push((child, de));
@@ -613,9 +619,44 @@ impl RemoteFs {
             };
             let perm = Self::parse_perm(&de.permissions);
             let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, de.nlink as u32);
             self.insert_attr_cache(child.clone(), attr);
             out.push((child, de))
+        }
+
+        //aggiorno attr del parent directory
+        let rel_db_parent = Self::rel_of(dir);
+        let de = self
+            .rt
+            .block_on(self.api.get_update_metadata(&rel_db_parent)).unwrap();
+
+        if let Some(mut parent_attr) = self.state.get_attr(dir) {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[DIR_ENTRIES] Updating parent attr in cache for dir: {:?}",
+                    dir
+                );
+            }
+            parent_attr.nlink = de.nlink as u32;
+            parent_attr.size = de.size as u64;
+            parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
+            self.state.set_attr(dir, parent_attr);
+        } else {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[DIR_ENTRIES] Creating new attr in cache for dir: {:?}",
+                    dir
+                );
+            }
+            let attr = self.file_attr(
+                dir,
+                NodeType::Directory,
+                de.size as u64,
+                Some(de.mtime),
+                0o755,
+                de.nlink as u32,
+            );
+            self.state.set_attr(dir, attr);
         }
 
         Ok(out)
@@ -949,7 +990,7 @@ fn normalize_websocket_path(raw: &str) -> String {
 }
 
 /// Estrae i metadati dal payload WebSocket
-fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16)> {
+fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16, i64)> {
     let raw_rel = payload["relPath"].as_str()?;
 
     // 🔴 NORMALIZZA: rimuovi path assoluto Windows se presente
@@ -975,6 +1016,7 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
 
     let perm_str = payload["permissions"].as_str().unwrap_or("644");
     let perm = u16::from_str_radix(perm_str, 8).unwrap_or(0o644);
+    let nlink = payload["nlink"].as_i64().unwrap_or(1);
 
     // Converti path relativo backend ("./a/b") in path canonico Windows (".\\a\\b")
     let abs_path = if rel == "." || rel.is_empty() {
@@ -985,7 +1027,7 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
         PathBuf::from(format!("./{}", rel))
     };
 
-    Some((abs_path, name, is_dir, size, mtime, perm))
+    Some((abs_path, name, is_dir, size, mtime, perm, nlink))
 }
 
 /// Avvia il listener WebSocket per ricevere notifiche di cambiamenti
@@ -1053,7 +1095,7 @@ fn handle_fs_change(payload: &Value, fs_state: &FsState) {
 
 /// Gestisce creazione di file/directory
 fn handle_created(payload: &Value, st: &FsState) {
-    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+    let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
         eprintln!("[WebSocket] handle_created: invalid metadata");
         return;
     };
@@ -1061,7 +1103,7 @@ fn handle_created(payload: &Value, st: &FsState) {
     println!("[WebSocket] CREATE: path={:?} is_dir={}", abs, is_dir);
 
     // Aggiorna cache con nuovi dati
-    let _ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
+    let _ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
 
     // Invalida parent directory (forza rilettura al prossimo accesso)
     if let Some(parent) = abs.parent() {
@@ -1074,7 +1116,7 @@ fn handle_created(payload: &Value, st: &FsState) {
 
 /// Gestisce aggiornamento di file
 fn handle_updated(payload: &Value, st: &FsState) {
-    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
+    let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
         eprintln!("[WebSocket] handle_updated: invalid metadata");
         return;
     };
@@ -1082,7 +1124,7 @@ fn handle_updated(payload: &Value, st: &FsState) {
     println!("[WebSocket] UPDATE: path={:?} size={}", abs, size);
 
     // Aggiorna attributi in cache
-    update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
+    update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
 
     // Invalida parent per forzare refresh visivo in Explorer
     if let Some(parent) = abs.parent() {
@@ -1167,8 +1209,8 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
     };
 
     // Aggiorna metadata del nuovo path
-    if let Some((_, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) {
-        update_cache_from_metadata(st, &new_abs, &name, is_dir, size, mtime, perm);
+    if let Some((_, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) {
+        update_cache_from_metadata(st, &new_abs, &name, is_dir, size, mtime, perm, nlink);
     }
 
     // Rimuovi cache del vecchio path
@@ -1194,12 +1236,15 @@ pub fn update_cache_from_metadata(
     size: u64,
     mtime: i64,
     perm: u16,
+    nlink: i64,
 ) -> u64 {
     let kind = if is_dir {
         NodeType::Directory
     } else {
         NodeType::RegularFile
     };
+
+    let parent = abs.parent().unwrap_or(Path::new("."));
 
     let ino = match st.ino_of(abs) {
         Some(i) => i,
@@ -1219,7 +1264,7 @@ pub fn update_cache_from_metadata(
         crtime: mtime_st,
         kind,
         perm,
-        nlink: if is_dir { 2 } else { 1 },
+        nlink: nlink as u32,
         uid: 0,
         gid: 0,
         rdev: 0,
@@ -1227,14 +1272,23 @@ pub fn update_cache_from_metadata(
         flags: 0,
     };
 
-    st.set_attr(abs, attr);
-
-    // Invalida parent directory cache
-    if let Some(parent) = abs.parent() {
+    if st.get_attr(parent).is_none() {
+        if cfg!(debug_assertions) {
+            println!("[UPDATE_CACHE_FROM_METADATA] Setting attr for new parent present for path: {:?}", abs);
+        }
+        st.set_attr(abs, attr);
+        st.insert_path_mapping(abs, ino);
         st.remove_dir_cache(parent);
+        ino
+    } else {
+        if cfg!(debug_assertions) {
+            println!("[UPDATE_CACHE_FROM_METADATA] Parent exists, updating caches for path: {:?}", abs);
+        }
+        st.remove_attr(parent);
+        st.remove_dir_cache(parent);
+        st.set_attr(abs, attr);
+        ino
     }
-
-    ino
 }
 
 impl FileSystemContext for RemoteFs {
@@ -1613,7 +1667,7 @@ impl FileSystemContext for RemoteFs {
                 NodeType::RegularFile
             };
             let size = if isdir { 0 } else { de.size.max(0) as u64 };
-            let attr = self.file_attr(&child_path, ty, size, Some(de.mtime), perm);
+            let attr = self.file_attr(&child_path, ty, size, Some(de.mtime), perm, de.nlink as u32);
             self.insert_attr_cache(child_path.clone(), attr);
             println!(
                 "[GET_FILE_INFO] attrcache updated for '{}'",
@@ -2140,7 +2194,7 @@ impl FileSystemContext for RemoteFs {
                     let ty = if is_dir { NodeType::Directory } else { NodeType::RegularFile };
                     let perm = Self::parse_perm(&de.permissions);
                     let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                    let a = self.file_attr(&child_path, ty, size, Some(de.mtime), perm);
+                    let a = self.file_attr(&child_path, ty, size, Some(de.mtime), perm, de.nlink as u32);
                     self.insert_attr_cache(child_path.clone(), a.clone());
                     attr = Some(a);
                 }
@@ -2156,7 +2210,7 @@ impl FileSystemContext for RemoteFs {
                         let is_dir = Self::is_dir(&de);
                         let ty = if is_dir { NodeType::Directory } else { NodeType::RegularFile };
                         let perm = Self::parse_perm(&de.permissions);
-                        let a = self.file_attr(&child_path, ty, 0, Some(de.mtime), perm);
+                        let a = self.file_attr(&child_path, ty, 0, Some(de.mtime), perm, de.nlink as u32);
                         self.insert_attr_cache(child_path.clone(), a.clone());
                         a
                     }
@@ -2402,7 +2456,7 @@ impl FileSystemContext for RemoteFs {
                         backend_perm
                     };
                     let perm = final_perm as u16;
-                    let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+                    let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, de.nlink as u32);
                     println!(
                         "[CLOSE] updating attr_cache for '{}' size={}",
                         child.display(),
@@ -2503,7 +2557,7 @@ impl FileSystemContext for RemoteFs {
                         let perm = Self::parse_perm(&de.permissions);
                         let size = if is_dir { 0 } else { de.size.max(0) as u64 };
 
-                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
+                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm, de.nlink as u32);
                         self.insert_attr_cache(path.clone(), a.clone());
                         attr = Some(a);
                     }
@@ -2924,9 +2978,12 @@ impl FileSystemContext for RemoteFs {
                         0,
                         None,
                         0o755,
+                        1,// directory tipicamente 2 link , ma su windows rimane sempre 1
                     );
-                    attr.nlink = 2; // directory tipicamente 2
+                    //attr.nlink = 2; 
                     self.insert_attr_cache(std::path::PathBuf::from(&rel), attr);
+
+
 
                     return Ok(MyFileContext {
                         ino,
@@ -3021,8 +3078,9 @@ impl FileSystemContext for RemoteFs {
                     0,
                     None,
                     desired_mode as u16,
+                    1, // file tipicamente 1 link
                 );
-                attr.nlink = 1;
+                //attr.nlink = 1;
                 self.insert_attr_cache(Path::new(&rel).to_path_buf(), attr);
 
                 // 6. Aggiorna cache parent per rendere visibile la nuova entry
@@ -3083,7 +3141,7 @@ impl FileSystemContext for RemoteFs {
                         };
                         let perm = Self::parse_perm(&de.permissions);
                         let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                        let a = self.file_attr(&p, ty, size, Some(de.mtime), perm);
+                        let a = self.file_attr(&p, ty, size, Some(de.mtime), perm, de.nlink as u32);
                         self.insert_attr_cache(p.clone(), a.clone());
                         a
                     } else {
