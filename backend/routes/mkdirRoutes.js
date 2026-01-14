@@ -11,7 +11,10 @@ const router = express.Router();
 // POST /mkdir/path
 router.post("/", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+     if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const dirPath = path.join(ROOT_DIR, relPath);
     const parentPathAbs = path.dirname(dirPath);
     const parentDirName = path.dirname(relPath);

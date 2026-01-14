@@ -23,7 +23,10 @@ function parseRange(rangeHeader, fileSize) {
 
 router.get("/", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const filePath = path.join(ROOT_DIR, relPath);
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: "File not found" });
@@ -70,7 +73,10 @@ router.put("/", async (req, res) => {
   let fd;
 
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const offset = parseInt(req.query.offset ?? "0", 10);
 
     const filePathAbs = path.join(ROOT_DIR, relPath);
@@ -138,7 +144,10 @@ router.put("/", async (req, res) => {
 // DELETE /files/path
 router.delete("/", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
 
@@ -165,7 +174,10 @@ router.delete("/", async (req, res) => {
 // PATCH /files/chmod?relPath=...&perm=755
 router.patch("/chmod", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const perm = req.query.perm;
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
@@ -180,7 +192,10 @@ router.patch("/chmod", async (req, res) => {
 // PATCH /files/truncate?relPath=...&size=123
 router.patch("/truncate", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const size = parseInt(req.query.size, 10);
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
@@ -205,7 +220,10 @@ router.patch("/truncate", async (req, res) => {
 // PATCH /files/utimes?relPath=...&atime=...&mtime=...
 router.patch("/utimes", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const at = req.query.atime ? parseInt(req.query.atime, 10) : null;
     const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null;
     const filePathAbs = path.join(ROOT_DIR, relPath);
@@ -226,8 +244,14 @@ router.patch("/utimes", async (req, res) => {
 // PATCH /files/rename?oldRelPath=...&newRelPath=... 
 router.patch("/rename", async (req, res) => {
   try {
-    const oldRelPath = req.query.oldRelPath;
-    const newRelPath = req.query.newRelPath;
+    let oldRelPath = req.query.oldRelPath;
+    if (oldRelPath.startsWith('././')) {
+      oldRelPath = oldRelPath.slice(2);
+    }
+    let newRelPath = req.query.newRelPath;
+     if (newRelPath.startsWith('././')) {
+      newRelPath = newRelPath.slice(2);
+    }
     if (!oldRelPath || !newRelPath) {
       return res.status(400).json({ error: "Missing oldRelPath or newRelPath" });
     }

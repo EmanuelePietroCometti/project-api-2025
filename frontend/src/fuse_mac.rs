@@ -783,7 +783,9 @@ impl RemoteFs {
         if s == "/" {
             return "".to_string();
         }
-         else {
+        if s.starts_with("./") {
+            s.to_string()
+        } else {
             let trimmed = s.trim_start_matches("/");
             format!("./{}", trimmed)
         }
@@ -2289,6 +2291,8 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
+        MountOption::CUSTOM("volname=RemoteFiles".to_string()),
+        MountOption::CUSTOM("local".to_string()),
     ];
 
     let bg_session = spawn_mount2(remote_fs, &mp, &options).expect("Failed to mount filesystem");
