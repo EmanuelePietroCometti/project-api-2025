@@ -153,7 +153,7 @@ fn stop_daemon() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn run_as_detached_windows(ip: &str, mp: &str) -> anyhow::Result<()> {
+fn run_as_detached_windows(ip: &str, _mp: &str) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     
     let child = std::process::Command::new(std::env::current_exe()?)

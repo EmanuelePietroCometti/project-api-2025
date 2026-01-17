@@ -1,58 +1,47 @@
 use ctrlc;
 use std::collections::{HashMap, HashSet};
-use std::fs::FileType;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-//use std::time::SystemTime;
 use std::{ffi::c_void, ptr};
 use tokio::runtime::Runtime;
 use widestring::{U16CStr, U16CString};
 use winfsp::filesystem::{
-    DirBuffer, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
+    DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
 };
 use winfsp::host::{FileSystemHost, VolumeParams};
-use std::process::Command;use winfsp::{FspError, Result as WinFspResult};
-// API Windows per convertire SDDL -> SECURITY_DESCRIPTOR (self-relative)
+use winfsp::{FspError, Result as WinFspResult};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND,
-    ERROR_INVALID_PARAMETER, ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED, HLOCAL, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_INVALID_PARAMETER, HLOCAL, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_WRITE_DATA,
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+    FILE_WRITE_DATA,
 };
-//use windows_sys::Win32::System::IO::CREATE_DIRECTORY;
 use winfsp::filesystem::DirInfo;
 use winfsp_sys::FILE_FLAGS_AND_ATTRIBUTES;
 use winfsp_sys::FspCleanupDelete;
-
-use std::mem::{size_of, zeroed};
-use std::ptr::addr_of_mut;
 use std::slice;
 use winfsp_sys::{FSP_FSCTL_DIR_INFO, FspFileSystemAddDirInfo};
-//use std::cmp::Ordering;
 use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+
 pub struct MyFileContext {
     pub ino: u64,
-    pub temp_write: Option<TempWrite>, // Some se stiamo scrivendo, None se solo lettura
+    pub temp_write: Option<TempWrite>,
     pub delete_on_close: AtomicBool,
-    pub allow_delete: bool,
     pub is_dir: bool,
-    pub needs_truncate: AtomicBool,
     pub access_mask: u32,
 }
-//per la definizione fileAttr di file o directory
+
 #[derive(Clone, Debug)]
 enum NodeType {
     Directory,
@@ -63,14 +52,14 @@ use crate::file_api::{DirectoryEntry, FileApi};
 const TTL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
-struct TempWrite {
-    tem_path: PathBuf,
-    size: u64,
+pub struct TempWrite {
+    pub tem_path: PathBuf,
+    pub _size: u64,
 }
 
-// Definisco un FileAttr locale (simile a fuse::FileAttr).
 #[derive(Clone, Debug)]
-struct FileAttr {
+#[allow(dead_code)]
+pub struct FileAttr {
     ino: u64,
     size: u64,
     blocks: u64,
@@ -112,8 +101,6 @@ impl FsState {
     pub fn new() -> Self {
         let mut ino_by_path = HashMap::new();
         let mut path_by_ino = HashMap::new();
-
-        // Root sempre con inode 1
         ino_by_path.insert(PathBuf::from("."), 1);
         path_by_ino.insert(1, PathBuf::from("."));
 
@@ -125,7 +112,7 @@ impl FsState {
             writes: Arc::new(Mutex::new(HashMap::new())),
             next_ino: Arc::new(Mutex::new(2)),
             already_deleted: Arc::new(Mutex::new(HashSet::new())),
-            cache_ttl: Duration::from_secs(300),
+            cache_ttl: TTL,
         }
     }
 
@@ -195,11 +182,6 @@ impl FsState {
     }
 
     // ---- CACHE DIRECTORY ----
-
-    pub fn get_dir_cache(&self, path: &Path) -> Option<(Vec<DirectoryEntry>, SystemTime)> {
-        self.dir_cache.lock().unwrap().get(path).cloned()
-    }
-
     pub fn set_dir_cache(&self, path: &Path, data: (Vec<DirectoryEntry>, SystemTime)) {
         self.dir_cache
             .lock()
@@ -218,40 +200,10 @@ impl FsState {
         self.dir_cache.lock().unwrap().clear();
     }
 
-    pub fn clear_cache(&self, path: Option<&Path>) {
-        match path {
-            Some(p) => {
-                self.remove_attr(p);
-                self.remove_dir_cache(p);
-            }
-            None => {
-                self.clear_all_cache();
-            }
-        }
-    }
-
-    // ---- WRITE TRACKING ----
-
-    pub fn insert_write(&self, ino: u64, tw: TempWrite) {
-        self.writes.lock().unwrap().insert(ino, tw);
-    }
-
-    pub fn get_write(&self, ino: u64) -> Option<TempWrite> {
-        self.writes.lock().unwrap().get(&ino).cloned()
-    }
-
-    pub fn remove_write(&self, ino: u64) -> Option<TempWrite> {
-        self.writes.lock().unwrap().remove(&ino)
-    }
-
     // ---- DELETED TRACKING ----
 
     pub fn mark_deleted(&self, ino: u64) {
         self.already_deleted.lock().unwrap().insert(ino);
-    }
-
-    pub fn is_deleted(&self, ino: u64) -> bool {
-        self.already_deleted.lock().unwrap().contains(&ino)
     }
 }
 
@@ -264,12 +216,7 @@ struct RemoteFs {
     rt: Arc<Runtime>,
 }
 
-// Costanti WinAPI che non sempre sono re-esportate dal crate
-//const FILE_WRITE_DATA: u32 = 0x0002;
-const CREATE_DIRECTORY: u32 = 0x00000001; //TODO poi da provare ad usare un import
-//const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;
-const FSP_CLEANUP_DELETE: u32 = 0x20; //TODO vedere se si riesce ad importare
-//const DELETE: u32 = 0x0001_0000; //TODO vedere se si riesce ad importare
+const CREATE_DIRECTORY: u32 = 0x00000001;
 
 impl RemoteFs {
     fn new(api: FileApi, rt: Arc<Runtime>) -> Self {
@@ -279,8 +226,6 @@ impl RemoteFs {
             rt,
         }
     }
-
-    // Tutti i metodi ora usano self.state invece di accedere direttamente ai campi
 
     fn alloc_ino(&self, path: &Path) -> u64 {
         self.state.allocate_ino(path)
@@ -310,36 +255,19 @@ impl RemoteFs {
         self.state.set_dir_cache(&path, data);
     }
 
-    pub fn get_dir_cache(&self, path: &Path) -> Option<(Vec<DirectoryEntry>, SystemTime)> {
-        let cache_entry = self.state.get_dir_cache(path);
-        if let Some((_, ts)) = &cache_entry {
-            if !self.is_cache_valid(*ts) {
-                return None;
-            }
-        }
-        cache_entry
-    }
-
-    // Funzione che effettua l'aggiornamento della cache
-    // Viene chiamata dopo operazioni di scrittura, creazione o cancellazione
     pub fn update_cache(&self, dir: &Path) -> anyhow::Result<()> {
-        // 1) chiave canonica per il parent
-        let rel = Self::rel_of(dir); // "." oppure "./a/b"
+        let rel = Self::rel_of(dir);
         let parent_key = PathBuf::from(rel.clone());
 
-        // 2) backend refresh
         let list = self.rt.block_on(self.api.ls(&rel))?;
 
-        // 3) aggiorna dir_cache con chiave canonica
         {
             let mut dircache = self.state.dir_cache.lock().unwrap();
             dircache.insert(parent_key.clone(), (list.clone(), SystemTime::now()));
         }
         let dir_meta = self.rt.block_on(self.api.get_update_metadata(&rel))?; 
-        // 4) aggiorna attr_cache in modo coerente e non aggressivo
         let mut attrcache = self.state.attr_cache.lock().unwrap();
         for de in &list {
-            // sempre forma "./..." per i figli
             let child = if rel == "." || rel.is_empty() {
                 PathBuf::from(format!("./{}", de.name))
             } else {
@@ -370,10 +298,6 @@ impl RemoteFs {
         Ok(())
     }
 
-    pub fn is_cache_valid(&self, timestamp: SystemTime) -> bool {
-        SystemTime::now().duration_since(timestamp).unwrap() < self.state.cache_ttl
-    }
-
     fn sd_from_sddl(sddl: &str) -> anyhow::Result<Vec<u8>> {
         let sddl_u16 = U16CString::from_str(sddl)?;
         let mut sd_ptr: *mut c_void = ptr::null_mut();
@@ -381,7 +305,7 @@ impl RemoteFs {
         let ok = unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl_u16.as_ptr(),
-                1, // SDDL_REVISION_1
+                1,
                 (&mut sd_ptr as *mut *mut c_void).cast(),
                 &mut sd_size as *mut u32,
             )
@@ -396,41 +320,14 @@ impl RemoteFs {
         }
         Ok(bytes)
     }
-    /*
-        fn alloc_ino(&self, path: &Path) -> u64 {
-            if let Some(ino) = self.state.ino_by_path.lock().unwrap().get(path).cloned() {
-                return ino;
-            }
-            let mut next_ino = self.state.next_ino.lock().unwrap();
-            let ino = *next_ino;
-            *next_ino += 1;
-            self.state.ino_by_path
-                .lock()
-                .unwrap()
-                .insert(path.to_path_buf(), ino);
-            self.state.path_by_ino
-                .lock()
-                .unwrap()
-                .insert(ino, path.to_path_buf());
-            ino
-        }
-
-        fn path_of(&self, ino: u64) -> Option<PathBuf> {
-            self.state.path_by_ino.lock().unwrap().get(&ino).cloned()
-        }
-    */
+    
     fn rel_of(path: &Path) -> String {
-        // to_string_lossy è sufficiente qui perché lavori con componenti ASCII del FS virtuale
         let mut s = path.to_string_lossy().replace('\\', "/");
-
-        // Root o vuoto -> "."
         if s.is_empty() || s == "/" {
             return ".".to_string();
         }
 
-        // Se è già relativo canonico che inizia con '.'
         if s.starts_with('.') {
-            // Normalizza: elimina sequenze "././" in testa e "/." in coda
             while s.starts_with("././") {
                 s = format!("./{}", &s[4..]);
             }
@@ -446,7 +343,6 @@ impl RemoteFs {
             return s;
         }
 
-        // Se arriva come assoluto "/a/b" -> "./a/b"
         if s.starts_with('/') {
             s = s.trim_start_matches('/').to_string();
         }
@@ -506,11 +402,8 @@ impl RemoteFs {
 
     fn dir_entries(&self, dir: &Path) -> WinFspResult<Vec<(PathBuf, DirectoryEntry)>> {
         let rel = Self::rel_of(dir);
-        //let rel=dir;
 
         println!("[DEBUG] dir_entries(): chiamata backend -> rel='{}'", rel);
-        //1) prova cache directory
-
         if let Some((entries, ts)) = self
             .state
             .dir_cache
@@ -552,11 +445,9 @@ impl RemoteFs {
             }
         }
 
-        //2) se non trovata in cache chiamo il backend
         let list_res = self.rt.block_on(self.api.ls(&rel));
 
         match &list_res {
-            //lo uso solo per il print
             Ok(list) => {
                 println!("[DEBUG] dir_entries(): backend OK ({} entries)", list.len());
                 for (i, de) in list.iter().enumerate() {
@@ -576,27 +467,10 @@ impl RemoteFs {
             FspError::from(io_err)
         })?;
 
-        //aggiorno cache directory
         self.insert_dir_cache(PathBuf::from(&rel), (list.clone(), SystemTime::now()));
-
-        //costruisco out e pre-popolo attr_cache per i figli
 
         let mut out = Vec::with_capacity(list.len());
 
-        // Normalizza il path base ma è già fatto da rel of provare con print
-        /*
-        let base_path = if dir == Path::new("/") || dir.to_string_lossy() == "/" {
-            PathBuf::from("/")
-        } else {
-            // Assicurati che inizi con / e normalizza
-            let s = dir.to_string_lossy();
-            let normalized = if s.starts_with('/') {
-                s.to_string()
-            } else {
-                format!("/{}", s.trim_start_matches("./"))
-            };
-            PathBuf::from(normalized)
-        };*/
         println!(
             "[DIR_ENTRIES] path utilizzato caso no cache per file attr {}",
             rel
@@ -624,7 +498,6 @@ impl RemoteFs {
             out.push((child, de))
         }
 
-        //aggiorno attr del parent directory
         let rel_db_parent = Self::rel_of(dir);
         let de = self
             .rt
@@ -663,33 +536,24 @@ impl RemoteFs {
     }
 
     fn path_from_u16(&self, path: &U16CStr) -> String {
-        // Converti U16CStr -> OsString -> String lossily
         let raw = path.to_os_string().to_string_lossy().to_string();
         println!("[DEBUG] path_from_u16 RAW input: '{}'", raw);
 
         let mut s = raw;
 
-        // Normalizza separatori Windows -> Unix
         if s.contains('\\') {
             s = s.replace('\\', "/");
         }
-
-        // Rimuovi eventuali doppie slash
         while s.contains("//") {
             s = s.replace("//", "/");
         }
 
-        // Se la stringa è vuota -> root
         if s.is_empty() {
             return "/".to_string();
         }
-
-        // Assicurati leading slash
         if !s.starts_with('/') {
             s = format!("/{}", s);
         }
-
-        // Rimuovi trailing slash eccetto per root
         if s.len() > 1 && s.ends_with('/') {
             s.truncate(s.len() - 1);
         }
@@ -703,19 +567,13 @@ impl RemoteFs {
         p
     }
 
-    /// Helper: verifica se l'entry esiste nel backend (usa ls sul parent e cerca il nome)
     fn backend_entry_exists(&self, path: &str) -> bool {
-        // rel è già nel formato corretto: "." o "./subdir/qualcosa"
         let rel_path = Path::new(path);
-
-        // Calcola il parent relativo — se vuoto, usa "."
         let parent_rel = rel_path
             .parent()
             .map(|pp| pp.to_string_lossy().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ".".to_string());
-
-        // Estrai il nome del file o directory
         let name = rel_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -749,7 +607,6 @@ impl RemoteFs {
     }
 
     fn nt_time_from_system_time(t: SystemTime) -> u64 {
-        // NT epoch 1601-01-01 to Unix epoch 1970-01-01 in 100ns ticks
         const SECS_BETWEEN_EPOCHS: u64 = 11644473600;
         const HUNDRED_NS_PER_SEC: u64 = 10_000_000;
 
@@ -763,12 +620,7 @@ impl RemoteFs {
         }
     }
 
-    fn is_directory_from_permissions(p: &str) -> bool {
-        p.chars().next().unwrap_or('-') == 'd'
-    }
-
     fn evict_all_state_for(&self, path: &str) {
-        //liberi la cache, mapping e temp write
         let path_buf = std::path::PathBuf::from(path);
         if let Some(ino) = self.state.ino_by_path.lock().unwrap().remove(&path_buf) {
             self.state.path_by_ino.lock().unwrap().remove(&ino);
@@ -781,32 +633,12 @@ impl RemoteFs {
 
     fn can_delete(
         &self,
-        file_context: &MyFileContext,
-        //file_name: Option<&U16CStr>,
+        _file_context: &MyFileContext,
         rel: String,
     ) -> WinFspResult<()> {
         println!("[CAN_DELETE] enter");
-
-        // Risolvi path
-        /*  let path = if let Some(name) = file_name {
-            let p = self.path_from_u16(name);
-            println!("[CAN_DELETE] file_name provided -> path_from_u16 = {}", p);
-            p
-        } else {
-            let p = self
-                .path_of(file_context.ino)
-                .map(|p| p.to_string_lossy().to_string())
-                .ok_or(FspError::WIN32(
-                    windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
-                ))?;
-            println!("[CAN_DELETE] no file_name, path_of(ino={}) = {}", file_context.ino, p);
-            p
-        };
-
-        let rel = RemoteFs::rel_of(std::path::Path::new(&path));*/
         println!("[CAN_DELETE] rel = '{}'", rel);
 
-        // Root non cancellabile
         if rel == "." {
             println!("[CAN_DELETE] rel='.' => deny delete: ERROR_ACCESS_DENIED");
             return Err(FspError::WIN32(
@@ -814,7 +646,6 @@ impl RemoteFs {
             ));
         }
 
-        // Determina parent e name
         let parent_rel = std::path::Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -829,8 +660,6 @@ impl RemoteFs {
             "[CAN_DELETE] parent_rel='{}', name_only='{}'",
             parent_rel, name_only
         );
-
-        // Lista parent per trovare la dirent
         let list = match self.rt.block_on(self.api.ls(&parent_rel)) {
             Ok(v) => {
                 println!(
@@ -876,7 +705,6 @@ impl RemoteFs {
 
         if is_dir {
             println!("[CAN_DELETE] directory case -> check emptiness for RemoveDirectory");
-            // Directory: deve essere vuota
             let children = match self.rt.block_on(self.api.ls(&rel)) {
                 Ok(v) => {
                     println!(
@@ -908,24 +736,20 @@ impl RemoteFs {
             println!("[CAN_DELETE] file case -> allow delete-on-close");
         }
 
-        // Se arrivi qui, WinFsp marcherà delete-on-close (per questa open) e la cancellazione dovrà avvenire in Cleanup con FspCleanupDelete.
         println!(
             "[CAN_DELETE] accept -> return Ok (WinFsp will signal FspCleanupDelete at Cleanup)"
         );
         Ok(())
     }
 
-    //per trasformare il tempo da u64 a Systime
     fn filetime_to_systemtime(ft: u64) -> Option<SystemTime> {
         if ft == 0 {
             return None;
         }
-        // FILETIME = 100ns ticks since 1601
         let duration = Duration::from_nanos(ft * 100);
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(11644473600) + duration)
     }
 
-    // Helpers locali
     fn split_parent_name(rel: &str) -> (String, String) {
         let p = Path::new(rel);
         let parent = p
@@ -939,61 +763,38 @@ impl RemoteFs {
             .unwrap_or_default();
         (parent, name)
     }
-
-    // Mappa errori backend (stub)
-    fn map_backend_err<E: std::fmt::Display>(_: E) -> FspError {
-        FspError::WIN32(ERROR_ACCESS_DENIED)
-    }
-
-    fn block_on<T>(rt: &tokio::runtime::Runtime, fut: impl std::future::Future<Output = T>) -> T {
-        rt.block_on(fut)
-    }
 }
 
-/// Normalizza path ricevuti dal WebSocket (gestisce path assoluti errati)
 fn normalize_websocket_path(raw: &str) -> String {
-    // Caso 1: Path già corretto "./file.txt"
     if raw.starts_with("./") || raw == "." {
         return raw.to_string();
     }
 
-    // Caso 2: Path assoluto Windows "C:\Users\...\storage\file.txt"
-    // Estrai solo la parte dopo "storage"
     if raw.contains("\\storage\\") || raw.contains("/storage/") {
-        // Trova l'indice di "storage"
         let storage_idx = raw.rfind("storage").unwrap_or(0);
 
         if storage_idx > 0 {
-            // Salta "storage\" o "storage/"
-            let after_storage = &raw[storage_idx + 7..]; // 7 = len("storage")
+            let after_storage = &raw[storage_idx + 7..];
             let clean = after_storage.trim_start_matches(['/', '\\']);
 
             if clean.is_empty() {
                 return ".".to_string();
             }
-
-            // Normalizza separatori e aggiungi prefisso
             let normalized = clean.replace('\\', "/");
             return format!("./{}", normalized);
         }
     }
 
-    // Caso 3: Path relativo senza prefisso "file.txt" -> "./file.txt"
     if !raw.starts_with('/') && !raw.contains(":\\") {
         let normalized = raw.replace('\\', "/");
         return format!("./{}", normalized);
     }
-
-    // Fallback: ritorna invariato con warning
     eprintln!("[WebSocket] WARNING: Unhandled path format: '{}'", raw);
     raw.to_string()
 }
 
-/// Estrae i metadati dal payload WebSocket
 fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16, i64)> {
     let raw_rel = payload["relPath"].as_str()?;
-
-    // 🔴 NORMALIZZA: rimuovi path assoluto Windows se presente
     let rel = normalize_websocket_path(raw_rel);
 
     println!(
@@ -1018,7 +819,6 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
     let perm = u16::from_str_radix(perm_str, 8).unwrap_or(0o644);
     let nlink = payload["nlink"].as_i64().unwrap_or(1);
 
-    // Converti path relativo backend ("./a/b") in path canonico Windows (".\\a\\b")
     let abs_path = if rel == "." || rel.is_empty() {
         PathBuf::from(".")
     } else if rel.starts_with("./") {
@@ -1030,7 +830,6 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
     Some((abs_path, name, is_dir, size, mtime, perm, nlink))
 }
 
-/// Avvia il listener WebSocket per ricevere notifiche di cambiamenti
 pub fn start_websocket_listener(api_url: &str, fs_state: Arc<FsState>) {
     let ws_url = format!("{}/socket.io/", api_url.trim_end_matches('/'));
 
@@ -1068,7 +867,6 @@ pub fn start_websocket_listener(api_url: &str, fs_state: Arc<FsState>) {
     });
 }
 
-/// Dispatcher principale per eventi fs_change
 fn handle_fs_change(payload: &Value, fs_state: &FsState) {
     let op = payload["op"].as_str().unwrap_or("");
 
@@ -1093,7 +891,6 @@ fn handle_fs_change(payload: &Value, fs_state: &FsState) {
     }
 }
 
-/// Gestisce creazione di file/directory
 fn handle_created(payload: &Value, st: &FsState) {
     let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
         eprintln!("[WebSocket] handle_created: invalid metadata");
@@ -1102,19 +899,14 @@ fn handle_created(payload: &Value, st: &FsState) {
 
     println!("[WebSocket] CREATE: path={:?} is_dir={}", abs, is_dir);
 
-    // Aggiorna cache con nuovi dati
     let _ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
 
-    // Invalida parent directory (forza rilettura al prossimo accesso)
     if let Some(parent) = abs.parent() {
         st.remove_dir_cache(parent);
         println!("[WebSocket] Invalidated parent dir cache: {:?}", parent);
     }
-
-    // IMPORTANTE: Windows/Explorer leggerà i nuovi dati al prossimo readdir/getattr
 }
 
-/// Gestisce aggiornamento di file
 fn handle_updated(payload: &Value, st: &FsState) {
     let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
         eprintln!("[WebSocket] handle_updated: invalid metadata");
@@ -1123,16 +915,13 @@ fn handle_updated(payload: &Value, st: &FsState) {
 
     println!("[WebSocket] UPDATE: path={:?} size={}", abs, size);
 
-    // Aggiorna attributi in cache
     update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
 
-    // Invalida parent per forzare refresh visivo in Explorer
     if let Some(parent) = abs.parent() {
         st.remove_dir_cache(parent);
     }
 }
 
-/// Gestisce cancellazione
 fn handle_deleted_event(payload: &Value, st: &FsState) {
     if let Some(rel) = payload["relPath"].as_str() {
         let abs = if rel == "." || rel.is_empty() {
@@ -1151,19 +940,14 @@ fn handle_deleted_event(payload: &Value, st: &FsState) {
     }
 }
 
-/// Rimuove tutti gli stati per un path cancellato
 fn handle_deleted_path(abs: &Path, st: &FsState) {
-    // Marca come cancellato PRIMA di rimuovere
     if let Some(ino) = st.ino_of(abs) {
         st.mark_deleted(ino);
         println!("[WebSocket] Marked inode {} as deleted", ino);
     }
-
-    // Rimuovi mapping e cache
     st.remove_path(abs);
     st.remove_attr(abs);
 
-    // Invalida parent directory (critico per Explorer)
     if let Some(parent) = abs.parent() {
         st.remove_dir_cache(parent);
         println!(
@@ -1173,7 +957,6 @@ fn handle_deleted_path(abs: &Path, st: &FsState) {
     }
 }
 
-/// Gestisce rename
 fn handle_renamed_event(payload: &Value, st: &FsState) {
     let Some(old_rel) = payload["oldPath"].as_str() else {
         eprintln!("[WebSocket] handle_renamed_event: missing oldPath");
@@ -1183,8 +966,6 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
         eprintln!("[WebSocket] handle_renamed_event: missing newPath");
         return;
     };
-
-    // Converti entrambi i path nel formato canonico
     let old_abs = if old_rel.starts_with("./") {
         PathBuf::from(old_rel)
     } else {
@@ -1199,8 +980,7 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
 
     println!("[WebSocket] RENAME: {:?} -> {:?}", old_abs, new_abs);
 
-    // Mantieni l'inode se esiste, altrimenti allocane uno nuovo
-    let ino = if let Some(ino) = st.ino_of(&old_abs) {
+    let _ino = if let Some(ino) = st.ino_of(&old_abs) {
         st.remove_path(&old_abs);
         st.insert_path_mapping(&new_abs, ino);
         ino
@@ -1208,15 +988,12 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
         st.allocate_ino(&new_abs)
     };
 
-    // Aggiorna metadata del nuovo path
     if let Some((_, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) {
         update_cache_from_metadata(st, &new_abs, &name, is_dir, size, mtime, perm, nlink);
     }
 
-    // Rimuovi cache del vecchio path
     st.remove_attr(&old_abs);
 
-    // Invalida ENTRAMBI i parent (potrebbero essere diversi in caso di move)
     if let Some(old_parent) = old_abs.parent() {
         st.remove_dir_cache(old_parent);
         println!("[WebSocket] Invalidated old parent: {:?}", old_parent);
@@ -1227,11 +1004,10 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
     }
 }
 
-/// Aggiorna le cache da metadata ricevuti via WebSocket
 pub fn update_cache_from_metadata(
     st: &FsState,
     abs: &Path,
-    name: &str,
+    _name: &str,
     is_dir: bool,
     size: u64,
     mtime: i64,
@@ -1306,7 +1082,6 @@ impl FileSystemContext for RemoteFs {
 
         println!("[GET_SECURITY_BY_NAME] path='{}' rel='{}'", path_abs, rel);
 
-        // 1) Prepara SD valido (usa sempre lo stesso SDDL per coerenza)
         let sd_bytes = RemoteFs::sd_from_sddl("O:BAG:BAD:(A;;FA;;;WD)(A;;FA;;;BA)(A;;FA;;;SY)")
             .unwrap_or_else(|_| {
                 eprintln!("[GET_SECURITY_BY_NAME] WARN: sd_from_sddl failed, using empty SD");
@@ -1316,9 +1091,7 @@ impl FileSystemContext for RemoteFs {
         let required = sd_bytes.len();
         println!("[GET_SECURITY_BY_NAME] SD size={} bytes", required);
 
-        // 2) ROOT: esiste sempre
         if is_root {
-            // Copia SD nel buffer se fornito e capiente
             if let Some(buff) = buf {
                 if buff.len() >= required && required > 0 {
                     unsafe {
@@ -1342,7 +1115,6 @@ impl FileSystemContext for RemoteFs {
             });
         }
 
-        // 3) Determina parent e nome
         let parent_rel = Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -1362,8 +1134,6 @@ impl FileSystemContext for RemoteFs {
             name_only,
             parent_path.display()
         );
-
-        // 4) Cerca entry nel parent (cache-aware)
         let list = match self.dir_entries(&parent_path) {
             Ok(v) => {
                 println!("[GET_SECURITY_BY_NAME] dir_entries OK: {} entries", v.len());
@@ -1374,8 +1144,6 @@ impl FileSystemContext for RemoteFs {
                 return Err(e);
             }
         };
-
-        // 5) Cerca il file specifico
         if let Some((child_path, de)) = list.iter().find(|(_, d)| d.name == name_only) {
             let is_dir = RemoteFs::is_dir(&de);
             let attrs = if is_dir {
@@ -1384,10 +1152,7 @@ impl FileSystemContext for RemoteFs {
                 FILE_ATTRIBUTE_NORMAL
             };
 
-            // Alloca ino (idempotente)
             let _ = self.alloc_ino(std::path::Path::new(&path_abs));
-
-            // Copia SD nel buffer se fornito e capiente
             if let Some(buff) = buf {
                 if buff.len() >= required && required > 0 {
                     unsafe {
@@ -1418,8 +1183,6 @@ impl FileSystemContext for RemoteFs {
                 sz_security_descriptor: required as u64,
             });
         }
-
-        // 6) Non trovato
         eprintln!(
             "[GET_SECURITY_BY_NAME] NOT FOUND '{}' in parent '{}'",
             name_only, parent_rel
@@ -1435,7 +1198,6 @@ impl FileSystemContext for RemoteFs {
     ) -> WinFspResult<u64> {
         println!("[GET_SECURITY] ino={}", context.ino);
 
-        // Usa LO STESSO SDDL di get_security_by_name per coerenza
         let sd_bytes = Self::sd_from_sddl("O:BAG:BAD:(A;;FA;;;WD)(A;;FA;;;BA)(A;;FA;;;SY)")
             .unwrap_or_else(|_| {
                 eprintln!("[GET_SECURITY] WARN: sd_from_sddl failed, using empty SD");
@@ -1445,12 +1207,10 @@ impl FileSystemContext for RemoteFs {
         let sd_len = sd_bytes.len();
         println!("[GET_SECURITY] SD size={} bytes", sd_len);
 
-        // Se chiamante chiede solo la size
         if security_descriptor.is_none() {
             return Ok(sd_len as u64);
         }
 
-        // Copia nel buffer se capiente
         let buf_void = security_descriptor.unwrap();
         let buf_len = buf_void.len();
 
@@ -1476,7 +1236,6 @@ impl FileSystemContext for RemoteFs {
             context.ino, context.is_dir
         );
 
-        // 1) Path canonico dal mapping ino -> path -> rel "./..."
         let path = match self.path_of(context.ino) {
             Some(p) => p,
             None => {
@@ -1496,7 +1255,6 @@ impl FileSystemContext for RemoteFs {
             rel
         );
 
-        // 2) Directory
         if context.is_dir {
             file_info.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
             file_info.file_size = 0;
@@ -1521,8 +1279,6 @@ impl FileSystemContext for RemoteFs {
                 println!("[GET_FILE_INFO] done (dir, cache) OK");
                 return Ok(());
             }
-
-            // Fallback: risolvi parent e nome, poi cerca in dir_entries(parent)
             let parent_rel = Path::new(&rel)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -1559,7 +1315,6 @@ impl FileSystemContext for RemoteFs {
                 return Ok(());
             }
 
-            // Ultimo fallback: timestamps 0
             file_info.creation_time = 0;
             file_info.last_access_time = 0;
             file_info.last_write_time = 0;
@@ -1571,7 +1326,6 @@ impl FileSystemContext for RemoteFs {
             return Ok(());
         }
 
-        // 3) File: prova attrcache
         if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
             let readonly = (attr.perm & 0o222) == 0;
             file_info.file_attributes = if readonly {
@@ -1600,8 +1354,6 @@ impl FileSystemContext for RemoteFs {
             return Ok(());
         }
         println!("[GET_FILE_INFO] file cache miss for '{}'", rel);
-
-        // 4) Fallback file: cerca DirectoryEntry via parent
         let parent_rel = Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -1660,7 +1412,6 @@ impl FileSystemContext for RemoteFs {
                 t, nt
             );
 
-            // Aggiorna attrcache
             let ty = if isdir {
                 NodeType::Directory
             } else {
@@ -1678,7 +1429,6 @@ impl FileSystemContext for RemoteFs {
             return Ok(());
         }
 
-        // 5) Non trovato
         println!(
             "[GET_FILE_INFO] ERROR: entry '{}' non trovata tra i figli -> FILE_NOT_FOUND",
             rel
@@ -1695,7 +1445,7 @@ impl FileSystemContext for RemoteFs {
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> WinFspResult<()> {
-        // 1) Canonicalizza path
+
         let src_abs = self.path_from_u16(file_name);
         let dst_abs = self.path_from_u16(new_file_name);
         let src_rel = RemoteFs::rel_of(std::path::Path::new(&src_abs));
@@ -1705,7 +1455,6 @@ impl FileSystemContext for RemoteFs {
             context.ino, context.is_dir, src_rel, dst_rel, replace_if_exists
         );
 
-        // Root non rinominabile
         if src_rel == "." {
             println!("[RENAME] denied: source is root");
             return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
@@ -1720,13 +1469,11 @@ impl FileSystemContext for RemoteFs {
             }
         }
 
-        // 2) Parent/nome canonici
         let (src_parent_rel, src_name) = RemoteFs::split_parent_name(&src_rel);
         let (dst_parent_rel, dst_name) = RemoteFs::split_parent_name(&dst_rel);
         let src_parent_key = std::path::PathBuf::from(&src_parent_rel);
         let dst_parent_key = std::path::PathBuf::from(&dst_parent_rel);
 
-        // 3) Liste parent (cache-aware)
         let src_list = self.dir_entries(&src_parent_key).map_err(|e| {
             eprintln!("[RENAME] dir_entries('{}') failed: {}", src_parent_rel, e);
             e
@@ -1740,8 +1487,7 @@ impl FileSystemContext for RemoteFs {
             })?
         };
 
-        // 4) Sorgente deve esistere
-        let (src_child_path, src_de) = match src_list.iter().find(|(_, d)| d.name == src_name) {
+        let (_src_child_path, src_de) = match src_list.iter().find(|(_, d)| d.name == src_name) {
             Some((p, d)) => (p.clone(), d.clone()),
             None => {
                 eprintln!(
@@ -1755,7 +1501,6 @@ impl FileSystemContext for RemoteFs {
         };
         let src_is_dir = RemoteFs::is_dir(&src_de);
 
-        // 5) Gestisci destinazione esistente e replace_if_exists
         if let Some((_, dst_de)) = dst_list.iter().find(|(_, d)| d.name == dst_name) {
             let dst_is_dir = RemoteFs::is_dir(&dst_de);
             if src_is_dir != dst_is_dir {
@@ -1779,7 +1524,6 @@ impl FileSystemContext for RemoteFs {
                     windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED,
                 ));
             }
-            // Emula REPLACE_EXISTING se hai delete
             if let Err(e) = self.rt.block_on(self.api.delete(&dst_rel)) {
                 eprintln!("[RENAME] pre-delete failed for '{}': {}", dst_rel, e);
                 return Err(FspError::WIN32(
@@ -1788,7 +1532,6 @@ impl FileSystemContext for RemoteFs {
             }
         }
 
-        // 6) Backend rename (async PATCH /files/rename?oldRelPath=&newRelPath=)
         if let Err(e) = self.rt.block_on(self.api.rename(&src_rel, &dst_rel)) {
             eprintln!(
                 "[RENAME] backend rename failed: {} -> {} err={}",
@@ -1799,29 +1542,17 @@ impl FileSystemContext for RemoteFs {
             ));
         }
 
-        // 7) Aggiorna cache in modo coerente con le tue API
-        // Evict state vecchio path (attrcache/dircache/inode mapping/pendenze write)
         self.evict_all_state_for(&src_rel);
-
-        // Hard refresh dei parent coinvolti (usa le tue primitive)
-        // - Se hai update_cache(Path), usala per ricaricare da backend e ripopolare dircache/attrcache.
-        // - Se no, chiama ls e insert_dir_cache come già fai altrove.
-
-        // Aggiorna cache parent sorgente e destinazione
         if let Err(e) = self.update_cache(&src_parent_key) {
             eprintln!("[RENAME] update_cache('{}') failed: {}", src_parent_rel, e);
-            // continua comunque
         }
         if src_parent_rel != dst_parent_rel {
             if let Err(e) = self.update_cache(&dst_parent_key) {
                 eprintln!("[RENAME] update_cache('{}') failed: {}", dst_parent_rel, e);
             }
         }
-
-        // 8) Aggiorna mappa ino->path se il context punta proprio all’oggetto rinominato
         if let Some(cur) = self.path_of(context.ino) {
             if RemoteFs::rel_of(&cur) == src_rel {
-                // path_by_ino modificabile con le tue strutture
                 if let Ok(mut byino) = self.state.path_by_ino.lock() {
                     byino.insert(context.ino, PathBuf::from(dst_abs.clone()));
                 }
@@ -1841,10 +1572,9 @@ impl FileSystemContext for RemoteFs {
 
     fn get_stream_info(
         &self,
-        context: &Self::FileContext,
-        buffer: &mut [u8],
+        _context: &Self::FileContext,
+        _buffer: &mut [u8],
     ) -> Result<u32, FspError> {
-        // Non supportiamo ADS: ritorniamo vuoto (0 bytes scritti)
         Ok(0)
     }
 
@@ -1853,8 +1583,6 @@ impl FileSystemContext for RemoteFs {
         out_volume_info: &mut winfsp::filesystem::VolumeInfo,
     ) -> WinFspResult<()> {
         println!("[GET_VOLUME_INFO] start");
-
-        // Chiama il backend per ottenere le statistiche (probabilmente hai un endpoint /stats o /df)
         let stats = self.rt.block_on(self.api.statfs()).map_err(|e| {
             eprintln!("[GET_VOLUME_INFO] statfs backend failed: {}", e);
             FspError::from(std::io::Error::new(
@@ -1863,12 +1591,8 @@ impl FileSystemContext for RemoteFs {
             ))
         })?;
 
-        // Popola VolumeInfo con i dati dal backend
-        // Assicurati che il tuo FileApi::statfs() ritorni una struct con questi campi
-        // (vedi il tuo file_api.rs: StatsResponse ha bsize, blocks, bfree, bavail, files)
-
-        out_volume_info.total_size = stats.blocks * stats.bsize; // blocchi totali * size
-        out_volume_info.free_size = stats.bfree * stats.bsize; // blocchi liberi * size
+        out_volume_info.total_size = stats.blocks * stats.bsize;
+        out_volume_info.free_size = stats.bfree * stats.bsize;
         println!(
             "[GET_VOLUME_INFO] total={} free={} (in bytes)",
             out_volume_info.total_size, out_volume_info.free_size,
@@ -1880,8 +1604,8 @@ impl FileSystemContext for RemoteFs {
     fn open(
         &self,
         file_name: &U16CStr,
-        create_options: u32,
-        mut granted_access: u32,
+        _create_options: u32,
+        granted_access: u32,
         open_info: &mut OpenFileInfo,
     ) -> WinFspResult<Self::FileContext> {
         use windows_sys::Win32::Storage::FileSystem::{
@@ -1889,20 +1613,11 @@ impl FileSystemContext for RemoteFs {
         };
 
         println!("[OPEN] .0 entry");
-
-        // 1) Path Win32 -> rel canonico per cache/backend
         let path = self.path_from_u16(file_name);
         let rel = RemoteFs::rel_of(std::path::Path::new(&path));
         println!("[OPEN] .1 path_from_u16 -> path='{}' rel='{}'", path, rel);
-
-        // DEBUG: stampa tutti i permission flag ricevuti
         const GENERIC_READ: u32 = 0x80000000;
         const GENERIC_WRITE: u32 = 0x40000000;
-        const GENERIC_EXECUTE: u32 = 0x20000000;
-        const READ_CONTROL: u32 = 0x00020000;
-        const WRITE_DAC: u32 = 0x00040000;
-        const SYNCHRONIZE: u32 = 0x00100000;
-        // Windows file access: leggere SOLO attributi (Explorer/WinAPI spesso usa questo)
         const FILE_READ_ATTRIBUTES: u32 = 0x00000080;
         const FILE_READ_DATA: u32 = 0x00000001;
         const FILE_DELETE_CHILD: u32 = 0x00000040;
@@ -1914,15 +1629,6 @@ impl FileSystemContext for RemoteFs {
             (granted_access & GENERIC_WRITE) != 0,
             (granted_access & FILE_READ_ATTRIBUTES) != 0
         );
-        /*     //forza a chiamare la read
-        if (granted_access & FILE_READ_ATTRIBUTES) != 0
-            && (granted_access & FILE_READ_DATA) == 0
-            && (granted_access & GENERIC_READ) == 0
-        {
-            println!("[OPEN] upgrading FILE_READ_ATTRIBUTES -> FILE_READ_DATA");
-            granted_access |= FILE_READ_DATA | GENERIC_READ;
-        }*/
-
         println!("[OPEN] .2 granted_access=0x{:08X}", granted_access);
         println!("[OPEN] .2 granted_access binary: {:032b}", granted_access);
         println!(
@@ -1934,10 +1640,8 @@ impl FileSystemContext for RemoteFs {
         let wants_delete = (granted_access & DELETE) != 0;
         let wants_write =
             (granted_access & FILE_WRITE_DATA) != 0 || (granted_access & GENERIC_WRITE) != 0;
-        // Accetta FILE_READ_DATA, GENERIC_READ
         let wants_read =
             (granted_access & FILE_READ_DATA) != 0 || (granted_access & GENERIC_READ) != 0;
-        //Vuole solo leggere gli attributi (Explorer usa questo per "proprietà" senza aprire il file)
         let wants_read_attributes = (granted_access & FILE_READ_ATTRIBUTES) != 0;
         let has_delete_child = granted_access & FILE_DELETE_CHILD != 0;
 
@@ -1946,26 +1650,21 @@ impl FileSystemContext for RemoteFs {
             wants_delete, wants_write, wants_read, wants_read_attributes, has_delete_child
         );
 
-        // 2) Root
         if rel == "." {
             println!("[OPEN] .4 root case -> returning dir context");
             let fi = open_info.as_mut();
             fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
             fi.file_size = 0;
-            // alloc_ino su chiave canonica della root, NON su "/"
-            let ino = self.alloc_ino(std::path::Path::new(".")); // FIX
+            let ino = self.alloc_ino(std::path::Path::new("."));
             return Ok(MyFileContext {
                 ino,
                 is_dir: true,
-                allow_delete: wants_delete,
                 delete_on_close: AtomicBool::new(false),
                 temp_write: None,
-                needs_truncate: AtomicBool::new(false),
                 access_mask: granted_access,
             });
         }
 
-        // 3) Parent/name canonici
         let parent_rel = std::path::Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -1995,14 +1694,11 @@ impl FileSystemContext for RemoteFs {
                 );
                 return Err(e);
             }
-        }; // cache-aware su chiavi canoniche
-
-        // 4) Trova figlio: child_path è canonico ("./nome")
-        let target_name = std::ffi::OsStr::new(&name_only);
+        }; 
         let (child_path, de) = entries
             .clone()
             .into_iter()
-            .find(|(_, d)| d.name == name_only) // ← Rimuovi il confronto su path.file_name()
+            .find(|(_, d)| d.name == name_only)
             .ok_or_else(|| {
                 eprintln!(
                     "[OPEN] .E child not found: '{}' in parent '{}'",
@@ -2021,21 +1717,16 @@ impl FileSystemContext for RemoteFs {
         let is_dir = RemoteFs::is_dir(&de);
         println!("[OPEN] .8 is_dir={}", is_dir);
 
-        // 5) alloc_ino sulla chiave canonica del figlio (NON su 'path' Win32)
         let ino = self.alloc_ino(&child_path); // FIX
         println!("[OPEN] .9 alloc_ino -> ino={}", ino);
 
-        // 6) Compila OpenFileInfo coerentemente
         let fi = open_info.as_mut();
         if is_dir {
             println!("[OPEN] .10 returning dir context for child");
 
-            // 🌟 PASSO CRITICO: Recupera gli attributi completi per la directory
             if let Some(attr) = self.get_attr_cache(&child_path) {
                 fi.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
                 fi.file_size = 0;
-
-                // ✅ IL FIX: Mappa i timestamp dalla cache a OpenFileInfo
                 fi.creation_time = RemoteFs::nt_time_from_system_time(attr.crtime);
                 fi.last_access_time = RemoteFs::nt_time_from_system_time(attr.atime);
                 fi.last_write_time = RemoteFs::nt_time_from_system_time(attr.mtime);
@@ -2050,14 +1741,11 @@ impl FileSystemContext for RemoteFs {
                 return Ok(MyFileContext {
                     ino,
                     is_dir: true,
-                    allow_delete: wants_delete,
                     delete_on_close: AtomicBool::new(false),
                     temp_write: None,
-                    needs_truncate: AtomicBool::new(false),
                     access_mask: granted_access,
                 });
             } else {
-                // Fallback in caso di cache miss per una directory
                 eprintln!(
                     "[OPEN] .10.2 Directory '{}' not in cache after creation. Returning NOT FOUND to force re-evaluation.",
                     rel
@@ -2066,11 +1754,9 @@ impl FileSystemContext for RemoteFs {
             }
         }
 
-        // 7) File: prova attr_cache; fallback a DirectoryEntry
         if let Some(mut attr) = self.get_attr_cache(&child_path) {
             println!("[OPEN] .11 attr cache HIT for '{}'", child_path.display());
             println!("[OPEN] .11 attr: size={} de.size={}", attr.size, de.size);
-            // ⭐ NUOVO: Se size=0 ma il file esiste, verifica con backend
             if attr.size == 0 && de.size > 0 {
                 println!(
                     "[OPEN] .11.1 Backend reports size={}, updating cache",
@@ -2086,14 +1772,12 @@ impl FileSystemContext for RemoteFs {
             }
 
             let readonly = (attr.perm & 0o222) == 0;
-
-            // ✅ USA attr AGGIORNATO
             fi.file_attributes = if readonly {
                 FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_READONLY
             } else {
                 FILE_ATTRIBUTE_NORMAL
             };
-            fi.file_size = attr.size; // ✅ Ora è corretto!
+            fi.file_size = attr.size;
             fi.allocation_size = ((attr.size + 4095) / 4096) * 4096;
             fi.creation_time = RemoteFs::nt_time_from_system_time(attr.crtime);
             fi.last_access_time = RemoteFs::nt_time_from_system_time(attr.atime);
@@ -2104,7 +1788,6 @@ impl FileSystemContext for RemoteFs {
             fi.reparse_tag = 0;
             fi.ea_size = 0;
 
-            // ⭐ CRITICAL DEBUG: stampa TUTTO
             println!(
                 "[OPEN] .11 OpenFileInfo: attrs={:#x} size={} alloc={} cr={:#x} at={:#x} wt={:#x} ct={:#x} idx={} hl={} rt={} ea={}",
                 fi.file_attributes,
@@ -2139,8 +1822,6 @@ impl FileSystemContext for RemoteFs {
             fi.hard_links = 0;
             fi.reparse_tag = 0;
             fi.ea_size = 0;
-
-            // ⭐ CRITICAL DEBUG
             println!(
                 "[OPEN] .12 OpenFileInfo: attrs={:#x} size={} alloc={} cr={:#x} at={:#x} wt={:#x} ct={:#x}",
                 fi.file_attributes,
@@ -2152,7 +1833,6 @@ impl FileSystemContext for RemoteFs {
                 fi.change_time
             );
         }
-        // 8) TempWrite solo se wants_write
         let temp_write = if wants_write {
             println!(
                 "[OPEN] .13 wants_write=true -> create temp file for ino={}",
@@ -2179,15 +1859,11 @@ impl FileSystemContext for RemoteFs {
                     temp_path.display()
                 );
 
-                // ⭐ NUOVO: Log del contenuto iniziale del temp
                 if let Ok(metadata) = std::fs::metadata(&temp_path) {
                     println!("[OPEN] .13.2.1 Temp file initial size: {}", metadata.len());
                 }
             } else if should_prepopulate {
-                // Caso: append o read+write
                 println!("[OPEN] .13.3 wants_read=true -> pre-populating temp");
-
-                // Ensure we have attributes (size) available for this entry
                 let mut attr = self.get_attr_cache(&child_path);
                 if attr.is_none() {
                     let is_dir = Self::is_dir(&de);
@@ -2206,7 +1882,6 @@ impl FileSystemContext for RemoteFs {
                         std::fs::File::create(&temp_path).map_err(|e| {
                             FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
                         })?;
-                        // Build a minimal FileAttr for the newly-created empty temp
                         let is_dir = Self::is_dir(&de);
                         let ty = if is_dir { NodeType::Directory } else { NodeType::RegularFile };
                         let perm = Self::parse_perm(&de.permissions);
@@ -2239,7 +1914,6 @@ impl FileSystemContext for RemoteFs {
                             }
                         }
                         Ok(_) => {
-                            // Backend returned an empty body -> create empty temp
                             println!("[OPEN] .13.5 Backend returned empty -> create empty temp");
                             std::fs::File::create(&temp_path).map_err(|e| {
                                 FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
@@ -2247,7 +1921,6 @@ impl FileSystemContext for RemoteFs {
                         }
                         Err(e) => {
                             eprintln!("[OPEN] .13.5 Backend read failed: {} -> trying fallback", e);
-                            // fallback rel form
                             let alt = if rel.starts_with("./") {
                                 rel.trim_start_matches("./").to_string()
                             } else {
@@ -2281,14 +1954,11 @@ impl FileSystemContext for RemoteFs {
                     }
                 }
             } else {
-                // Fallback
                 println!("[OPEN] .13.6 Fallback: create empty temp");
                 std::fs::File::create(&temp_path).map_err(|e| {
                     FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
                 })?;
             }
-
-            // Verifica che il file esista
             if !temp_path.exists() {
                 eprintln!(
                     "[OPEN] CRITICAL ERROR: temp file not created at '{}'",
@@ -2307,7 +1977,7 @@ impl FileSystemContext for RemoteFs {
 
             let tw = TempWrite {
                 tem_path: temp_path,
-                size,
+                _size: size,
             };
             self.state.writes.lock().unwrap().insert(ino, tw.clone());
             println!("[OPEN] .15 temp_write inserted for ino={}", ino);
@@ -2322,10 +1992,8 @@ impl FileSystemContext for RemoteFs {
         Ok(MyFileContext {
             ino,
             is_dir: false,
-            allow_delete: wants_delete,
             delete_on_close: AtomicBool::new(false),
             temp_write,
-            needs_truncate: AtomicBool::new(false), // Non serve più il flag lazy
             access_mask: granted_access,
         })
     }
@@ -2334,7 +2002,7 @@ impl FileSystemContext for RemoteFs {
             file_context: Self::FileContext) 
     {
         println!(
-            "[CLOSE] ⭐⭐⭐ ENTRY ino={} temp_write={}",
+            "[CLOSE] ENTRY ino={} temp_write={}",
             file_context.ino,
             file_context.temp_write.is_some()
         );
@@ -2369,10 +2037,8 @@ impl FileSystemContext for RemoteFs {
                 return;
             }
         };
-
-        // ⭐ ANALISI FINALE
         if real_size == 0 {
-            println!("[CLOSE] ⚠️⚠️⚠️ CRITICAL: Syncing EMPTY file!");
+            println!("[CLOSE] CRITICAL: Syncing EMPTY file!");
             println!("[CLOSE] This means write() was NEVER called");
             println!("[CLOSE] PowerShell might be using a different API");
         }
@@ -2385,15 +2051,12 @@ impl FileSystemContext for RemoteFs {
             temp_write.tem_path.display(),
             real_size
         );
-
-        // 1) Commit sul backend
         if let Err(e) = self.rt.block_on(
             self.api
                 .write_file(&rel_path, &temp_write.tem_path.to_string_lossy()),
         ) {
             eprintln!("[CLOSE] Errore commit file {}: {:?}", rel_path, e);
         } else {
-            // 2) Aggiorna cache dopo commit riuscito
             let parent_rel = Path::new(&rel_path)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -2429,13 +2092,11 @@ impl FileSystemContext for RemoteFs {
                         de.size.max(0) as u64
                     };
                     let backend_perm = RemoteFs::parse_perm(&de.permissions) as u16;
-                    // Prefer cached perm if available (e.g. create/set_basic_info set desired perm)
                     let ty = if RemoteFs::is_dir(&de) {
                         NodeType::Directory
                     } else {
                         NodeType::RegularFile
                     };
-                    // Check cache for an intended perm override (created earlier)
                     let cached_perm_opt = self.get_attr_cache(&child).map(|a| a.perm);
                     let final_perm: u16 = if let Some(cperm) = cached_perm_opt {
                         if cperm != backend_perm {
@@ -2443,7 +2104,6 @@ impl FileSystemContext for RemoteFs {
                                 "[CLOSE] backend perm {:#o} != cached perm {:#o} -> reapplying cached perm",
                                 backend_perm, cperm
                             );
-                            // Try to reapply cached perm to backend
                             let _ = self
                                 .rt
                                 .block_on(self.api.chmod(&rel_path, cperm as u32))
@@ -2467,49 +2127,6 @@ impl FileSystemContext for RemoteFs {
                 let _ = self.update_cache(&parent_key);
             }
         }
-        /*
-                // 3) chmod post-commit
-                // Preserve readonly if backend/cache says file was read-only (0o444).
-                let desired_mode = if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel_path)) {
-                    println!(
-                        "[CLOSE] setting permissions based on attr cache perm={:#o}",
-                        attr.perm
-                    );
-                    if (attr.perm & 0o444) == 1 {
-                        0o444
-                    } else {
-                        0o644
-                    }
-                } else {
-                    // fallback: ask backend parent listing for the entry's permissions
-                    let parent_rel = Path::new(&rel_path)
-                        .parent()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| ".".to_string());
-                    match self.rt.block_on(self.api.ls(&parent_rel)) {
-                        Ok(list) => {
-                            let name = Path::new(&rel_path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            if let Some(de) = list.into_iter().find(|d| d.name == name) {
-                                let perm = RemoteFs::parse_perm(&de.permissions);
-                                if (perm & 0o222) == 0 { 0o444 } else { 0o644 }
-                            } else {
-                                0o644
-                            }
-                        }
-                        Err(_) => 0o644,
-                    }
-                };
-                println!(
-                    "[CHMOD] applying chmod {} to '{}'",
-                    desired_mode, rel_path
-                );
-                let _ = self.rt.block_on(self.api.chmod(&rel_path, desired_mode));
-        */
-        // 4) Pulisci il temp file
         if let Err(e) = std::fs::remove_file(&temp_write.tem_path) {
             eprintln!("[CLOSE] Errore rimozione temp file: {}", e);
         }
@@ -2532,8 +2149,6 @@ impl FileSystemContext for RemoteFs {
         let path = self.path_of(file_context.ino).ok_or(FspError::WIN32(1))?;
         let rel_path = RemoteFs::rel_of(&path);
         println!("[READ] rel='{}'", rel_path);
-
-        // Ensure we have attributes (size) for this path; if missing, try to populate from parent listing
         let mut attr = self.get_attr_cache(&path);
 
         if attr.is_none() {
@@ -2546,7 +2161,7 @@ impl FileSystemContext for RemoteFs {
 
             match self.dir_entries(&parent_key) {
                 Ok(entries) => {
-                    if let Some((child_path, de)) = entries.into_iter().find(|(p, _)| *p == path)
+                    if let Some((_child_path, de)) = entries.into_iter().find(|(p, _)| *p == path)
                     {
                         let is_dir = Self::is_dir(&de);
                         let ty = if is_dir {
@@ -2572,8 +2187,6 @@ impl FileSystemContext for RemoteFs {
             Some(a) => a,
             None => return Err(FspError::WIN32(ERROR_FILE_NOT_FOUND)),
         };
-
-        // If offset beyond EOF, return 0 bytes
         if offset as u64 >= attr.size {
             return Ok(0);
         }
@@ -2581,8 +2194,6 @@ impl FileSystemContext for RemoteFs {
         if buffer.is_empty() {
             return Ok(0);
         }
-
-        // Compute start/end for backend range reads
         let start_u64 = offset as u64;
         let end_u64 = (start_u64 + (buffer.len() as u64) - 1).min(attr.size.saturating_sub(1));
 
@@ -2604,7 +2215,6 @@ impl FileSystemContext for RemoteFs {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("[READ] backend read failed for '{}': {}", rel_path, e);
-                    // fallback (if backend expects './' form)
                     let alt = if rel_path.starts_with("./") {
                         rel_path.trim_start_matches("./").to_string()
                     } else {
@@ -2635,7 +2245,6 @@ impl FileSystemContext for RemoteFs {
             let end = std::cmp::min(start + buffer.len(), data.len());
             bytes_to_copy = &data[start..end];
         } else {
-            // backend returned exactly the requested window starting at `start_u64`
             let end = std::cmp::min(buffer.len(), data.len());
             bytes_to_copy = &data[0..end];
         }
@@ -2659,15 +2268,13 @@ impl FileSystemContext for RemoteFs {
         file_info: &mut FileInfo,
     ) -> WinFspResult<u32> {
         println!(
-            "[WRITE] ⭐⭐⭐ CALLED! ino={} offset={} len={} write_to_eof={} constrained={}",
+            "[WRITE] CALLED! ino={} offset={} len={} write_to_eof={} constrained={}",
             file_context.ino,
             offset,
             buffer.len(),
             write_to_end_of_file,
             constrained_io
         );
-
-        // Check permissions: se il file è readonly (nessun bit di scrittura), rifiuta
         if let Some(path) = self.path_of(file_context.ino) {
             if let Some(attr) = self.get_attr_cache(&path) {
                 if (attr.perm & 0o222) == 0 {
@@ -2679,8 +2286,6 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         }
-
-        // ⭐ DUMP dei primi bytes per debug
         if buffer.len() > 0 {
             let preview =
                 std::str::from_utf8(&buffer[..buffer.len().min(50)]).unwrap_or("<binary>");
@@ -2688,7 +2293,7 @@ impl FileSystemContext for RemoteFs {
         }
         let tw = match &file_context.temp_write {
             Some(tw) => tw,
-            None => return Err(FspError::WIN32(1)), // file opened read-only
+            None => return Err(FspError::WIN32(1)),
         };
 
         let mut file = std::fs::OpenOptions::new()
@@ -2724,7 +2329,7 @@ impl FileSystemContext for RemoteFs {
             file_info.file_size = new_size;
             file_info.allocation_size = ((new_size + 4095) / 4096) * 4096;
             println!(
-                "[WRITE] ⭐ Success: wrote {} bytes, total size now {}",
+                "[WRITE] Success: wrote {} bytes, total size now {}",
                 buffer.len(),
                 new_size
             );
@@ -2736,14 +2341,14 @@ impl FileSystemContext for RemoteFs {
     fn overwrite(
         &self,
         context: &Self::FileContext,
-        file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
+        _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
         replace_file_attributes: bool,
         allocation_size: u64,
-        extra_buffer: Option<&[u8]>,
+        _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> Result<(), FspError> {
         println!(
-            "[OVERWRITE] ⭐ ino={} replace_attrs={} allocation_size={}",
+            "[OVERWRITE] ino={} replace_attrs={} allocation_size={}",
             context.ino, replace_file_attributes, allocation_size
         );
 
@@ -2752,8 +2357,6 @@ impl FileSystemContext for RemoteFs {
                 "[OVERWRITE] truncating temp file '{}' to 0",
                 tw.tem_path.display()
             );
-            
-            // ✅ FIX: Usa OpenOptions con truncate(true)
             let result = std::fs::OpenOptions::new()
                 .write(true) 
                 .truncate(true) 
@@ -2761,13 +2364,9 @@ impl FileSystemContext for RemoteFs {
 
             match result {
                 Ok(_) => {
-                    println!("[OVERWRITE] ✅ Temp file truncated successfully");
-                    
-                    // ✅ Aggiorna il FileInfo per riflettere il truncate
+                    println!("[OVERWRITE] Temp file truncated successfully");
                     file_info.file_size = 0;
                     file_info.allocation_size = 0;
-                    
-                    // ✅ Aggiorna la cache locale
                     let path = self.path_of(context.ino).ok_or(FspError::WIN32(
                         windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
                     ))?;
@@ -2781,7 +2380,7 @@ impl FileSystemContext for RemoteFs {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[OVERWRITE] ❌ ERROR truncating temp file: {}", e);
+                    eprintln!("[OVERWRITE] ERROR truncating temp file: {}", e);
                     return Err(FspError::from(io::Error::new(
                         io::ErrorKind::Other,
                         e.to_string(),
@@ -2789,7 +2388,7 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         } else {
-            eprintln!("[OVERWRITE] ❌ No temp_write available for truncation");
+            eprintln!("[OVERWRITE] No temp_write available for truncation");
             return Err(FspError::WIN32(ERROR_INVALID_PARAMETER));
         }
 
@@ -2849,28 +2448,18 @@ impl FileSystemContext for RemoteFs {
                 core::ptr::write_bytes(dir_info_ptr as *mut u8, 0, entry_size as usize);
 
                 (*dir_info_ptr).Size = entry_size;
-
-                // Determina se è una directory o un file
                 let is_dir = Self::is_dir(&de);
-
-                // Imposta gli attributi
                 (*dir_info_ptr).FileInfo.FileAttributes = if is_dir {
                     FILE_ATTRIBUTE_DIRECTORY
                 } else {
                     FILE_ATTRIBUTE_NORMAL
                 };
-
-                // DISTINZIONE: Imposta dimensioni SOLO per i file, NON per le directory
                 if is_dir {
-                    // Per le directory: FileSize e AllocationSize devono essere 0
                     (*dir_info_ptr).FileInfo.FileSize = 0;
                     (*dir_info_ptr).FileInfo.AllocationSize = 0;
                 } else {
-                    // Per i file: usa la dimensione effettiva dal backend
                     let file_size = de.size as u64;
                     (*dir_info_ptr).FileInfo.FileSize = file_size;
-
-                    // Calcola AllocationSize arrotondato al cluster (4096 byte)
                     let cluster = 4096u64;
                     let alloc = if file_size == 0 {
                         0
@@ -2879,8 +2468,6 @@ impl FileSystemContext for RemoteFs {
                     };
                     (*dir_info_ptr).FileInfo.AllocationSize = alloc;
                 }
-
-                // Timestamp (uguali per file e directory)
                 let mtime = UNIX_EPOCH
                     .checked_add(Duration::from_secs(de.mtime as u64))
                     .unwrap_or_else(SystemTime::now);
@@ -2890,13 +2477,11 @@ impl FileSystemContext for RemoteFs {
                 (*dir_info_ptr).FileInfo.LastWriteTime = t;
                 (*dir_info_ptr).FileInfo.ChangeTime = t;
 
-                // Copia del nome subito dopo la struttura
                 let name_dst = (dir_info_ptr as *mut u8)
                     .add(core::mem::size_of::<FSP_FSCTL_DIR_INFO>())
                     as *mut u16;
                 core::ptr::copy_nonoverlapping(name_slice.as_ptr(), name_dst, name_len);
 
-                // Aggiungi l'entry al buffer di risposta
                 let ok = FspFileSystemAddDirInfo(
                     dir_info_ptr,
                     buffer.as_mut_ptr() as *mut _,
@@ -2910,7 +2495,6 @@ impl FileSystemContext for RemoteFs {
             }
         }
 
-        // Segnala EOF
         unsafe {
             let _ = FspFileSystemAddDirInfo(
                 core::ptr::null_mut(),
@@ -2927,7 +2511,7 @@ impl FileSystemContext for RemoteFs {
         &self,
         path: &U16CStr,
         create_options: u32,
-        granted_access: u32,
+        _granted_access: u32,
         _file_attributes: u32,
         _allocation_size: Option<&[c_void]>,
         _create_flags: u64,
@@ -2954,8 +2538,6 @@ impl FileSystemContext for RemoteFs {
         println!("[CREATE] caso dir parentpath : {}", parent_rel);
 
         let parent_path = PathBuf::from(&parent_rel);
-
-        //Caso Directory
         if is_dir {
             match self.rt.block_on(self.api.mkdir(&rel)) {
                 Ok(_) => {
@@ -2967,20 +2549,15 @@ impl FileSystemContext for RemoteFs {
                     fi.change_time = nt_time;
 
                     let ino = self.alloc_ino(std::path::Path::new(&path_str));
-
-                    // 1) Aggiorna cache parent: ricarica elenco (Explorer leggerà subito)
                     let _ = self.update_cache(&parent_path);
-
-                    // 2) Inserisci attr della nuova dir in cache (evita finestra di inconsistenza)
-                    let mut attr = self.file_attr(
+                    let attr = self.file_attr(
                         std::path::Path::new(&path_str),
                         NodeType::Directory,
                         0,
                         None,
                         0o755,
-                        1,// directory tipicamente 2 link , ma su windows rimane sempre 1
+                        1,
                     );
-                    //attr.nlink = 2; 
                     self.insert_attr_cache(std::path::PathBuf::from(&rel), attr);
 
 
@@ -2990,8 +2567,6 @@ impl FileSystemContext for RemoteFs {
                         temp_write: None,
                         delete_on_close: std::sync::atomic::AtomicBool::new(false),
                         is_dir: true,
-                        allow_delete: (granted_access & DELETE) != 0,
-                        needs_truncate: AtomicBool::new(false),
                         access_mask: 0,
                     });
                 }
@@ -3004,41 +2579,24 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         }
-
-        //Caso File
-
-        // Esiste già --> errore
         if self.backend_entry_exists(&rel) {
             return Err(FspError::WIN32(ERROR_ALREADY_EXISTS));
         }
 
         let ino = self.alloc_ino(Path::new(&path_str));
         println!("[CREATE] file ino: {:?}", ino);
-
-        // 1. Crea il file temporaneo vuoto PRIMA di chiamare write_file
         let temp_path = self.get_temporary_path(ino);
         if let Err(e) = std::fs::File::create(&temp_path) {
             eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
             return Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32));
         }
 
-        //aggiungo la creazione immediata del file vuoto per la gui (di explorer) che mi permette di fare la creazione file
         match self
             .rt
             .block_on(self.api.write_file(&rel, &temp_path.to_str().unwrap()))
         {
             Ok(_) => {
-                // 2. Imposta mode desiderato per il nuovo file (evita ereditare 755 dalla dir)
-                /*  let desired_mode: u32 = 0o644;
-                let _ = self
-                    .rt
-                    .block_on(self.api.chmod(&rel, desired_mode))
-                    .map_err(|e| {
-                        eprintln!("[CREATE] warning: chmod after create failed: {}", e);
-                        FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
-                    });*/
                 let desired_mode: u32 = 0o644;
-                // 3. Prepara la struttura per le scritture temporanee (locale)
                 let temp_path = self.get_temporary_path(ino);
                 if let Err(e) = std::fs::File::create(&temp_path) {
                     eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
@@ -3046,7 +2604,7 @@ impl FileSystemContext for RemoteFs {
                 }
                 let temp_write = TempWrite {
                     tem_path: temp_path,
-                    size: 0,
+                    _size: 0,
                 };
                 self.state
                     .writes
@@ -3054,17 +2612,13 @@ impl FileSystemContext for RemoteFs {
                     .unwrap()
                     .insert(ino, temp_write.clone());
 
-                // 4. Costruisci FileContext
                 let file_context = MyFileContext {
                     ino,
                     temp_write: Some(temp_write),
                     delete_on_close: AtomicBool::new(false),
-                    allow_delete: (granted_access & DELETE) != 0,
                     is_dir: false,
-                    needs_truncate: AtomicBool::new(false),
                     access_mask: 0,
                 };
-                // 5. Popola OpenFileInfo e cache coerente (perm = desired_mode)
                 fi.file_attributes = FILE_ATTRIBUTE_NORMAL;
                 fi.file_size = 0;
                 fi.creation_time = nt_time;
@@ -3072,32 +2626,27 @@ impl FileSystemContext for RemoteFs {
                 fi.last_write_time = nt_time;
                 fi.change_time = nt_time;
 
-                let mut attr = self.file_attr(
+                let attr = self.file_attr(
                     Path::new(&path_str),
                     NodeType::RegularFile,
                     0,
                     None,
                     desired_mode as u16,
-                    1, // file tipicamente 1 link
+                    1,
                 );
-                //attr.nlink = 1;
                 self.insert_attr_cache(Path::new(&rel).to_path_buf(), attr);
-
-                // 6. Aggiorna cache parent per rendere visibile la nuova entry
                 let _ = self.update_cache(&parent_path);
 
                 Ok(file_context)
             }
             Err(e) => {
                 eprintln!("[CREATE] Errore creazione file sul backend: {}", e);
-                //pulisci il file temporaneo locale se write fallisce
                 let _ = std::fs::remove_file(&temp_path);
                 Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32))
             }
         }
     }
 
-    //per la modifica dei permessi
     fn set_basic_info(
         &self,
         file_context: &Self::FileContext,
@@ -3125,8 +2674,6 @@ impl FileSystemContext for RemoteFs {
             "[SET_BASIC_INFO] ino={} path='{}' file_attrs={:#x} access_mask={:#x}",
             file_context.ino, rel, file_attributes, file_context.access_mask
         );
-
-        // 1) Get or create attr from cache
         let mut attr = if let Some(a) = self.get_attr_cache(&rel_key) {
             a
         } else {
@@ -3157,11 +2704,6 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         };
-
-        // 2) Determine if we should apply permission changes
-        // Critical logic: ONLY use temp_write to detect active write operations
-        // DO NOT check access_mask - it has too many false positives due to bit overlaps
-
         let has_pending_write = file_context.temp_write.is_some();
 
         println!(
@@ -3170,21 +2712,15 @@ impl FileSystemContext for RemoteFs {
         );
 
         let mode = if has_pending_write {
-            // CASE A: File has pending writes (copy/paste, create with immediate write)
-            // Ignore FILE_ATTRIBUTE_READONLY - Explorer sets this during copy
             println!(
                 "[SET_BASIC_INFO] File has pending write - ignoring FILE_ATTRIBUTE_READONLY flag"
             );
-
-            // Keep existing permission or default to writable
             if attr.perm == 0 {
-                0o644 // Default for new files
+                0o644 
             } else {
-                attr.perm as u32 // Preserve existing permission
+                attr.perm as u32 
             }
         } else if file_attributes != u32::MAX {
-            // CASE B: Explicit attribute change without pending write
-            // This is the Properties dialog case
             if (file_attributes & FILE_ATTRIBUTE_READONLY) != 0 {
                 println!("[SET_BASIC_INFO] ✓ User set readonly attribute (no pending write)");
                 0o444
@@ -3193,7 +2729,6 @@ impl FileSystemContext for RemoteFs {
                 0o644
             }
         } else {
-            // CASE C: No attribute change requested
             println!(
                 "[SET_BASIC_INFO] No attribute change, preserving perm={:#o}",
                 attr.perm
@@ -3202,14 +2737,10 @@ impl FileSystemContext for RemoteFs {
         };
 
         println!("[SET_BASIC_INFO] Final decision: mode={:#o}", mode);
-
-        // 3) Apply chmod to backend
         self.rt.block_on(self.api.chmod(&rel, mode)).map_err(|e| {
             eprintln!("[SET_BASIC_INFO] chmod failed: {}", e);
             FspError::from(io::Error::new(io::ErrorKind::Other, format!("{}", e)))
         })?;
-
-        // 4) Handle timestamps - utimes (Linux equivalent)
         let mut need_utimes = false;
         let mut new_atime = None;
         let mut new_mtime = None;
@@ -3242,19 +2773,13 @@ impl FileSystemContext for RemoteFs {
                     ))
                 })?;
         }
-
-        // 5) Update cache with new permissions
         attr.perm = mode as u16;
         self.insert_attr_cache(rel_key.clone(), attr.clone());
         println!(
             "[SET_BASIC_INFO] ✓ Cache updated: perm={:#o} size={}",
             mode, attr.size
         );
-
-        // 6) Refresh parent cache
         let _ = self.update_cache(&parent_key);
-
-        // 7) Update WinFsp file_info
         if file_attributes != u32::MAX {
             file_info.file_attributes = file_attributes;
         }
@@ -3276,7 +2801,7 @@ impl FileSystemContext for RemoteFs {
 
     fn get_dir_info_by_name(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         file_name: &U16CStr,
         out_dir_info: &mut DirInfo,
     ) -> WinFspResult<()> {
@@ -3290,13 +2815,10 @@ impl FileSystemContext for RemoteFs {
 
         println!("[GET_DIR_INFO_BY_NAME] rel='{}'", rel);
 
-        // Root case
         if rel == "." {
             println!("[GET_DIR_INFO_BY_NAME] root directory");
             return Ok(());
         }
-
-        // Determina parent e nome
         let parent_rel = Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -3310,19 +2832,13 @@ impl FileSystemContext for RemoteFs {
 
         let parent_key = PathBuf::from(&parent_rel);
 
-        // Usa dir_entries (cache-aware)
         let entries = self.dir_entries(&parent_key)?;
 
-        // Cerca l'entry
         if let Some((_, _de)) = entries.iter().find(|(_, d)| d.name == name_only) {
             println!("[GET_DIR_INFO_BY_NAME] found entry: {}", _de.name);
 
-            // 🌟 PASSO CRITICO: Recupera gli attributi dalla cache
             match self.get_attr_cache(Path::new(&rel)) {
-                // ✅ CORRETTO: Gestisce il caso in cui l'attributo sia in cache (Some)
                 Some(attr) => {
-                    // Popola out_dir_info con i dati della cache
-                    //out_dir_info.file_info_mut().file_attributes = attr.file_attributes;
                     out_dir_info.file_info_mut().file_size = attr.size;
                     out_dir_info.file_info_mut().creation_time =
                         RemoteFs::nt_time_from_system_time(attr.ctime);
@@ -3335,19 +2851,11 @@ impl FileSystemContext for RemoteFs {
 
                     Ok(())
                 }
-                // ✅ CORRETTO: Gestisce il caso in cui l'attributo NON sia in cache (None)
                 None => {
                     eprintln!(
                         "[GET_DIR_INFO_BY_NAME] Attributi mancanti in cache per '{}'.",
                         rel
                     );
-
-                    // Opzione 1: Prova a recuperare dal backend (consigliato per robustezza)
-                    // Se hai una funzione self.api.get_attributes_by_path(&rel) che restituisce
-                    // Result<FileAttr, E>, puoi chiamarla qui.
-
-                    // Opzione 2: Ritorna FILE_NOT_FOUND (Se la cache è l'unica fonte attendibile)
-                    // Questo potrebbe essere l'errore se la creazione è fallita, ma la dir_entries è corretta.
                     Err(FspError::WIN32(ERROR_FILE_NOT_FOUND))
                 }
             }
@@ -3357,7 +2865,6 @@ impl FileSystemContext for RemoteFs {
         }
     }
 
-    //equivalente truncate per aumento dimensione di file in write
     fn set_file_size(
         &self,
         file_context: &Self::FileContext,
@@ -3368,19 +2875,15 @@ impl FileSystemContext for RemoteFs {
 
         if set_allocation_size {
             println!(
-                "[SET_FILE_SIZE] 🚫 Allocation-only request ignored ({} bytes)",
+                "[SET_FILE_SIZE] Allocation-only request ignored ({} bytes)",
                 new_size
             );
-
-            // Aggiorna solo allocation_size (opzionale)
             file_info.allocation_size =
                 file_info.allocation_size.max(new_size);
-
-            // ⚠️ RETURN IMMEDIATO — niente altro deve essere eseguito
             return Ok(());
         }
         println!(
-            "[SET_FILE_SIZE] ⭐ ino={} new_size={} set_allocation={} has_temp={}",
+            "[SET_FILE_SIZE] ino={} new_size={} set_allocation={} has_temp={}",
             file_context.ino,
             new_size,
             set_allocation_size,
@@ -3390,40 +2893,24 @@ impl FileSystemContext for RemoteFs {
         let path = self.path_of(file_context.ino).ok_or(FspError::WIN32(
             windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
         ))?;
-
-        // ============================================================
-        // ✅ CASE 1: PRE-ALLOCATION ONLY (DO NOT TOUCH FILE SIZE)
-        // ============================================================
         if set_allocation_size {
             println!(
-                "[SET_FILE_SIZE] 📦 Preallocation request: {} bytes (ignored logically)",
+                "[SET_FILE_SIZE] Preallocation request: {} bytes (ignored logically)",
                 new_size
             );
-
-            // Aggiorna solo allocation_size per WinFsp
             file_info.allocation_size = new_size.max(file_info.allocation_size);
-
-            // NON aggiornare:
-            // - temp file size
-            // - backend
-            // - attr.size
-            // - file_info.file_size
 
             return Ok(());
         }
 
-        // ============================================================
-        // ✅ CASE 2: REAL FILE RESIZE (truncate / extend)
-        // ============================================================
-
         if let Some(tw) = &file_context.temp_write {
             println!(
-                "[SET_FILE_SIZE] ✂️ Resizing TEMP file '{}' to {}",
+                "[SET_FILE_SIZE] Resizing TEMP file '{}' to {}",
                 tw.tem_path.display(),
                 new_size
             );
 
-            let mut f = std::fs::OpenOptions::new()
+            let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&tw.tem_path)
                 .map_err(|e| {
@@ -3442,8 +2929,7 @@ impl FileSystemContext for RemoteFs {
                 ))
             })?;
         } else {
-            // Raro: file aperto senza temp_write (read-only path)
-            println!("[SET_FILE_SIZE] ✂️ Resizing BACKEND directly to {}", new_size);
+            println!("[SET_FILE_SIZE] Resizing BACKEND directly to {}", new_size);
 
             let rel = RemoteFs::rel_of(&path);
             self.rt
@@ -3457,9 +2943,6 @@ impl FileSystemContext for RemoteFs {
                 })?;
         }
 
-        // ============================================================
-        // ✅ Update local cache
-        // ============================================================
 
         if let Some(mut attr) = self.get_attr_cache(&path) {
             attr.size = new_size;
@@ -3469,15 +2952,11 @@ impl FileSystemContext for RemoteFs {
             self.insert_attr_cache(path.clone(), attr);
         }
 
-        // ============================================================
-        // ✅ Update WinFsp FileInfo
-        // ============================================================
-
         file_info.file_size = new_size;
         file_info.allocation_size = ((new_size + 4095) / 4096) * 4096;
 
         println!(
-            "[SET_FILE_SIZE] ✅ Done: file_size={} allocation_size={}",
+            "[SET_FILE_SIZE] Done: file_size={} allocation_size={}",
             file_info.file_size,
             file_info.allocation_size
         );
@@ -3491,20 +2970,17 @@ impl FileSystemContext for RemoteFs {
         _file_info: &mut FileInfo,
     ) -> WinFspResult<()> {
         println!(
-            "[FLUSH] ⭐ CALLED! ino={} has_temp={}",
+            "[FLUSH] CALLED! ino={} has_temp={}",
             file_context.unwrap().ino,
             file_context.unwrap().temp_write.is_some()
         );
-        // Se c'è un temp file, committalo subito
         if let Some(ref tw) = file_context.unwrap().temp_write {
             println!("[FLUSH] temp file: '{}'", tw.tem_path.display());
 
             if let Ok(metadata) = std::fs::metadata(&tw.tem_path) {
                 println!("[FLUSH] temp file size: {}", metadata.len());
-
-                // Se il file è vuoto, leggi da stdin o altra fonte?
                 if metadata.len() == 0 {
-                    println!("[FLUSH] ⚠️ WARNING: Flushing empty temp file!");
+                    println!("[FLUSH] WARNING: Flushing empty temp file!");
                 }
             }
 
@@ -3529,10 +3005,8 @@ impl FileSystemContext for RemoteFs {
                 })?;
 
             if let Ok(meta) = std::fs::metadata(&tw.tem_path) {
-                // Se hai size locale, aggiorna l’entry
                 if let Some(mut a) = self.get_attr_cache(&path) {
                     a.size = meta.len();
-                    // Imposta un mtime conservativo “ora”; se hai un valore dal backend, meglio usarlo
                     let now = std::time::SystemTime::now();
                     a.mtime = now;
                     a.ctime = now;
@@ -3551,16 +3025,13 @@ impl FileSystemContext for RemoteFs {
         &self,
         context: &Self::FileContext,
         file_name: &U16CStr,
-        buffer: &mut [u8],
+        _buffer: &mut [u8],
     ) -> Result<u64, FspError> {
         println!(
             "[GET_REPARSE_POINT] ino={} file_name={}",
             context.ino,
             file_name.to_string_lossy()
         );
-
-        // Non supportiamo reparse point (symlink, junction, ecc.)
-        // Ritorna 0 (nessun reparse point)
         Ok(0)
     }
 
@@ -3596,8 +3067,6 @@ impl FileSystemContext for RemoteFs {
         };
 
         let rel = RemoteFs::rel_of(std::path::Path::new(&path));
-
-        //se non hai i permessi negi la cancellazione
         if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
             if (attr.perm & 0o222) == 0 {
                 println!(
@@ -3609,11 +3078,7 @@ impl FileSystemContext for RemoteFs {
         }
 
         if delete {
-            // Prima verifica se si può cancellare
-
             self.can_delete(file_context, rel)?;
-
-            // 🔴 Importante: marca il contesto come "da cancellare al close"
             file_context.delete_on_close.store(true, Ordering::Relaxed);
 
             println!(
@@ -3624,10 +3089,8 @@ impl FileSystemContext for RemoteFs {
             file_context.delete_on_close.store(false, Ordering::Relaxed);
         }
 
-        Ok(()) //tornando ok dovrebbe marcare il fspCleanupDelete in modo da abilitare la cancellazione
+        Ok(())
     }
-
-    //problema con la rimozione da windows powershell perchè rmdir non funziona per farlo funzionare bisogna chiamare cmd /c rmdir nome_cartella
     fn cleanup(&self, file_context: &MyFileContext, file_name: Option<&U16CStr>, flags: u32) {
         println!(
             "[CLEANUP] flags={:#x} FspCleanupDelete={:#x} delete_on_close={}",
@@ -3635,10 +3098,6 @@ impl FileSystemContext for RemoteFs {
             FspCleanupDelete as u32,
             file_context.delete_on_close.load(Ordering::Relaxed)
         );
-
-        //
-        // 1) Ricava il path canonico
-        //
         let path = if let Some(name) = file_name {
             self.path_from_u16(name)
         } else if let Some(p) = self.path_of(file_context.ino) {
@@ -3654,22 +3113,15 @@ impl FileSystemContext for RemoteFs {
             eprintln!("[ERROR] cleanup: impossibile cancellare la root directory");
             return;
         }
-
-        //se non hai i permessi negi la cancellazione
         if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
             if (attr.perm & 0o222) == 0 {
                 println!(
                     "[SET_DELETE] denied by perm for {:?} perm={:#o}",
                     path, attr.perm
                 );
-                //return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
                 return;
             }
         }
-
-        //
-        // 2) Determina parent e nome
-        //
         let parent_rel = std::path::Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -3683,8 +3135,6 @@ impl FileSystemContext for RemoteFs {
 
         let parent_path = PathBuf::from(&parent_rel);
         println!("[CLEANUP] ParentPath : {:?} ", parent_path);
-
-        // Se c'è un TempWrite pendente per questo ino, non evictare né cancellare
         if self
             .state
             .writes
@@ -3699,9 +3149,6 @@ impl FileSystemContext for RemoteFs {
             return;
         }
 
-        //
-        // 3) Usa dir_entries() con cache invece di api.ls()
-        //
         let list = match self.dir_entries(&parent_path) {
             Ok(v) => v,
             Err(e) => {
@@ -3713,9 +3160,6 @@ impl FileSystemContext for RemoteFs {
             }
         };
 
-        //
-        // 4) Se l’entry non esiste già localmente o nel backend → solo evict
-        //
         let Some((_, de)) = list.iter().find(|(_, d)| d.name == name_only) else {
             println!("[CLEANUP] entry '{}' già sparita, eseguo solo evict", rel);
             self.evict_all_state_for(&path);
@@ -3725,11 +3169,7 @@ impl FileSystemContext for RemoteFs {
 
         let is_dir = RemoteFs::is_dir(&de);
 
-        //
-        // 5) Verifica flag delete-on-close
-        //mettiamo il flag sempre attivo FSP_CLEANUP_DELETE per forzare la cancellazione
         let del_flag = (flags & (FspCleanupDelete as u32)) != 0;
-        //let del_flag = (flags & (FSP_CLEANUP_DELETE as u32)) != 0;
         let del_ctx = file_context.delete_on_close.load(Ordering::Relaxed);
 
         println!(
@@ -3741,10 +3181,6 @@ impl FileSystemContext for RemoteFs {
             println!("[DEBUG] cleanup: no delete request, skip");
             return;
         }
-
-        //
-        // 6) Per directory: controlla se è vuota (CanDelete dovrebbe averlo garantito)
-        //
         if is_dir {
             let dir_path = PathBuf::from(&rel);
 
@@ -3767,10 +3203,6 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         }
-
-        //
-        // 7) Esegui la delete lato backend
-        //
         match self.rt.block_on(self.api.delete(&rel)) {
             Ok(_) => println!("[DEBUG] cleanup: '{}' eliminato", rel),
             Err(e) => {
@@ -3778,47 +3210,19 @@ impl FileSystemContext for RemoteFs {
                 return;
             }
         }
-
-        //
-        // 8) Aggiorna cache: evict dell’entry eliminata
-        //
         self.evict_all_state_for(&path);
-
-        //
-        // 9) HARD refresh del parent: chiamata diretta a backend.ls (niente dir_entries) per aggiornale cache al prossimo passsaggio
-        /*match self.rt.block_on(self.api.ls(&parent_rel)) {
-            Ok(list) => {
-                self.insert_dir_cache(
-                    parent_path.clone(),
-                    (list.clone(), std::time::SystemTime::now())
-                );
-                println!("[CLEANUP] parent '{:?}' hard-refreshed", parent_path);
-            }
-            Err(e) => {
-                eprintln!("[ERROR] cleanup: ls parent '{}' fallita: {}, invalido cache", parent_rel, e);
-                // invalida per forzare miss al prossimo accesso
-                self.dir_cache.lock().unwrap().remove(&parent_path);
-            }
-        }*/
         let _ = self.update_cache(&parent_path);
 
         println!("[CLEANUP] done '{}'", rel);
     }
 }
 
-/*pub fn mount_fs(mountpoint: &str, api: FileApi) -> anyhow::Result<()> {
-let rt = Arc::new(Runtime::new()?);
-let fs = RemoteFs::new(api, rt);
-fs.init_cache();*/
 
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
     let fs = RemoteFs::new(api, rt.clone());
-    let fs_state = fs.state.clone(); // ← CRITICO: Clona lo stato per il WebSocket
-
+    let fs_state = fs.state.clone();
     fs.init_cache();
-
-    // Configura WinFSP
     let mut vparams = VolumeParams::default();
     vparams.sectors_per_allocation_unit(64);
     vparams.sector_size(4096);
@@ -3831,8 +3235,6 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let mut host = FileSystemHost::new(vparams, fs)?;
     host.mount(mountpoint)?;
     host.start()?;
-
-    // ✅ Avvia WebSocket listener in background
     println!("[Mount] Starting WebSocket listener for: {}", url);
     {
         let url_clone = url.clone();
@@ -3841,7 +3243,6 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
         });
     }
 
-    // Attendi Ctrl-C
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
