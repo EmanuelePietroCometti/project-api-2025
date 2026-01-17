@@ -9,8 +9,11 @@ const file = new FileDAO();
 router.get('/', async (req, res) => {
     try {
         let dirname = req.query.relPath;
-        if (dirname === '') {
+        if (dirname === '' || dirname === './storage') {
             dirname = '.';
+        }
+        if (dirname.startsWith('././')) {
+            dirname = dirname.slice(2);
         }
         const files = await file.getFilesByDirectory(dirname);
         res.json(files);
@@ -24,8 +27,11 @@ router.get('/', async (req, res) => {
 router.get("/updatedMetadata", async (req, res) => {
     try {
         let path = req.query.relPath;
-        if (!path || path === "./storage" || path=="") {
+        if (!path || path=="" || path== "./storage") {
             path = ".";
+        }
+        if (path.startsWith('././')) {
+            path = path.slice(2);
         }
         const f = await file.getFileByPath(path);
         if (!f) {
