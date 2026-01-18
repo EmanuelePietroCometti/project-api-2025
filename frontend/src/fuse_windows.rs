@@ -241,10 +241,11 @@ impl RemoteFs {
     }
 
     pub fn insert_attr_cache(&self, path: PathBuf, attr: FileAttr) {
+        if cfg!(debug_assertions) {
         println!(
             "[INSERT ATTR CACHE] (path , attr) : ({:?}, {:?}) ",
             path, attr
-        );
+        );}
         self.state.set_attr(&path, attr);
     }
 
@@ -273,7 +274,8 @@ impl RemoteFs {
             };
 
             if !attrcache.contains_key(&child) {
-                println!("[UPDATE CACHE] aggiornamento attr cache miss");
+                if cfg!(debug_assertions) {
+                println!("[UPDATE CACHE] aggiornamento attr cache miss");}
                 let isdir = Self::is_dir(&de);
                 let ty = if isdir {
                     NodeType::Directory
@@ -288,10 +290,11 @@ impl RemoteFs {
                 };
                 let nlink = 1;
                 let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, nlink);
+                if cfg!(debug_assertions) {
                 println!(
                     "[INSERT ATTR CACHE/Update] (path , attr) : ({:?}, {:?}) ",
                     child, attr
-                );
+                );}
                 attrcache.insert(child.clone(), attr);
             }
         }
@@ -403,8 +406,8 @@ impl RemoteFs {
 
     fn dir_entries(&self, dir: &Path) -> WinFspResult<Vec<(PathBuf, DirectoryEntry)>> {
         let rel = Self::rel_of(dir);
-
-        println!("[DEBUG] dir_entries(): chiamata backend -> rel='{}'", rel);
+        if cfg!(debug_assertions) {
+        println!("[DEBUG] dir_entries(): chiamata backend -> rel='{}'", rel);}
         if let Some((entries, ts)) = self
             .state
             .dir_cache
@@ -451,16 +454,19 @@ impl RemoteFs {
 
         match &list_res {
             Ok(list) => {
-                println!("[DEBUG] dir_entries(): backend OK ({} entries)", list.len());
+                if cfg!(debug_assertions) {
+                println!("[DEBUG] dir_entries(): backend OK ({} entries)", list.len());}
                 for (i, de) in list.iter().enumerate() {
+                    if cfg!(debug_assertions) {
                     println!(
                         "  [{}] name='{}', perm='{}', size={}, mtime={}",
                         i, de.name, de.permissions, de.size, de.mtime
-                    );
+                    );}
                 }
             }
             Err(e) => {
-                eprintln!("[DEBUG] dir_entries(): backend ERROR -> {}", e);
+                if cfg!(debug_assertions) {
+                eprintln!("[DEBUG] dir_entries(): backend ERROR -> {}", e);}
             }
         }
 
@@ -472,11 +478,11 @@ impl RemoteFs {
         self.insert_dir_cache(PathBuf::from(&rel), (list.clone(), SystemTime::now()));
 
         let mut out = Vec::with_capacity(list.len());
-
+        if cfg!(debug_assertions) {
         println!(
             "[DIR_ENTRIES] path utilizzato caso no cache per file attr {}",
             rel
-        );
+        );}
 
         for de in list {
             let child_str = if rel == "." || rel.is_empty() {
@@ -540,7 +546,8 @@ impl RemoteFs {
 
     fn path_from_u16(&self, path: &U16CStr) -> String {
         let raw = path.to_os_string().to_string_lossy().to_string();
-        println!("[DEBUG] path_from_u16 RAW input: '{}'", raw);
+        if cfg!(debug_assertions) {
+        println!("[DEBUG] path_from_u16 RAW input: '{}'", raw);}
 
         let mut s = raw;
 
@@ -581,15 +588,16 @@ impl RemoteFs {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-
+if cfg!(debug_assertions) {
         println!(
             "[DEBUG] backend_entry_exists: rel='{}' -> parent_rel='{}' name='{}'",
             path, parent_rel, name
-        );
+        );}
 
         match self.rt.block_on(self.api.ls(&parent_rel)) {
             Ok(list) => {
                 let exists = list.iter().any(|de| de.name == name);
+                if cfg!(debug_assertions) {
                 println!(
                     "[DEBUG] backend_entry_exists: parent='{}' found={} entries=[{}] exists={}",
                     parent_rel,
@@ -599,11 +607,12 @@ impl RemoteFs {
                         .collect::<Vec<_>>()
                         .join(", "),
                     exists
-                );
+                );}
                 exists
             }
             Err(e) => {
-                eprintln!("[DEBUG] backend_entry_exists: backend error: {}", e);
+                if cfg!(debug_assertions) {
+                eprintln!("[DEBUG] backend_entry_exists: backend error: {}", e);}
                 false
             }
         }
@@ -635,11 +644,13 @@ impl RemoteFs {
     }
 
     fn can_delete(&self, _file_context: &MyFileContext, rel: String) -> WinFspResult<()> {
+        if cfg!(debug_assertions) {
         println!("[CAN_DELETE] enter");
-        println!("[CAN_DELETE] rel = '{}'", rel);
+        println!("[CAN_DELETE] rel = '{}'", rel);}
 
         if rel == "." {
-            println!("[CAN_DELETE] rel='.' => deny delete: ERROR_ACCESS_DENIED");
+            if cfg!(debug_assertions) {
+            println!("[CAN_DELETE] rel='.' => deny delete: ERROR_ACCESS_DENIED");}
             return Err(FspError::WIN32(
                 windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED,
             ));
@@ -654,25 +665,27 @@ impl RemoteFs {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-
+        if cfg!(debug_assertions) {
         println!(
             "[CAN_DELETE] parent_rel='{}', name_only='{}'",
             parent_rel, name_only
-        );
+        );}
         let list = match self.rt.block_on(self.api.ls(&parent_rel)) {
             Ok(v) => {
+                if cfg!(debug_assertions) {
                 println!(
                     "[CAN_DELETE] api.ls(parent='{}') ok: {} entries",
                     parent_rel,
                     v.len()
-                );
+                );}
                 v
             }
             Err(e) => {
+                if cfg!(debug_assertions) {
                 println!(
                     "[CAN_DELETE] api.ls(parent='{}') ERR: {} -> map to Other",
                     parent_rel, e
-                );
+                );}
                 return Err(FspError::from(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
@@ -682,17 +695,19 @@ impl RemoteFs {
 
         let de = match list.iter().find(|d| d.name == name_only) {
             Some(d) => {
+                if cfg!(debug_assertions) {
                 println!(
                     "[CAN_DELETE] found entry name='{}' is_dir={:?}",
                     d.name, d.is_dir
-                );
+                );}
                 d
             }
             None => {
+                if cfg!(debug_assertions) {
                 println!(
                     "[CAN_DELETE] entry '{}' not found in parent '{}': ERROR_FILE_NOT_FOUND",
                     name_only, parent_rel
-                );
+                );}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
                 ));
@@ -700,24 +715,28 @@ impl RemoteFs {
         };
 
         let is_dir = RemoteFs::is_dir(&de);
-        println!("[CAN_DELETE] is_dir={}", is_dir);
+        if cfg!(debug_assertions) {
+        println!("[CAN_DELETE] is_dir={}", is_dir);}
 
         if is_dir {
-            println!("[CAN_DELETE] directory case -> check emptiness for RemoveDirectory");
+            if cfg!(debug_assertions) {
+            println!("[CAN_DELETE] directory case -> check emptiness for RemoveDirectory");}
             let children = match self.rt.block_on(self.api.ls(&rel)) {
                 Ok(v) => {
+                    if cfg!(debug_assertions) {
                     println!(
                         "[CAN_DELETE] api.ls(rel='{}') ok: {} children",
                         rel,
                         v.len()
-                    );
+                    );}
                     v
                 }
                 Err(e) => {
+                    if cfg!(debug_assertions) {
                     println!(
                         "[CAN_DELETE] api.ls(rel='{}') ERR: {} -> map to Other",
                         rel, e
-                    );
+                    );}
                     return Err(FspError::from(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         e.to_string(),
@@ -725,55 +744,23 @@ impl RemoteFs {
                 }
             };
             if !children.is_empty() {
-                println!("[CAN_DELETE] directory not empty -> ERROR_DIR_NOT_EMPTY");
+                if cfg!(debug_assertions) {
+                println!("[CAN_DELETE] directory not empty -> ERROR_DIR_NOT_EMPTY");}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_DIR_NOT_EMPTY,
                 ));
             }
-            println!("[CAN_DELETE] directory empty -> allow delete-on-close");
+            if cfg!(debug_assertions) {
+            println!("[CAN_DELETE] directory empty -> allow delete-on-close");}
         } else {
-            println!("[CAN_DELETE] file case -> allow delete-on-close");
+            if cfg!(debug_assertions) {
+            println!("[CAN_DELETE] file case -> allow delete-on-close");}
         }
-
+        if cfg!(debug_assertions) {
         println!(
             "[CAN_DELETE] accept -> return Ok (WinFsp will signal FspCleanupDelete at Cleanup)"
-        );
+        );}
         Ok(())
-    }
-
-    fn filetime_to_systemtime(ft: u64) -> Option<SystemTime> {
-        if ft == 0 {
-            return None;
-        }
-
-        const WINDOWS_EPOCH_OFFSET_SECS: u64 = 11644473600; // secondi tra 1601 e 1970
-        const HUNDRED_NS_PER_SEC: u64 = 10_000_000;
-
-        // Converti intervalli di 100ns in secondi e nanosecondi
-        let total_seconds = ft / HUNDRED_NS_PER_SEC;
-        let nanos = ((ft % HUNDRED_NS_PER_SEC) * 100) as u32;
-
-        // SOTTRAI l'offset Windows per ottenere Unix timestamp
-        if total_seconds < WINDOWS_EPOCH_OFFSET_SECS {
-            eprintln!(
-                "[WARN] filetime_to_systemtime: timestamp prima del 1970 (ft={})",
-                ft
-            );
-            return None;
-        }
-
-        let unix_seconds = total_seconds - WINDOWS_EPOCH_OFFSET_SECS;
-
-        // Validazione ragionevolezza (tra 1970 e 2100)
-        if unix_seconds > 4_102_444_800 {
-            eprintln!(
-                "[WARN] filetime_to_systemtime: timestamp futuro remoto: {} (ft={}) - forse bug?",
-                unix_seconds, ft
-            );
-            return None;
-        }
-
-        Some(UNIX_EPOCH + Duration::new(unix_seconds, nanos))
     }
 
     fn split_parent_name(rel: &str) -> (String, String) {
@@ -815,18 +802,19 @@ fn normalize_websocket_path(raw: &str) -> String {
         let normalized = raw.replace('\\', "/");
         return format!("./{}", normalized);
     }
-    eprintln!("[WebSocket] WARNING: Unhandled path format: '{}'", raw);
+    if cfg!(debug_assertions) {
+    eprintln!("[WebSocket] WARNING: Unhandled path format: '{}'", raw);}
     raw.to_string()
 }
 
 fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16, i64)> {
     let raw_rel = payload["relPath"].as_str()?;
     let rel = normalize_websocket_path(raw_rel);
-
+    if cfg!(debug_assertions) {
     println!(
         "[WebSocket] metadata_from_payload: raw='{}' -> normalized='{}'",
         raw_rel, rel
-    );
+    );}
     let name = payload["name"]
         .as_str()
         .map(|s| s.to_string())
@@ -866,28 +854,33 @@ pub fn start_websocket_listener(api_url: &str, fs_state: Arc<FsState>) {
         tokio::task::spawn_blocking(move || {
             let client = ClientBuilder::new(ws_url_clone)
                 .on("connect", |_, _| {
-                    println!("[WebSocket] Connected!");
+                    if cfg!(debug_assertions) {
+                    println!("[WebSocket] Connected!");}
                 })
                 .on("fs_change", move |payload, _| match payload {
                     Payload::Text(values) => {
                         if values.len() < 1 {
-                            eprintln!("[WebSocket] fs_change without data");
+                            if cfg!(debug_assertions) {
+                            eprintln!("[WebSocket] fs_change without data");}
                             return;
                         }
                         let json_payload = &values[0];
                         handle_fs_change(json_payload, &fs_state_cloned);
                     }
                     _ => {
-                        eprintln!("[WebSocket] Binary payload not supported");
+                        if cfg!(debug_assertions) {
+                        eprintln!("[WebSocket] Binary payload not supported");}
                     }
                 })
                 .on("error", |err, _| {
-                    eprintln!("[WebSocket] Error: {:?}", err);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[WebSocket] Error: {:?}", err);}
                 })
                 .connect();
 
             if let Err(err) = client {
-                eprintln!("[WebSocket] Connection failed: {:?}", err);
+                if cfg!(debug_assertions) {
+                eprintln!("[WebSocket] Connection failed: {:?}", err);}
             }
         });
     });
@@ -895,8 +888,8 @@ pub fn start_websocket_listener(api_url: &str, fs_state: Arc<FsState>) {
 
 fn handle_fs_change(payload: &Value, fs_state: &FsState) {
     let op = payload["op"].as_str().unwrap_or("");
-
-    println!("[WebSocket] Received fs_change: op={}", op);
+    if cfg!(debug_assertions) {
+    println!("[WebSocket] Received fs_change: op={}", op);}
 
     match op {
         "add" | "addDir" => {
@@ -912,34 +905,38 @@ fn handle_fs_change(payload: &Value, fs_state: &FsState) {
             handle_renamed_event(payload, fs_state);
         }
         _ => {
-            println!("[WebSocket] Unknown op: {}", op);
+            if cfg!(debug_assertions) {
+            println!("[WebSocket] Unknown op: {}", op);}
         }
     }
 }
 
 fn handle_created(payload: &Value, st: &FsState) {
     let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
-        eprintln!("[WebSocket] handle_created: invalid metadata");
+        if cfg!(debug_assertions) {
+        eprintln!("[WebSocket] handle_created: invalid metadata");}
         return;
     };
-
-    println!("[WebSocket] CREATE: path={:?} is_dir={}", abs, is_dir);
+    if cfg!(debug_assertions) {
+    println!("[WebSocket] CREATE: path={:?} is_dir={}", abs, is_dir);}
 
     let _ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
 
     if let Some(parent) = abs.parent() {
         st.remove_dir_cache(parent);
-        println!("[WebSocket] Invalidated parent dir cache: {:?}", parent);
+        if cfg!(debug_assertions) {
+        println!("[WebSocket] Invalidated parent dir cache: {:?}", parent);}
     }
 }
 
 fn handle_updated(payload: &Value, st: &FsState) {
     let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
-        eprintln!("[WebSocket] handle_updated: invalid metadata");
+        if cfg!(debug_assertions) {
+        eprintln!("[WebSocket] handle_updated: invalid metadata");}
         return;
     };
-
-    println!("[WebSocket] UPDATE: path={:?} size={}", abs, size);
+    if cfg!(debug_assertions) {
+    println!("[WebSocket] UPDATE: path={:?} size={}", abs, size);}
 
     update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
 
@@ -957,39 +954,44 @@ fn handle_deleted_event(payload: &Value, st: &FsState) {
         } else {
             PathBuf::from(format!("./{}", rel))
         };
-
-        println!("[WebSocket] DELETE: path={:?}", abs);
+        if cfg!(debug_assertions) {
+        println!("[WebSocket] DELETE: path={:?}", abs);}
 
         handle_deleted_path(&abs, st);
     } else {
-        eprintln!("[WebSocket] handle_deleted_event: missing relPath");
+        if cfg!(debug_assertions) {
+        eprintln!("[WebSocket] handle_deleted_event: missing relPath");}
     }
 }
 
 fn handle_deleted_path(abs: &Path, st: &FsState) {
     if let Some(ino) = st.ino_of(abs) {
         st.mark_deleted(ino);
-        println!("[WebSocket] Marked inode {} as deleted", ino);
+        if cfg!(debug_assertions) {
+        println!("[WebSocket] Marked inode {} as deleted", ino);}
     }
     st.remove_path(abs);
     st.remove_attr(abs);
 
     if let Some(parent) = abs.parent() {
         st.remove_dir_cache(parent);
+        if cfg!(debug_assertions) {
         println!(
             "[WebSocket] Invalidated parent dir cache after delete: {:?}",
             parent
-        );
+        );}
     }
 }
 
 fn handle_renamed_event(payload: &Value, st: &FsState) {
     let Some(old_rel) = payload["oldPath"].as_str() else {
-        eprintln!("[WebSocket] handle_renamed_event: missing oldPath");
+        if cfg!(debug_assertions) {
+        eprintln!("[WebSocket] handle_renamed_event: missing oldPath");}
         return;
     };
     let Some(new_rel) = payload["newPath"].as_str() else {
-        eprintln!("[WebSocket] handle_renamed_event: missing newPath");
+        if cfg!(debug_assertions) {
+        eprintln!("[WebSocket] handle_renamed_event: missing newPath");}
         return;
     };
     let old_abs = if old_rel.starts_with("./") {
@@ -1003,8 +1005,8 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
     } else {
         PathBuf::from(format!("./{}", new_rel))
     };
-
-    println!("[WebSocket] RENAME: {:?} -> {:?}", old_abs, new_abs);
+    if cfg!(debug_assertions) {
+    println!("[WebSocket] RENAME: {:?} -> {:?}", old_abs, new_abs);}
 
     let _ino = if let Some(ino) = st.ino_of(&old_abs) {
         st.remove_path(&old_abs);
@@ -1022,11 +1024,13 @@ fn handle_renamed_event(payload: &Value, st: &FsState) {
 
     if let Some(old_parent) = old_abs.parent() {
         st.remove_dir_cache(old_parent);
-        println!("[WebSocket] Invalidated old parent: {:?}", old_parent);
+        if cfg!(debug_assertions) {
+        println!("[WebSocket] Invalidated old parent: {:?}", old_parent);}
     }
     if let Some(new_parent) = new_abs.parent() {
         st.remove_dir_cache(new_parent);
-        println!("[WebSocket] Invalidated new parent: {:?}", new_parent);
+        if cfg!(debug_assertions) {
+        println!("[WebSocket] Invalidated new parent: {:?}", new_parent);}
     }
 }
 
@@ -1111,17 +1115,20 @@ impl FileSystemContext for RemoteFs {
         let path_abs = self.path_from_u16(name);
         let rel = RemoteFs::rel_of(std::path::Path::new(&path_abs));
         let is_root = rel == ".";
-
+        if cfg!(debug_assertions) {
         println!("[GET_SECURITY_BY_NAME] path='{}' rel='{}'", path_abs, rel);
+        }
 
         let sd_bytes = RemoteFs::sd_from_sddl("O:BAG:BAD:(A;;FA;;;WD)(A;;FA;;;BA)(A;;FA;;;SY)")
             .unwrap_or_else(|_| {
-                eprintln!("[GET_SECURITY_BY_NAME] WARN: sd_from_sddl failed, using empty SD");
+                if cfg!(debug_assertions) {
+                eprintln!("[GET_SECURITY_BY_NAME] WARN: sd_from_sddl failed, using empty SD");}
                 Vec::new()
             });
 
         let required = sd_bytes.len();
-        println!("[GET_SECURITY_BY_NAME] SD size={} bytes", required);
+        if cfg!(debug_assertions) {
+        println!("[GET_SECURITY_BY_NAME] SD size={} bytes", required);}
 
         if is_root {
             if let Some(buff) = buf {
@@ -1130,13 +1137,15 @@ impl FileSystemContext for RemoteFs {
                         let dst = buff.as_mut_ptr() as *mut u8;
                         std::ptr::copy_nonoverlapping(sd_bytes.as_ptr(), dst, required);
                     }
-                    println!("[GET_SECURITY_BY_NAME] SD copied to buffer (root)");
+                    if cfg!(debug_assertions) {
+                    println!("[GET_SECURITY_BY_NAME] SD copied to buffer (root)");}
                 } else if buff.len() < required {
+                    if cfg!(debug_assertions) {
                     println!(
                         "[GET_SECURITY_BY_NAME] Buffer too small: {} < {}",
                         buff.len(),
                         required
-                    );
+                    );}
                 }
             }
 
@@ -1159,20 +1168,22 @@ impl FileSystemContext for RemoteFs {
             .unwrap_or_default();
 
         let parent_path = PathBuf::from(&parent_rel);
-
+        if cfg!(debug_assertions) {
         println!(
             "[GET_SECURITY_BY_NAME] parent='{}' name='{}' parent_key='{}'",
             parent_rel,
             name_only,
             parent_path.display()
-        );
+        );}
         let list = match self.dir_entries(&parent_path) {
             Ok(v) => {
-                println!("[GET_SECURITY_BY_NAME] dir_entries OK: {} entries", v.len());
+                if cfg!(debug_assertions) {
+                println!("[GET_SECURITY_BY_NAME] dir_entries OK: {} entries", v.len());}
                 v
             }
             Err(e) => {
-                eprintln!("[GET_SECURITY_BY_NAME] dir_entries FAILED: {}", e);
+                if cfg!(debug_assertions) {
+                eprintln!("[GET_SECURITY_BY_NAME] dir_entries FAILED: {}", e);}
                 return Err(e);
             }
         };
@@ -1191,23 +1202,25 @@ impl FileSystemContext for RemoteFs {
                         let dst = buff.as_mut_ptr() as *mut u8;
                         std::ptr::copy_nonoverlapping(sd_bytes.as_ptr(), dst, required);
                     }
-                    println!("[GET_SECURITY_BY_NAME] SD copied to buffer");
+                    if cfg!(debug_assertions) {
+                    println!("[GET_SECURITY_BY_NAME] SD copied to buffer");}
                 } else if buff.len() < required {
+                    if cfg!(debug_assertions) {
                     println!(
                         "[GET_SECURITY_BY_NAME] Buffer too small: {} < {}",
                         buff.len(),
                         required
-                    );
+                    );}
                 }
             }
-
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_SECURITY_BY_NAME] FOUND '{}' is_dir={} attrs={:#x} sd_len={}",
                 child_path.display(),
                 is_dir,
                 attrs,
                 required
-            );
+            );}
 
             return Ok(FileSecurity {
                 reparse: false,
@@ -1215,10 +1228,11 @@ impl FileSystemContext for RemoteFs {
                 sz_security_descriptor: required as u64,
             });
         }
+        if cfg!(debug_assertions) {
         eprintln!(
             "[GET_SECURITY_BY_NAME] NOT FOUND '{}' in parent '{}'",
             name_only, parent_rel
-        );
+        );}
 
         Err(FspError::WIN32(ERROR_FILE_NOT_FOUND))
     }
@@ -1228,16 +1242,19 @@ impl FileSystemContext for RemoteFs {
         context: &Self::FileContext,
         security_descriptor: Option<&mut [c_void]>,
     ) -> WinFspResult<u64> {
-        println!("[GET_SECURITY] ino={}", context.ino);
+        if cfg!(debug_assertions) {
+        println!("[GET_SECURITY] ino={}", context.ino);}
 
         let sd_bytes = Self::sd_from_sddl("O:BAG:BAD:(A;;FA;;;WD)(A;;FA;;;BA)(A;;FA;;;SY)")
             .unwrap_or_else(|_| {
-                eprintln!("[GET_SECURITY] WARN: sd_from_sddl failed, using empty SD");
+                if cfg!(debug_assertions) {
+                eprintln!("[GET_SECURITY] WARN: sd_from_sddl failed, using empty SD");}
                 Vec::new()
             });
 
         let sd_len = sd_bytes.len();
-        println!("[GET_SECURITY] SD size={} bytes", sd_len);
+        if cfg!(debug_assertions) {
+        println!("[GET_SECURITY] SD size={} bytes", sd_len);}
 
         if security_descriptor.is_none() {
             return Ok(sd_len as u64);
@@ -1247,7 +1264,8 @@ impl FileSystemContext for RemoteFs {
         let buf_len = buf_void.len();
 
         if buf_len < sd_len {
-            println!("[GET_SECURITY] Buffer too small: {} < {}", buf_len, sd_len);
+            if cfg!(debug_assertions) {
+            println!("[GET_SECURITY] Buffer too small: {} < {}", buf_len, sd_len);}
             return Err(FspError::WIN32(
                 windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER,
             ));
@@ -1257,58 +1275,64 @@ impl FileSystemContext for RemoteFs {
             unsafe { slice::from_raw_parts_mut(buf_void.as_mut_ptr() as *mut u8, buf_len) };
 
         dst_u8[..sd_len].copy_from_slice(&sd_bytes);
-        println!("[GET_SECURITY] SD copied to buffer");
+        if cfg!(debug_assertions) {
+        println!("[GET_SECURITY] SD copied to buffer");}
 
         Ok(sd_len as u64)
     }
 
     fn get_file_info(&self, context: &MyFileContext, file_info: &mut FileInfo) -> WinFspResult<()> {
+        if cfg!(debug_assertions) {
         println!(
             "[GET_FILE_INFO] start ino={} is_dir={}",
             context.ino, context.is_dir
-        );
+        );}
 
         let path = match self.path_of(context.ino) {
             Some(p) => p,
             None => {
+                if cfg!(debug_assertions) {
                 println!(
                     "[GET_FILE_INFO] ERROR: ino={} non mappato -> FILE_NOT_FOUND",
                     context.ino
-                );
+                );}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
                 ));
             }
         };
         let rel = RemoteFs::rel_of(&path);
+        if cfg!(debug_assertions) {
         println!(
             "[GET_FILE_INFO] path_abs='{}' rel='{}'",
             path.display(),
             rel
-        );
+        );}
 
         if context.is_dir {
             file_info.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
             file_info.file_size = 0;
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] dir path='{}' set attrs=DIR size=0 (cache lookup)",
                 rel
-            );
+            );}
 
             if let Some(attr) = self.get_attr_cache(&PathBuf::from(&rel)) {
                 file_info.creation_time = RemoteFs::nt_time_from_system_time(attr.crtime);
                 file_info.last_access_time = RemoteFs::nt_time_from_system_time(attr.atime);
                 file_info.last_write_time = RemoteFs::nt_time_from_system_time(attr.mtime);
                 file_info.change_time = RemoteFs::nt_time_from_system_time(attr.ctime);
-
+                if cfg!(debug_assertions) {
                 println!(
                     "[GET_FILE_INFO] dir cache hit: cr={:#x} at={:#x} wt={:#x} ct={:#x}",
                     file_info.creation_time,
                     file_info.last_access_time,
                     file_info.last_write_time,
                     file_info.change_time
-                );
-                println!("[GET_FILE_INFO] done (dir, cache) OK");
+                );}
+                if cfg!(debug_assertions) {
+                println!("[GET_FILE_INFO] done (dir, cache) OK");}
                 return Ok(());
             }
             let parent_rel = Path::new(&rel)
@@ -1320,17 +1344,19 @@ impl FileSystemContext for RemoteFs {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] dir cache miss -> lookup parent_rel='{}' name='{}'",
                 parent_rel, name_only
-            );
+            );}
 
             let parent_key = PathBuf::from(parent_rel);
             let entries = self.dir_entries(&parent_key)?;
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] dir parent entries loaded: count={}",
                 entries.len()
-            );
+            );}
 
             if let Some((_, de)) = entries.iter().find(|(_, d)| d.name == name_only) {
                 let t = std::time::UNIX_EPOCH
@@ -1341,9 +1367,9 @@ impl FileSystemContext for RemoteFs {
                 file_info.last_access_time = nt;
                 file_info.last_write_time = nt;
                 file_info.change_time = nt;
-
+                if cfg!(debug_assertions) {
                 println!("[GET_FILE_INFO] dir fallback hit: mt={:?} nt={:#x}", t, nt);
-                println!("[GET_FILE_INFO] done (dir, fallback) OK");
+                println!("[GET_FILE_INFO] done (dir, fallback) OK");}
                 return Ok(());
             }
 
@@ -1351,10 +1377,11 @@ impl FileSystemContext for RemoteFs {
             file_info.last_access_time = 0;
             file_info.last_write_time = 0;
             file_info.change_time = 0;
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] dir not found in parent entries -> timestamps=0 (graceful OK)"
             );
-            println!("[GET_FILE_INFO] done (dir, zeros) OK");
+            println!("[GET_FILE_INFO] done (dir, zeros) OK");}
             return Ok(());
         }
 
@@ -1370,7 +1397,7 @@ impl FileSystemContext for RemoteFs {
             file_info.last_access_time = RemoteFs::nt_time_from_system_time(attr.atime);
             file_info.last_write_time = RemoteFs::nt_time_from_system_time(attr.mtime);
             file_info.change_time = RemoteFs::nt_time_from_system_time(attr.ctime);
-
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] file cache hit: attrs={:#x} size={} cr={:#x} at={:#x} wt={:#x} ct={:#x} perm={:#o} readonly={}",
                 file_info.file_attributes,
@@ -1381,11 +1408,13 @@ impl FileSystemContext for RemoteFs {
                 file_info.change_time,
                 attr.perm,
                 readonly
-            );
-            println!("[GET_FILE_INFO] done (file, cache) OK");
+            );}
+            if cfg!(debug_assertions) {
+            println!("[GET_FILE_INFO] done (file, cache) OK");}
             return Ok(());
         }
-        println!("[GET_FILE_INFO] file cache miss for '{}'", rel);
+        if cfg!(debug_assertions) {
+        println!("[GET_FILE_INFO] file cache miss for '{}'", rel);}
         let parent_rel = Path::new(&rel)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -1395,17 +1424,19 @@ impl FileSystemContext for RemoteFs {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        if cfg!(debug_assertions) {
         println!(
             "[GET_FILE_INFO] file lookup parent_rel='{}' name='{}'",
             parent_rel, name_only
-        );
+        );}
 
         let parent_key = PathBuf::from(parent_rel);
         let entries = self.dir_entries(&parent_key)?;
+        if cfg!(debug_assertions) {
         println!(
             "[GET_FILE_INFO] file parent entries loaded: count={}",
             entries.len()
-        );
+        );}
 
         if let Some((child_path, de)) = entries.into_iter().find(|(_, d)| d.name == name_only) {
             let isdir = RemoteFs::is_dir(&de);
@@ -1414,9 +1445,10 @@ impl FileSystemContext for RemoteFs {
             if isdir {
                 file_info.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
                 file_info.file_size = 0;
+                if cfg!(debug_assertions) {
                 println!(
                     "[GET_FILE_INFO] backend says DIR (context said file): force attrs=DIR size=0"
-                );
+                );}
             } else {
                 let readonly = (perm & 0o222) == 0;
                 file_info.file_attributes = if readonly {
@@ -1425,10 +1457,11 @@ impl FileSystemContext for RemoteFs {
                     FILE_ATTRIBUTE_NORMAL
                 };
                 file_info.file_size = de.size.max(0) as u64;
+                if cfg!(debug_assertions) {
                 println!(
                     "[GET_FILE_INFO] backend file: attrs={:#x} size={} perm={:#o} readonly={}",
                     file_info.file_attributes, file_info.file_size, perm, readonly
-                );
+                );}
             }
 
             let t = std::time::UNIX_EPOCH
@@ -1439,10 +1472,11 @@ impl FileSystemContext for RemoteFs {
             file_info.last_access_time = nt;
             file_info.last_write_time = nt;
             file_info.change_time = nt;
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] timestamps from backend: mt={:?} nt={:#x}",
                 t, nt
-            );
+            );}
 
             let ty = if isdir {
                 NodeType::Directory
@@ -1452,19 +1486,20 @@ impl FileSystemContext for RemoteFs {
             let size = if isdir { 0 } else { de.size.max(0) as u64 };
             let attr = self.file_attr(&child_path, ty, size, Some(de.mtime), perm, de.nlink as u32);
             self.insert_attr_cache(child_path.clone(), attr);
+            if cfg!(debug_assertions) {
             println!(
                 "[GET_FILE_INFO] attrcache updated for '{}'",
                 child_path.display()
             );
 
-            println!("[GET_FILE_INFO] done (file, fallback) OK");
+            println!("[GET_FILE_INFO] done (file, fallback) OK");}
             return Ok(());
         }
-
+        if cfg!(debug_assertions) {
         println!(
             "[GET_FILE_INFO] ERROR: entry '{}' non trovata tra i figli -> FILE_NOT_FOUND",
             rel
-        );
+        );}
         Err(FspError::WIN32(
             windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
         ))
@@ -1481,21 +1516,24 @@ impl FileSystemContext for RemoteFs {
         let dst_abs = self.path_from_u16(new_file_name);
         let src_rel = RemoteFs::rel_of(std::path::Path::new(&src_abs));
         let dst_rel = RemoteFs::rel_of(std::path::Path::new(&dst_abs));
+        if cfg!(debug_assertions) {
         println!(
             "[RENAME] start ino={} is_dir={} src='{}' -> dst='{}' replace={}",
             context.ino, context.is_dir, src_rel, dst_rel, replace_if_exists
-        );
+        );}
 
         if src_rel == "." {
-            println!("[RENAME] denied: source is root");
+            if cfg!(debug_assertions) {
+            println!("[RENAME] denied: source is root");}
             return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
         }
         if let Some(attr) = self.get_attr_cache(&PathBuf::from(&src_rel)) {
             if (attr.perm & 0o222) == 0 {
+                if cfg!(debug_assertions) {
                 println!(
                     "[RENAME] denied by perm for {} perm={:#o}",
                     src_rel, attr.perm
-                );
+                );}
                 return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
             }
         }
@@ -1506,14 +1544,15 @@ impl FileSystemContext for RemoteFs {
         let dst_parent_key = std::path::PathBuf::from(&dst_parent_rel);
 
         let src_list = self.dir_entries(&src_parent_key).map_err(|e| {
-            eprintln!("[RENAME] dir_entries('{}') failed: {}", src_parent_rel, e);
+            if cfg!(debug_assertions) {eprintln!("[RENAME] dir_entries('{}') failed: {}", src_parent_rel, e);}
             e
         })?;
         let dst_list = if src_parent_rel == dst_parent_rel {
             src_list.clone()
         } else {
             self.dir_entries(&dst_parent_key).map_err(|e| {
-                eprintln!("[RENAME] dir_entries('{}') failed: {}", dst_parent_rel, e);
+                if cfg!(debug_assertions) {
+                eprintln!("[RENAME] dir_entries('{}') failed: {}", dst_parent_rel, e);}
                 e
             })?
         };
@@ -1521,10 +1560,11 @@ impl FileSystemContext for RemoteFs {
         let (_src_child_path, src_de) = match src_list.iter().find(|(_, d)| d.name == src_name) {
             Some((p, d)) => (p.clone(), d.clone()),
             None => {
+                if cfg!(debug_assertions) {
                 eprintln!(
                     "[RENAME] source '{}' not found in '{}'",
                     src_name, src_parent_rel
-                );
+                );}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND,
                 ));
@@ -1535,28 +1575,32 @@ impl FileSystemContext for RemoteFs {
         if let Some((_, dst_de)) = dst_list.iter().find(|(_, d)| d.name == dst_name) {
             let dst_is_dir = RemoteFs::is_dir(&dst_de);
             if src_is_dir != dst_is_dir {
+                if cfg!(debug_assertions) {
                 eprintln!(
                     "[RENAME] type mismatch: src_is_dir={} dst_is_dir={}",
                     src_is_dir, dst_is_dir
-                );
+                );}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED,
                 ));
             }
             if !replace_if_exists {
-                eprintln!("[RENAME] destination exists and replace_if_exists=false");
+                if cfg!(debug_assertions) {
+                eprintln!("[RENAME] destination exists and replace_if_exists=false");}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS,
                 ));
             }
             if dst_is_dir {
-                eprintln!("[RENAME] replace directory not supported");
+                if cfg!(debug_assertions) {
+                eprintln!("[RENAME] replace directory not supported");}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED,
                 ));
             }
             if let Err(e) = self.rt.block_on(self.api.delete(&dst_rel)) {
-                eprintln!("[RENAME] pre-delete failed for '{}': {}", dst_rel, e);
+                if cfg!(debug_assertions) {
+                eprintln!("[RENAME] pre-delete failed for '{}': {}", dst_rel, e);}
                 return Err(FspError::WIN32(
                     windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED,
                 ));
@@ -1564,10 +1608,11 @@ impl FileSystemContext for RemoteFs {
         }
 
         if let Err(e) = self.rt.block_on(self.api.rename(&src_rel, &dst_rel)) {
+            if cfg!(debug_assertions) {
             eprintln!(
                 "[RENAME] backend rename failed: {} -> {} err={}",
                 src_rel, dst_rel, e
-            );
+            );}
             return Err(FspError::WIN32(
                 windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED,
             ));
@@ -1575,11 +1620,13 @@ impl FileSystemContext for RemoteFs {
 
         self.evict_all_state_for(&src_rel);
         if let Err(e) = self.update_cache(&src_parent_key) {
-            eprintln!("[RENAME] update_cache('{}') failed: {}", src_parent_rel, e);
+            if cfg!(debug_assertions) {
+            eprintln!("[RENAME] update_cache('{}') failed: {}", src_parent_rel, e);}
         }
         if src_parent_rel != dst_parent_rel {
             if let Err(e) = self.update_cache(&dst_parent_key) {
-                eprintln!("[RENAME] update_cache('{}') failed: {}", dst_parent_rel, e);
+                if cfg!(debug_assertions) {
+                eprintln!("[RENAME] update_cache('{}') failed: {}", dst_parent_rel, e);}
             }
         }
         if let Some(cur) = self.path_of(context.ino) {
@@ -1593,11 +1640,11 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         }
-
+        if cfg!(debug_assertions) {
         println!(
             "[RENAME] done: '{}' -> '{}' (replace_if_exists={})",
             src_rel, dst_rel, replace_if_exists
-        );
+        );}
         Ok(())
     }
 
@@ -1613,9 +1660,11 @@ impl FileSystemContext for RemoteFs {
         &self,
         out_volume_info: &mut winfsp::filesystem::VolumeInfo,
     ) -> WinFspResult<()> {
-        println!("[GET_VOLUME_INFO] start");
+        if cfg!(debug_assertions) {
+        println!("[GET_VOLUME_INFO] start");}
         let stats = self.rt.block_on(self.api.statfs()).map_err(|e| {
-            eprintln!("[GET_VOLUME_INFO] statfs backend failed: {}", e);
+            if cfg!(debug_assertions) {
+            eprintln!("[GET_VOLUME_INFO] statfs backend failed: {}", e);}
             FspError::from(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 e.to_string(),
@@ -1624,10 +1673,11 @@ impl FileSystemContext for RemoteFs {
 
         out_volume_info.total_size = stats.blocks * stats.bsize;
         out_volume_info.free_size = stats.bfree * stats.bsize;
+        if cfg!(debug_assertions) {
         println!(
             "[GET_VOLUME_INFO] total={} free={} (in bytes)",
             out_volume_info.total_size, out_volume_info.free_size,
-        );
+        );}
 
         Ok(())
     }
@@ -2160,61 +2210,68 @@ impl FileSystemContext for RemoteFs {
     }
 
     fn close(&self, file_context: Self::FileContext) {
+        if cfg!(debug_assertions) {
         println!(
             "[CLOSE] ENTRY ino={} temp_write={}",
             file_context.ino,
             file_context.temp_write.is_some()
-        );
+        );}
 
         let temp_write = match file_context.temp_write {
             Some(tw) => tw,
             None => {
-                println!("[CLOSE] no temp_write -> nothing to sync");
+                if cfg!(debug_assertions) {
+                println!("[CLOSE] no temp_write -> nothing to sync");}
                 return;
             }
         };
 
         if !temp_write.tem_path.exists() {
+            if cfg!(debug_assertions) {
             eprintln!(
                 "[CLOSE] ERROR: temp file missing at '{}' - skipping sync",
                 temp_write.tem_path.display()
-            );
+            );}
             return;
         }
 
         let real_size = match std::fs::metadata(&temp_write.tem_path) {
             Ok(m) => {
-                println!("[CLOSE] temp file metadata OK: size={}", m.len());
+                if cfg!(debug_assertions) {
+                println!("[CLOSE] temp file metadata OK: size={}", m.len());}
                 m.len()
             }
             Err(e) => {
+                if cfg!(debug_assertions) {
                 eprintln!(
                     "[CLOSE] Failed to get temp file metadata for '{}': {}",
                     temp_write.tem_path.display(),
                     e
-                );
+                );}
                 return;
             }
         };
         if real_size == 0 {
+            if cfg!(debug_assertions) {
             println!("[CLOSE] CRITICAL: Syncing EMPTY file!");
             println!("[CLOSE] This means write() was NEVER called");
             println!("[CLOSE] PowerShell might be using a different API");
-        }
+        }}
 
         let rel_path = RemoteFs::rel_of(&self.path_of(file_context.ino).unwrap());
-
+        if cfg!(debug_assertions) {
         println!(
             "[CLOSE] syncing rel='{}' from temp='{}' (real_size={})",
             rel_path,
             temp_write.tem_path.display(),
             real_size
-        );
+        );}
         if let Err(e) = self.rt.block_on(
             self.api
                 .write_file(&rel_path, &temp_write.tem_path.to_string_lossy()),
         ) {
-            eprintln!("[CLOSE] Errore commit file {}: {:?}", rel_path, e);
+            if cfg!(debug_assertions) {
+            eprintln!("[CLOSE] Errore commit file {}: {:?}", rel_path, e);}
         } else {
             let parent_rel = Path::new(&rel_path)
                 .parent()
@@ -2222,11 +2279,11 @@ impl FileSystemContext for RemoteFs {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| ".".to_string());
             let parent_key = PathBuf::from(parent_rel.clone());
-
+            if cfg!(debug_assertions) {
             println!(
                 "[CLOSE] refreshing parent '{}' to update attr cache",
                 parent_rel
-            );
+            );}
 
             if let Ok(list) = self.rt.block_on(self.api.ls(&parent_rel)) {
                 if let Some(de) = list.into_iter().find(|d| {
@@ -2259,14 +2316,15 @@ impl FileSystemContext for RemoteFs {
                     let cached_perm_opt = self.get_attr_cache(&child).map(|a| a.perm);
                     let final_perm: u16 = if let Some(cperm) = cached_perm_opt {
                         if cperm != backend_perm {
+                            if cfg!(debug_assertions) {
                             println!(
                                 "[CLOSE] backend perm {:#o} != cached perm {:#o} -> reapplying cached perm",
                                 backend_perm, cperm
-                            );
+                            );}
                             let _ = self
                                 .rt
                                 .block_on(self.api.chmod(&rel_path, cperm as u32))
-                                .map_err(|e| eprintln!("[CLOSE] chmod post-commit failed: {}", e));
+                                .map_err(|e|if cfg!(debug_assertions) { eprintln!("[CLOSE] chmod post-commit failed: {}", e)});
                             cperm
                         } else {
                             backend_perm
@@ -2277,21 +2335,24 @@ impl FileSystemContext for RemoteFs {
                     let perm = final_perm as u16;
                     let attr =
                         self.file_attr(&child, ty, size, Some(de.mtime), perm, de.nlink as u32);
+                    if cfg!(debug_assertions) {
                     println!(
                         "[CLOSE] updating attr_cache for '{}' size={}",
                         child.display(),
                         size
-                    );
+                    );}
                     self.insert_attr_cache(child, attr);
                 }
                 let _ = self.update_cache(&parent_key);
             }
         }
         if let Err(e) = std::fs::remove_file(&temp_write.tem_path) {
-            eprintln!("[CLOSE] Errore rimozione temp file: {}", e);
+            if cfg!(debug_assertions) {
+            eprintln!("[CLOSE] Errore rimozione temp file: {}", e);}
         }
         self.state.writes.lock().unwrap().remove(&file_context.ino);
-        println!("[CLOSE] done for '{}'", rel_path);
+        if cfg!(debug_assertions) {
+        println!("[CLOSE] done for '{}'", rel_path);}
     }
 
     fn read(
@@ -2300,15 +2361,17 @@ impl FileSystemContext for RemoteFs {
         buffer: &mut [u8],
         offset: u64,
     ) -> WinFspResult<u32> {
+        if cfg!(debug_assertions) {
         println!(
             "[READ] entry ino={} offset={} temp_write={}",
             file_context.ino,
             offset,
             file_context.temp_write.is_some()
-        );
+        );}
         let path = self.path_of(file_context.ino).ok_or(FspError::WIN32(1))?;
         let rel_path = RemoteFs::rel_of(&path);
-        println!("[READ] rel='{}'", rel_path);
+        if cfg!(debug_assertions) {
+        println!("[READ] rel='{}'", rel_path);}
         let mut attr = self.get_attr_cache(&path);
 
         if attr.is_none() {
@@ -2358,11 +2421,13 @@ impl FileSystemContext for RemoteFs {
         let end_u64 = (start_u64 + (buffer.len() as u64) - 1).min(attr.size.saturating_sub(1));
 
         let data: Vec<u8> = if let Some(tw) = &file_context.temp_write {
-            println!("[READ] reading from temp '{}'", tw.tem_path.display());
+            if cfg!(debug_assertions) {
+            println!("[READ] reading from temp '{}'", tw.tem_path.display());}
             match std::fs::read(&tw.tem_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("[READ] failed read temp: {}", e);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[READ] failed read temp: {}", e);}
                     return Err(FspError::from(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         e.to_string(),
@@ -2370,27 +2435,31 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         } else {
-            println!("[READ] reading from backend with rel='{}'", rel_path);
+            if cfg!(debug_assertions) {
+            println!("[READ] reading from backend with rel='{}'", rel_path);}
             match self
                 .rt
                 .block_on(self.api.read_range(&rel_path, start_u64, end_u64))
             {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("[READ] backend read failed for '{}': {}", rel_path, e);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[READ] backend read failed for '{}': {}", rel_path, e);}
                     let alt = if rel_path.starts_with("./") {
                         rel_path.trim_start_matches("./").to_string()
                     } else {
                         format!("./{}", rel_path.trim_start_matches("./"))
                     };
-                    eprintln!("[READ] trying fallback rel='{}'", alt);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[READ] trying fallback rel='{}'", alt);}
                     match self
                         .rt
                         .block_on(self.api.read_range(&alt, start_u64, end_u64))
                     {
                         Ok(d2) => d2,
                         Err(e2) => {
-                            eprintln!("[READ] backend read fallback failed for '{}': {}", alt, e2);
+                            if cfg!(debug_assertions) {
+                            eprintln!("[READ] backend read fallback failed for '{}': {}", alt, e2);}
                             return Err(FspError::from(std::io::Error::new(
                                 std::io::ErrorKind::Other,
                                 e2.to_string(),
@@ -2405,7 +2474,8 @@ impl FileSystemContext for RemoteFs {
         if file_context.temp_write.is_some() {
             let start = offset as usize;
             if start >= data.len() {
-                println!("[READ] offset >= data.len -> return 0");
+                if cfg!(debug_assertions) {
+                println!("[READ] offset >= data.len -> return 0");}
                 return Ok(0);
             }
             let end = std::cmp::min(start + buffer.len(), data.len());
@@ -2415,12 +2485,13 @@ impl FileSystemContext for RemoteFs {
             bytes_to_copy = &data[0..end];
         }
         buffer[..bytes_to_copy.len()].copy_from_slice(bytes_to_copy);
+        if cfg!(debug_assertions) {
         println!(
             "[READ] copied {} bytes ({} of {})",
             bytes_to_copy.len(),
             offset,
             data.len()
-        );
+        );}
         Ok(bytes_to_copy.len() as u32)
     }
 
@@ -2433,6 +2504,7 @@ impl FileSystemContext for RemoteFs {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> WinFspResult<u32> {
+        if cfg!(debug_assertions) {
         println!(
             "[WRITE] CALLED! ino={} offset={} len={} write_to_eof={} constrained={}",
             file_context.ino,
@@ -2440,14 +2512,15 @@ impl FileSystemContext for RemoteFs {
             buffer.len(),
             write_to_end_of_file,
             constrained_io
-        );
+        );}
         if let Some(path) = self.path_of(file_context.ino) {
             if let Some(attr) = self.get_attr_cache(&path) {
                 if (attr.perm & 0o222) == 0 {
+                    if cfg!(debug_assertions) {
                     println!(
                         "[WRITE] denied by perm for {:?} perm={:#o}",
                         path, attr.perm
-                    );
+                    );}
                     return Err(FspError::WIN32(ERROR_ACCESS_DENIED));
                 }
             }
@@ -2455,7 +2528,8 @@ impl FileSystemContext for RemoteFs {
         if buffer.len() > 0 {
             let preview =
                 std::str::from_utf8(&buffer[..buffer.len().min(50)]).unwrap_or("<binary>");
-            println!("[WRITE] buffer preview: {:?}", preview);
+                if cfg!(debug_assertions) {
+            println!("[WRITE] buffer preview: {:?}", preview);}
         }
         let tw = match &file_context.temp_write {
             Some(tw) => tw,
@@ -2467,26 +2541,30 @@ impl FileSystemContext for RemoteFs {
             .write(true)
             .open(&tw.tem_path)
             .map_err(|e| {
-                eprintln!("[WRITE] ERROR opening temp: {}", e);
+                if cfg!(debug_assertions) {
+                eprintln!("[WRITE] ERROR opening temp: {}", e);}
                 FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
             })?;
-
-        println!("[WRITE] Seeking to offset {}", offset);
+            if cfg!(debug_assertions) {
+        println!("[WRITE] Seeking to offset {}", offset);}
 
         file.seek(std::io::SeekFrom::Start(offset)).map_err(|e| {
-            eprintln!("[WRITE] ERROR seeking: {}", e);
+            if cfg!(debug_assertions) {
+            eprintln!("[WRITE] ERROR seeking: {}", e);}
             FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
         })?;
-
-        println!("[WRITE] Writing {} bytes", buffer.len());
+        if cfg!(debug_assertions) {
+        println!("[WRITE] Writing {} bytes", buffer.len());}
 
         file.write_all(buffer).map_err(|e| {
-            eprintln!("[WRITE] ERROR writing: {}", e);
+            if cfg!(debug_assertions) {
+            eprintln!("[WRITE] ERROR writing: {}", e);}
             FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
         })?;
 
         file.flush().map_err(|e| {
-            eprintln!("[WRITE] ERROR flushing: {}", e);
+            if cfg!(debug_assertions) {
+            eprintln!("[WRITE] ERROR flushing: {}", e);}
             FspError::from(io::Error::new(io::ErrorKind::Other, e.to_string()))
         })?;
 
@@ -2494,11 +2572,12 @@ impl FileSystemContext for RemoteFs {
             let new_size = metadata.len();
             file_info.file_size = new_size;
             file_info.allocation_size = ((new_size + 4095) / 4096) * 4096;
+            if cfg!(debug_assertions) {
             println!(
                 "[WRITE] Success: wrote {} bytes, total size now {}",
                 buffer.len(),
                 new_size
-            );
+            );}
         }
 
         Ok(buffer.len() as u32)
@@ -2513,16 +2592,18 @@ impl FileSystemContext for RemoteFs {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> Result<(), FspError> {
+        if cfg!(debug_assertions) {
         println!(
             "[OVERWRITE] ino={} replace_attrs={} allocation_size={}",
             context.ino, replace_file_attributes, allocation_size
-        );
+        );}
 
         if let Some(tw) = &context.temp_write {
+            if cfg!(debug_assertions) {
             println!(
                 "[OVERWRITE] truncating temp file '{}' to 0",
                 tw.tem_path.display()
-            );
+            );}
             let result = std::fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
@@ -2530,7 +2611,8 @@ impl FileSystemContext for RemoteFs {
 
             match result {
                 Ok(_) => {
-                    println!("[OVERWRITE] Temp file truncated successfully");
+                    if cfg!(debug_assertions) {
+                    println!("[OVERWRITE] Temp file truncated successfully");}
                     file_info.file_size = 0;
                     file_info.allocation_size = 0;
                     let path = self.path_of(context.ino).ok_or(FspError::WIN32(
@@ -2546,7 +2628,8 @@ impl FileSystemContext for RemoteFs {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[OVERWRITE] ERROR truncating temp file: {}", e);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[OVERWRITE] ERROR truncating temp file: {}", e);}
                     return Err(FspError::from(io::Error::new(
                         io::ErrorKind::Other,
                         e.to_string(),
@@ -2554,7 +2637,8 @@ impl FileSystemContext for RemoteFs {
                 }
             }
         } else {
-            eprintln!("[OVERWRITE] No temp_write available for truncation");
+            if cfg!(debug_assertions) {
+            eprintln!("[OVERWRITE] No temp_write available for truncation");}
             return Err(FspError::WIN32(ERROR_INVALID_PARAMETER));
         }
 
@@ -2568,7 +2652,8 @@ impl FileSystemContext for RemoteFs {
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> WinFspResult<u32> {
-        println!("Siamo in read_dir");
+        if cfg!(debug_assertions) {
+        println!("Siamo in read_dir");}
         let dir_path = self.path_of(file_context.ino).ok_or(FspError::WIN32(1))?;
 
         let mut entries = self.dir_entries(&dir_path)?;
@@ -2685,7 +2770,8 @@ impl FileSystemContext for RemoteFs {
         _write_through: bool,
         file_info: &mut OpenFileInfo,
     ) -> WinFspResult<Self::FileContext> {
-        println!("Siamo in create");
+        if cfg!(debug_assertions) {
+        println!("Siamo in create");}
 
         let path_str = self.path_from_u16(path);
         let rel = RemoteFs::rel_of(Path::new(&path_str));
@@ -2700,8 +2786,8 @@ impl FileSystemContext for RemoteFs {
             .map(|p| p.to_string_lossy().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ".".to_string());
-
-        println!("[CREATE] caso dir parentpath : {}", parent_rel);
+        if cfg!(debug_assertions) {
+        println!("[CREATE] caso dir parentpath : {}", parent_rel);}
 
         let parent_path = PathBuf::from(&parent_rel);
         if is_dir {
@@ -2735,7 +2821,8 @@ impl FileSystemContext for RemoteFs {
                     });
                 }
                 Err(e) => {
-                    eprintln!("[CREATE] mkdir failed for '{}' -> {}", rel, e);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[CREATE] mkdir failed for '{}' -> {}", rel, e);}
                     return Err(FspError::from(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         e.to_string(),
@@ -2748,10 +2835,12 @@ impl FileSystemContext for RemoteFs {
         }
 
         let ino = self.alloc_ino(Path::new(&path_str));
-        println!("[CREATE] file ino: {:?}", ino);
+        if cfg!(debug_assertions) {
+        println!("[CREATE] file ino: {:?}", ino);}
         let temp_path = self.get_temporary_path(ino);
         if let Err(e) = std::fs::File::create(&temp_path) {
-            eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
+            if cfg!(debug_assertions) {
+            eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);}
             return Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32));
         }
 
@@ -2763,7 +2852,8 @@ impl FileSystemContext for RemoteFs {
                 let desired_mode: u32 = 0o644;
                 let temp_path = self.get_temporary_path(ino);
                 if let Err(e) = std::fs::File::create(&temp_path) {
-                    eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);
+                    if cfg!(debug_assertions) {
+                    eprintln!("[CREATE] Errore creazione file temporaneo: {}", e);}
                     return Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32));
                 }
                 let temp_write = TempWrite {
@@ -2804,7 +2894,8 @@ impl FileSystemContext for RemoteFs {
                 Ok(file_context)
             }
             Err(e) => {
-                eprintln!("[CREATE] Errore creazione file sul backend: {}", e);
+                if cfg!(debug_assertions) {
+                eprintln!("[CREATE] Errore creazione file sul backend: {}", e);}
                 let _ = std::fs::remove_file(&temp_path);
                 Err(FspError::WIN32(ERROR_INVALID_PARAMETER as u32))
             }
@@ -2815,10 +2906,10 @@ impl FileSystemContext for RemoteFs {
     &self,
     file_context: &Self::FileContext,
     file_attributes: u32,
-    creation_time: u64,
-    last_access_time: u64,
-    last_write_time: u64,
-    change_time: u64,
+    _creation_time: u64,
+    _last_access_time: u64,
+    _last_write_time: u64,
+    _change_time: u64,
     file_info: &mut FileInfo,
 ) -> WinFspResult<()> {
     let path = self.path_of(file_context.ino).ok_or(FspError::WIN32(
@@ -2833,11 +2924,11 @@ impl FileSystemContext for RemoteFs {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ".".to_string());
     let parent_key = PathBuf::from(parent_rel.clone());
-
+    if cfg!(debug_assertions) {
     println!(
         "[SET_BASIC_INFO] ino={} path='{}' file_attrs={:#x} access_mask={:#x}",
         file_context.ino, rel, file_attributes, file_context.access_mask
-    );
+    );}
     
     let mut attr = if let Some(a) = self.get_attr_cache(&rel_key) {
         a
@@ -2871,17 +2962,18 @@ impl FileSystemContext for RemoteFs {
     };
     
     let has_pending_write = file_context.temp_write.is_some();
-
+    if cfg!(debug_assertions) {
     println!(
         "[SET_BASIC_INFO] Write detection: has_pending_write={} access_mask={:#x} file_attrs={:#x}",
         has_pending_write, file_context.access_mask, file_attributes
-    );
+    );}
 
     // Gestione dei permessi (invariata)
     let mode = if has_pending_write {
+        if cfg!(debug_assertions) {
         println!(
             "[SET_BASIC_INFO] File has pending write - ignoring FILE_ATTRIBUTE_READONLY flag"
-        );
+        );}
         if attr.perm == 0 {
             0o644
         } else {
@@ -2889,32 +2981,37 @@ impl FileSystemContext for RemoteFs {
         }
     } else if file_attributes != u32::MAX {
         if (file_attributes & FILE_ATTRIBUTE_READONLY) != 0 {
-            println!("[SET_BASIC_INFO] ✓ User set readonly attribute (no pending write)");
+            if cfg!(debug_assertions) {
+            println!("[SET_BASIC_INFO] ✓ User set readonly attribute (no pending write)");}
             0o444
         } else {
-            println!("[SET_BASIC_INFO] ✓ User cleared readonly attribute (no pending write)");
+            if cfg!(debug_assertions) {
+            println!("[SET_BASIC_INFO] ✓ User cleared readonly attribute (no pending write)");}
             0o644
         }
     } else {
+        if cfg!(debug_assertions) {
         println!(
             "[SET_BASIC_INFO] No attribute change, preserving perm={:#o}",
             attr.perm
-        );
+        );}
         attr.perm as u32
     };
-
-    println!("[SET_BASIC_INFO] Final decision: mode={:#o}", mode);
+    if cfg!(debug_assertions) {
+    println!("[SET_BASIC_INFO] Final decision: mode={:#o}", mode);}
     
     // Applica chmod al backend
     self.rt.block_on(self.api.chmod(&rel, mode)).map_err(|e| {
-        eprintln!("[SET_BASIC_INFO] chmod failed: {}", e);
+        if cfg!(debug_assertions) {
+        eprintln!("[SET_BASIC_INFO] chmod failed: {}", e);}
         FspError::from(io::Error::new(io::ErrorKind::Other, format!("{}", e)))
     })?;
 
     // ============================================================
     // MODIFICA: Ignora i timestamp di Windows, usa sempre "now"
     // ============================================================
-    println!("[SET_BASIC_INFO] Ignoring Windows timestamps - using current time");
+    if cfg!(debug_assertions) {
+    println!("[SET_BASIC_INFO] Ignoring Windows timestamps - using current time");}
     
     let now = SystemTime::now();
     attr.mtime = now;
@@ -2926,11 +3023,11 @@ impl FileSystemContext for RemoteFs {
     
     attr.perm = mode as u16;
     self.insert_attr_cache(rel_key.clone(), attr.clone());
-    
+    if cfg!(debug_assertions) {
     println!(
         "[SET_BASIC_INFO] ✓ Cache updated: perm={:#o} size={} (timestamps set to NOW)",
         mode, attr.size
-    );
+    );}
     
     let _ = self.update_cache(&parent_key);
 
@@ -3456,7 +3553,8 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let mut host = FileSystemHost::new(vparams, fs)?;
     host.mount(mountpoint)?;
     host.start()?;
-    println!("[Mount] Starting WebSocket listener for: {}", url);
+    if cfg!(debug_assertions) {
+    println!("[Mount] Starting WebSocket listener for: {}", url);}
     {
         let url_clone = url.clone();
         rt.spawn(async move {
@@ -3467,26 +3565,24 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
-        println!("\n[Mount] Ricevuto segnale Ctrl-C, terminazione...");
+        if cfg!(debug_assertions) {
+        println!("\n[Mount] Ricevuto segnale Ctrl-C, terminazione...");}
         r.store(false, Ordering::SeqCst);
     })?;
-
-    println!("╔════════════════════════════════════════════════════════════╗");
+    if cfg!(debug_assertions) {
     println!(
-        "║  Filesystem montato su: {}                         ",
+        " Filesystem montato su: {} ",
         mountpoint
     );
-    println!("║  Backend URL: {}                                   ", url);
-    println!("║  WebSocket attivo per notifiche real-time                 ║");
-    println!("║                                                            ║");
-    println!("║  Premi Ctrl-C per smontare e uscire                       ║");
-    println!("║  Premi F5 in Explorer per aggiornare dopo modifiche       ║");
-    println!("╚════════════════════════════════════════════════════════════╝");
+    println!("  Backend URL: {}  ", url);
+    println!("  WebSocket attivo per notifiche real-time  ║");
+   
+    println!(" Premi Ctrl-C per smontare e uscire ");}
 
     while running.load(Ordering::SeqCst) {
         thread::sleep(std::time::Duration::from_millis(100));
     }
-
-    println!("[Mount] Smonto il filesystem...");
+    if cfg!(debug_assertions) {
+    println!("[Mount] Smonto il filesystem...");}
     Ok(())
 }
