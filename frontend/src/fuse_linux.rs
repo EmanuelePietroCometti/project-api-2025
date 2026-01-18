@@ -375,8 +375,20 @@ fn handle_updated(payload: &Value, notifier: &Notifier, st: &FsState) {
         }
         return;
     };
+
     let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
+
     let _ = notifier.inval_inode(ino, 0, 0);
+    if let Some((parent_ino, _)) = resolve_parent(&abs, st) {
+        let _ = notifier.inval_entry(parent_ino, OsStr::new(&name));
+        
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_UPDATED] Invalidated entry for parent ino: {}, name: {:?}",
+                parent_ino, name
+            );
+        }
+    }
 }
 
 /// Updates metadata caches based on remote API info and returns the inode associated with the path
@@ -1473,7 +1485,15 @@ impl Filesystem for RemoteFs {
                                 temp_path
                             );
                         }
-                        let _ = f.write_all(&bytes);
+                        if flags & libc::O_APPEND != 0 {
+                            if cfg!(debug_assertions) {
+                                println!(
+                                    "[OPEN] Seeking to end of tempfile at path: {:?} due to O_APPEND flag",
+                                    temp_path
+                                );
+                            }
+                            let _ = f.write_all(&bytes);
+                        }
                     }
                 }
             }
