@@ -64,7 +64,7 @@ fn get_resolved_mountpoint() -> Result<String> {
 fn main() -> Result<(), anyhow::Error> {
     let args: Vec<String> = env::args().collect();
     
-    if args.contains(&"--stop".to_string()) {
+    if args.contains(&"stop".to_string()) {
         println!("Tentativo di arresto del filesystem remoto...");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return stop_daemon();
@@ -74,7 +74,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     let ip = if args.len() > 1 && args[1].parse::<IpAddr>().is_ok() {
         args[1].clone()
-    } else if args.contains(&"--deamon".to_string()) {
+    } else if args.contains(&"deamon".to_string()) {
         return Err(anyhow::anyhow!("Errore: IP mancante per l'avvio in background.\nUso: cargo run -- <IP> --deamon"));
     } else {
         let mut ip_input = String::new();
@@ -87,7 +87,7 @@ fn main() -> Result<(), anyhow::Error> {
     ip.parse::<IpAddr>().map_err(|_| anyhow::anyhow!("Formato IP non valido: {}", ip))?;
     let mp = get_resolved_mountpoint()?;
 
-    if args.contains(&"--deamon".to_string()) {
+    if args.contains(&"deamon".to_string()) {
         println!("Avvio del filesystem in background su {}...", mp);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return run_as_daemon_unix(&ip, &mp);
@@ -134,22 +134,42 @@ fn run_as_daemon_unix(ip: &str, mp: &str) -> anyhow::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stop_daemon() -> anyhow::Result<()> {
-    let pid_str = fs::read_to_string(pid_file()).map_err(|_| anyhow::anyhow!("File PID non trovato. Il filesystem è attivo?"))?;
-    let pid: i32 = pid_str.trim().parse()?;
+    use std::time::{Duration, Instant};
+    use std::thread;
 
-    match kill(Pid::from_raw(pid), Signal::SIGTERM) {
-        Ok(_) => {
-            println!("Segnale di arresto inviato al processo {}", pid);
-            remove_pid();
-            Ok(())
-        }
+    let pid_path = pid_file();
+    let pid_str = fs::read_to_string(&pid_path)
+        .map_err(|_| anyhow::anyhow!("File PID non trovato. Il filesystem è attivo?"))?;
+    let pid: i32 = pid_str.trim().parse()?;
+    let process_pid = Pid::from_raw(pid);
+
+    match kill(process_pid, Signal::SIGTERM) {
+        Ok(_) => println!("Segnale di arresto inviato al processo {}", pid),
         Err(nix::errno::Errno::ESRCH) => {
-            remove_pid();
             println!("Processo già terminato.");
-            Ok(())
+            let _ = fs::remove_file(&pid_path);
+            return Ok(());
         }
-        Err(e) => Err(e.into()),
+        Err(e) => return Err(e.into()),
     }
+
+    let timeout = Duration::from_secs(5);
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        if let Err(nix::errno::Errno::ESRCH) = kill(process_pid, None) {
+            println!("Processo terminato correttamente.");
+            let _ = fs::remove_file(&pid_path);
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    Err(anyhow::anyhow!(
+        "Errore: Il processo {} non è terminato entro {} secondi. \n\
+        Probabilmente il mountpoint è occupato (Busy). Chiudi i file aperti e riprova.",
+        pid, timeout.as_secs()
+    ))
 }
 
 #[cfg(target_os = "windows")]

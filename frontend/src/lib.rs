@@ -1,5 +1,23 @@
 pub mod file_api;
 
+use std::path::PathBuf;
+
+pub fn status_file() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push("remote-fs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.push("status");
+    dir
+}
+
+pub fn write_status(msg: &str) {
+    let _ = std::fs::write(status_file(), msg);
+}
+
+pub fn clear_status() {
+    let _ = std::fs::remove_file(status_file());
+}
+
 #[cfg(target_os = "linux")]
 mod fuse_linux;
 

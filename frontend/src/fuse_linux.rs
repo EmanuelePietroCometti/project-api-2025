@@ -10,7 +10,7 @@ use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::{
     collections::HashMap,
@@ -39,7 +39,6 @@ pub(crate) struct TempWrite {
     tem_path: PathBuf,
     size: u64,
     dirty: bool,
-    ino: u64,
 }
 
 #[derive(Clone)]
@@ -490,7 +489,7 @@ impl FsState {
         path_by_ino.insert(ino, child);
     }
 
-    pub fn insert_write_tempfile(&self, fh: u64, temp_path: PathBuf, dirty: bool, ino: u64) {
+    pub fn insert_write_tempfile(&self, fh: u64, temp_path: PathBuf, dirty: bool) {
         let mut writes = self.writes.lock().unwrap();
         writes.insert(
             fh,
@@ -498,7 +497,6 @@ impl FsState {
                 tem_path: temp_path,
                 size: 0,
                 dirty,
-                ino,
             },
         );
     }
@@ -983,13 +981,13 @@ impl Filesystem for RemoteFs {
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
+        _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
         if cfg!(debug_assertions) {
             println!(
-                "[SETATTR] Called with ino: {}, mode: {:?}, size: {:?}, fh: {:?}, flags: {:?}",
-                ino, mode, size, fh, flags
+                "[SETATTR] Called with ino: {}, mode: {:?}, size: {:?}, fh: {:?}",
+                ino, mode, size, fh
             );
         }
         if ino == 1 {
@@ -1044,22 +1042,30 @@ impl Filesystem for RemoteFs {
         if let Some(new_size) = size {
             let mut is_local_write = false;
 
-            if let Some(new_size) = size {
-                let mut writes = self.state.writes.lock().unwrap();
-
-                for tw in writes.values_mut() {
-                    if tw.ino == ino {
-                        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tw.tem_path) {
-                            let _ = f.set_len(new_size);
-                            tw.size = new_size;
-                            tw.dirty = true;
-                            is_local_write = true;
-                        }
-                    }
+            if let Some(fh_val) = fh {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[SETATTR] Received fh: {} for setattr on path: {:?}",
+                        fh_val, path
+                    );
                 }
-                drop(writes);
-                attr.size = new_size;
-                attr.blocks = (new_size + 511) / 512;
+                if let Some(effective_size) = self.state.with_write_mut(fh_val, |tw| {
+                    tw.size = new_size;
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tw.tem_path) {
+                        let _ = f.set_len(new_size);
+                    }
+                    tw.size
+                }) {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[SETATTR] Updating size from local write tempfile for fh: {}, new size: {}",
+                            fh_val, effective_size
+                        );
+                    }
+                    attr.size = effective_size;
+                    attr.blocks = (effective_size + 511) / 512;
+                    is_local_write = true;
+                }
             }
 
             if !is_local_write {
@@ -1331,18 +1337,6 @@ impl Filesystem for RemoteFs {
         if cfg!(debug_assertions) {
             println!("[GETATTR] Getattr called for ino: {}", ino);
         }
-        /* if ino == 1 {
-            if cfg!(debug_assertions) {
-                println!("[GETATTR] Getting attributes for root inode");
-            }
-            let uid = (unsafe { libc::getuid() }) as u32;
-            let gid = (unsafe { libc::getgid() }) as u32;
-            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755, 2);
-            attr.uid = uid;
-            attr.gid = gid;
-            reply.attr(&self.state.cache_ttl, &attr);
-            return;
-        } */
         let Some(path) = self.path_of(ino) else {
             if cfg!(debug_assertions) {
                 eprintln!("[GETATTR] Inode not found: {}", ino);
@@ -1429,7 +1423,6 @@ impl Filesystem for RemoteFs {
         let fh = self.state.alloc_fh();
 
         let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
-        let is_trunc = (flags & libc::O_TRUNC) != 0;
 
         if wants_write {
             if cfg!(debug_assertions) {
@@ -1439,6 +1432,7 @@ impl Filesystem for RemoteFs {
                 );
             }
             let temp_path = self.get_temporary_path(fh);
+
             if let Err(_) = File::create(&temp_path) {
                 if cfg!(debug_assertions) {
                     eprintln!(
@@ -1449,33 +1443,53 @@ impl Filesystem for RemoteFs {
                 reply.error(libc::EIO);
                 return;
             }
-            let mut initial_size = 0;
-            if !is_trunc {
-                if let Some(path) = self.path_of(ino) {
-                    if let Some(attr) = self.state.get_attr(&path) {
-                        let rel = Self::rel_for_db(&path);
-                        if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
-                            if let Ok(mut f) = File::options().write(true).open(&temp_path) {
-                                let _ = f.write_all(&bytes);
-                                initial_size = bytes.len() as u64;
-                            }
+            if let Some(path) = self.path_of(ino) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[OPEN] Loading existing file data into tempfile for path: {:?}",
+                        path
+                    );
+                }
+                let Some(attr) = self.state.get_attr(&path) else {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[OPEN] Attributes not found in cache for path: {:?}", path);
+                    }
+                    reply.error(ENOENT);
+                    return;
+                };
+                let rel = Self::rel_for_db(&path);
+                if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[OPEN] Writing {} bytes to tempfile at path: {:?}",
+                            bytes.len(),
+                            temp_path
+                        );
+                    }
+                    if let Ok(mut f) = File::options().write(true).open(&temp_path) {
+                        if cfg!(debug_assertions) {
+                            println!(
+                                "[OPEN] Opened tempfile for writing at path: {:?}",
+                                temp_path
+                            );
                         }
+                        let _ = f.write_all(&bytes);
                     }
                 }
-                self.state.insert_write_tempfile(fh, temp_path, false, ino);
-            } else {
-                self.state.insert_write_tempfile(fh, temp_path, true, ino);
             }
-            self.state.with_write_mut(fh, |tw| {
-                tw.size = initial_size;
-            });
+            if cfg!(debug_assertions) {
+                println!(
+                    "[OPEN] Inserting write tempfile into state for fh: {}, path: {:?}",
+                    fh, temp_path
+                );
+            }
+            self.state.insert_write_tempfile(fh, temp_path, true);
         }
         if cfg!(debug_assertions) {
             println!("[OPEN] File opened with fh: {}", fh);
         }
         reply.opened(fh, flags as u32);
     }
-
     // Reads data from a file starting at a specified offset
     fn read(
         &mut self,
@@ -1897,6 +1911,8 @@ impl Filesystem for RemoteFs {
             return;
         }
 
+        self.state.insert_write_tempfile(fh, tmp, true);
+
         let final_mode = mode & !umask;
         let attr = self.file_attr(
             &path,
@@ -1908,7 +1924,6 @@ impl Filesystem for RemoteFs {
         );
 
         self.state.set_attr(&path, attr.clone());
-        self.state.insert_write_tempfile(fh, tmp, true, attr.ino);
         if let Some(parent_path) = self.state.path_of(parent) {
             if cfg!(debug_assertions) {
                 println!("[CREATE] Updating cache for: {:?}", parent_path);
@@ -2224,14 +2239,11 @@ pub fn is_mountpoint_busy(path: &str) -> bool {
 
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
-
     let remote_fs = RemoteFs::new(api, rt.clone());
-
     let notifier_ptr = remote_fs.notifier.clone();
     let fs_state = remote_fs.state.clone();
 
     remote_fs.init_cache();
-
     let mp = mountpoint.to_string();
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
@@ -2245,6 +2257,7 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
         let mut lock = notifier_ptr.lock().unwrap();
         *lock = Some(notifier_actual.clone());
     }
+
     {
         let url_clone = url.clone();
         let notifier_for_ws = Arc::new(notifier_actual);
@@ -2254,36 +2267,47 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     }
 
     let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
-    let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
 
-    {
-        let tx = tx.clone();
-        let shutting_down = shutting_down.clone();
-        let mp_for_signals = mp.clone();
-        thread::spawn(move || {
-            for _sig in signals.forever() {
-                if is_mountpoint_busy(&mp_for_signals) {
-                    eprintln!(
-                        "\n[STOP] Signal ignored: Mountpoint {} is busy.",
-                        mp_for_signals
-                    );
-                    eprintln!("Please close open terminals or files in that directory to unmount.");
-                    let _ = anyhow::anyhow!("Mountpoint busy");
-                } else {
-                    if !shutting_down.swap(true, Ordering::SeqCst) {
-                        println!("\n[STOP] Mountpoint clear. Initiating safe unmount...");
-                        let _ = tx.send(());
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    thread::spawn(move || {
+        for _sig in signals.forever() {
+            let _ = tx.send(());
+        }
+    });
 
-    let _ = rx.recv();
-    println!("Unmounting filesystem...");
-    let _ = bg_session.join();
-    println!("Filesystem unmounted successfully.");
+    println!("[INFO] Filesystem montato su {}. In attesa di segnali...", mp);
+
+    while let Ok(_) = rx.recv() {
+        let mut success = false;
+        let max_attempts = 3;
+
+        for i in 1..=max_attempts {
+            if !is_mountpoint_busy(&mp) {
+                success = true;
+                break;
+            }
+
+            let msg = format!("EBUSY: Mountpoint occupato. Tentativo di chiusura {}/{}...", i, max_attempts);
+            eprintln!("[STOP] {}", msg);
+            crate::write_status(&msg);
+            
+            if i < max_attempts {
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        if success {
+            println!("[STOP] Mountpoint libero. Smontaggio in corso...");
+            crate::clear_status();
+            let _ = bg_session.join();
+            println!("[STOP] Filesystem smontato con successo.");
+            return Ok(()); 
+        } else {
+            let err_msg = "ERRORE: Impossibile smontare (Busy). Il demone resta attivo. Chiudi i file aperti.";
+            eprintln!("[STOP] {}", err_msg);
+            crate::write_status(err_msg);
+        }
+    }
+    
     Ok(())
 }
