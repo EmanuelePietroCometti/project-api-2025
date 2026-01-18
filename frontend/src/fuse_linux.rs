@@ -2269,6 +2269,7 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
                         mp_for_signals
                     );
                     eprintln!("Please close open terminals or files in that directory to unmount.");
+                    let _ = anyhow::anyhow!("Mountpoint busy");
                 } else {
                     if !shutting_down.swap(true, Ordering::SeqCst) {
                         println!("\n[STOP] Mountpoint clear. Initiating safe unmount...");
