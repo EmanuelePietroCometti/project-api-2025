@@ -9,7 +9,7 @@ use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::{
     collections::HashMap,
@@ -2279,15 +2279,14 @@ pub fn is_mountpoint_busy(path: &str) -> bool {
 
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
-
     let remote_fs = RemoteFs::new(api, rt.clone());
-
     let notifier_ptr = remote_fs.notifier.clone();
     let fs_state = remote_fs.state.clone();
 
     remote_fs.init_cache();
-
     let mp = mountpoint.to_string();
+
+    
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
@@ -2302,6 +2301,7 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
         let mut lock = notifier_ptr.lock().unwrap();
         *lock = Some(notifier_actual.clone());
     }
+
     {
         let url_clone = url.clone();
         let notifier_for_ws = Arc::new(notifier_actual);
@@ -2311,35 +2311,47 @@ pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<(
     }
 
     let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
-    let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
 
-    {
-        let tx = tx.clone();
-        let shutting_down = shutting_down.clone();
-        let mp_for_signals = mp.clone();
-        thread::spawn(move || {
-            for _sig in signals.forever() {
-                if is_mountpoint_busy(&mp_for_signals) {
-                    eprintln!(
-                        "\n[STOP] Signal ignored: Mountpoint {} is busy.",
-                        mp_for_signals
-                    );
-                    eprintln!("Please close open terminals or files in that directory to unmount.");
-                } else {
-                    if !shutting_down.swap(true, Ordering::SeqCst) {
-                        println!("\n[STOP] Mountpoint clear. Initiating safe unmount...");
-                        let _ = tx.send(());
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    thread::spawn(move || {
+        for _sig in signals.forever() {
+            let _ = tx.send(());
+        }
+    });
 
-    let _ = rx.recv();
-    println!("Unmounting filesystem...");
-    let _ = bg_session.join();
-    println!("Filesystem unmounted successfully.");
+    println!("[INFO] Filesystem (macOS) montato su {}. In attesa di segnali...", mp);
+
+    while let Ok(_) = rx.recv() {
+        let mut success = false;
+        let max_attempts = 3;
+
+        for i in 1..=max_attempts {
+            if !is_mountpoint_busy(&mp) {
+                success = true;
+                break;
+            }
+
+            let msg = format!("EBUSY (macOS): Mountpoint occupato. Tentativo di chiusura {}/{}...", i, max_attempts);
+            eprintln!("[STOP] {}", msg);
+            crate::write_status(&msg); 
+            
+            if i < max_attempts {
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        if success {
+            println!("[STOP] Mountpoint libero. Smontaggio in corso...");
+            crate::clear_status(); 
+            let _ = bg_session.join();
+            println!("[STOP] Filesystem macOS smontato con successo.");
+            return Ok(()); 
+        } else {
+            let err_msg = "ERRORE: Impossibile smontare macOS (Busy). Il demone resta attivo. Chiudi i file o i terminali aperti.";
+            eprintln!("[STOP] {}", err_msg);
+            crate::write_status(err_msg);
+        }
+    }
+    
     Ok(())
 }
