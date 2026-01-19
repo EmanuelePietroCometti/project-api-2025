@@ -83,7 +83,6 @@ Il sistema è ottimizzato per file superiori a **100MB**:
 - **Rust** (versione 1.75 o superiore)
 - **Node.js** (v18+) e **npm**
 - **FUSE:** `libfuse` (Linux), `macFUSE` (macOS) o `WinFSP` (Windows).
-- 
 
 ### Setup Repository
 ```bash
@@ -113,8 +112,9 @@ ctrl + C       #Per fermare l'esecuzione in modalità di debug
 
 ## Frontend (client)
 Il client Rust gestisce automaticamente il mountpoint predefinito nel percorso `~/mnt/remote-fs`.
-Avvio con IP e Background (Daemon): Il sistema supporta l'esecuzione in background tramite il flag `--deamon`:
+Avvio con IP e Background (Daemon): Il sistema supporta l'esecuzione in background tramite il flag `deamon`:
 ```bash
+cd frontend
 cargo run --release -- <IP> deamon
 ```
 Per fermare l'esecuzione:
