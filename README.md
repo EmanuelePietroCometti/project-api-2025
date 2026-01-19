@@ -117,7 +117,7 @@ Avvio con IP e Background (Daemon): Il sistema supporta l'esecuzione in backgrou
 cd frontend
 cargo run --release -- <IP> deamon
 ```
-Per fermare l'esecuzione:
+Il sistema supporta la terminazione dell'esecuzione in background tramite il flag `stop`:
 ```bash
 cargo run --release -- stop
 ```
