@@ -217,29 +217,6 @@ router.patch("/truncate", async (req, res) => {
   }
 });
 
-// PATCH /files/utimes?relPath=...&atime=...&mtime=...
-router.patch("/utimes", async (req, res) => {
-  try {
-    let relPath = req.query.relPath;
-    if (relPath.startsWith('././')) {
-      relPath = relPath.slice(2);
-    }
-    const at = req.query.atime ? parseInt(req.query.atime, 10) : null;
-    const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null;
-    const filePathAbs = path.join(ROOT_DIR, relPath);
-    backendChanges.add(filePathAbs);
-
-    const stats = await fs.promises.stat(filePathAbs);
-    const atime = at ? new Date(at * 1000) : stats.atime;
-    const mtime = mt ? new Date(mt * 1000) : stats.mtime;
-    await fs.promises.utimes(filePathAbs, atime, mtime);
-    const stats2 = await fs.promises.stat(filePathAbs);
-    await f.updateMtime(relPath, Math.floor(stats2.mtimeMs / 1000));
-    res.status(200).json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: "utimes failed" });
-  }
-});
 
 // PATCH /files/rename?oldRelPath=...&newRelPath=... 
 router.patch("/rename", async (req, res) => {

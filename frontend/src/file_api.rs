@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use reqwest::{Body, Client};
 use serde::Deserialize;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use urlencoding::encode;
@@ -98,36 +98,6 @@ impl FileApi {
         }
     }
 
-    // UTIMES /files/utimes
-    pub async fn utimes(
-        &self,
-        rel_path: &str,
-        atime: Option<SystemTime>,
-        mtime: Option<SystemTime>,
-    ) -> anyhow::Result<()> {
-        let url = format!("{}/files/utimes", self.base_url);
-        let ts = |t: SystemTime| {
-            t.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .to_string()
-        };
-        let mut q: Vec<(&str, String)> = vec![("relPath", rel_path.to_string())];
-        if let Some(a) = atime {
-            q.push(("atime", ts(a)));
-        }
-        if let Some(m) = mtime {
-            q.push(("mtime", ts(m)));
-        }
-        let resp = self.client.patch(&url).query(&q).send().await?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("utimes failed: {} - {}", status, text))
-        }
-    }
 
     /// GET /files?relPath=...
     pub async fn read_range(&self, rel: &str, start: u64, end: u64) -> anyhow::Result<Vec<u8>> {
