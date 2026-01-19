@@ -14,16 +14,16 @@ Il progetto adotta un'architettura **Client-Server** disaccoppiata:
 ---
 
 ## Requisiti Funzionali
-In conformità con le specifiche del documento "Project_API_2025.pdf":
+In conformità con le specifiche del progetto:
 
-- **[Pienamente Conforme] Mount Locale:** Supporto al montaggio su un mount point locale definito dall'utente.
-- **[Pienamente Conforme] Esplorazione:** Visualizzazione di file e directory tramite `ls` (mappato su `GET /list`).
-- **[Pienamente Conforme] Operazioni CRUD:** - Lettura file (`GET /files`).
+- **Mount Locale:** Supporto al montaggio su un mount point locale definito dall'utente.
+- **Esplorazione:** Visualizzazione di file e directory tramite `ls` (mappato su `GET /list`).
+- **Operazioni CRUD:** - Lettura file (`GET /files`).
     - Scrittura e upload (`PUT /files`).
     - Creazione cartelle (`POST /mkdir`).
     - Eliminazione (`DELETE /files`).
-- **[Pienamente Conforme] Attributi:** Gestione di dimensione, timestamp e permessi base recuperati dal server.
-- **[Pienamente Conforme] Background Daemon:** Il client viene eseguito come processo continuo per servire le richieste FUSE.
+- **Attributi:** Gestione di dimensione, timestamp e permessi base recuperati dal server.
+- **Background Daemon:** Il client viene eseguito come processo continuo per servire le richieste FUSE.
 
 ## Requisiti Non Funzionali
 - **Performance:** Minimizzazione dei round-trip di rete grazie alla cache locale dei metadati.
