@@ -21,6 +21,7 @@ async function bootstrap(rootDir, dbConnection) {
   } catch (err) {
     throw err;
   }
+
   const createTableQuery = `
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,17 +33,39 @@ async function bootstrap(rootDir, dbConnection) {
             size INTEGER,
             mtime INTEGER,
             permissions TEXT,
+            nlink INTEGER,
             version INTEGER DEFAULT 1,
             FOREIGN KEY(parent_id) REFERENCES files(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent);
     `;
-  return new Promise((resolve, reject) => {
+
+  await new Promise((resolve, reject) => {
     dbConnection.exec(createTableQuery, (err) => {
-      if (err) {
-        return reject(err);
-      }
+      if (err) return reject(err);
       resolve();
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    dbConnection.get("SELECT * FROM files WHERE path = '.'", (err, row) => {
+      if (err) return reject(err);
+
+      if (!row) {
+        const stmt = dbConnection.prepare(`
+          INSERT INTO files (path, parent_id, parent, name, is_dir, size, mtime, permissions, nlink, version)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const now = Math.floor(Date.now() / 1000);
+        stmt.run('.', null, null, 'root', 1, 0, now, '755', 2, 1, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+        stmt.finalize();
+      } else {
+        resolve();
+      }
     });
   });
 }
@@ -63,7 +86,8 @@ async function buildMetadataPayload(absPath) {
     is_dir: stats.isDirectory(),
     size: stats.size,
     mtime: Math.floor(stats.mtimeMs / 1000),
-    permissions
+    permissions,
+    nlink: stats.nlink,
   };
 }
 
@@ -85,10 +109,11 @@ async function handleFileUpdate(pathFile, stats) {
     if (!stats) {
       stats = await fs.stat(pathFile);
     }
+    
     const relPath = clean(pathFile);
-    const parentPath = path.dirname(relPath);
-    const name = path.basename(pathFile);
-    const permissions = (stats.mode & 0o777).toString(8);
+    
+    const name = (relPath === '.') ? 'root' : path.basename(pathFile);
+    const parentPath = (relPath === '.') ? null : path.dirname(relPath);
 
     const fileData = {
       path: relPath,
@@ -97,13 +122,16 @@ async function handleFileUpdate(pathFile, stats) {
       is_dir: stats.isDirectory(),
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions
-    }
+      permissions: (stats.mode & 0o777).toString(8),
+      nlink: stats.nlink
+    };
+    
     await f.updateFile(fileData);
   } catch (err) {
     console.error(`Error handling update for ${pathFile}:`, err);
   }
 }
+
 async function handleRename(oldAbs, newAbs) {
   try {
     const oldRel = clean(oldAbs);
@@ -235,7 +263,8 @@ watcher
           is_dir: false,
           size: 0,
           mtime: 0,
-          permissions: "000"
+          permissions: "000",
+          nlink: 0,
         });
       }, 200)
     };
@@ -267,7 +296,8 @@ watcher
           is_dir: true,
           size: 0,
           mtime: 0,
-          permissions: "000"
+          permissions: "000",
+          nlink: 0,
         });
       }, 200)
     };
@@ -306,8 +336,23 @@ watcher
 
 
 
-function clean(path) {
-  return path.replace(/^.*storage\//, "");
+function clean(absPath) {
+  let relative = path.relative(ROOT_DIR, absPath);
+
+  if (relative === '' || relative === '.') {
+    return '.';
+  }
+
+  relative = relative.split(path.sep).join('/');
+
+  if (relative.includes('..')) {
+    return '.';
+  }
+
+  if (!relative.startsWith('./')) {
+    relative = './' + relative;
+  }
+  return relative;
 }
 
 function getPrimaryIP() {
@@ -316,7 +361,7 @@ function getPrimaryIP() {
   for (const name in interfaces) {
     for (const net of interfaces[name]) {
       if (net.family === "IPv4" && !net.internal) {
-        return net.address; 
+        return net.address;
       }
     }
   }
@@ -333,7 +378,7 @@ const port = 3001;
 let IPAddress = process.argv[2];
 
 if (!IPAddress) {
-  IPAddress=getPrimaryIP();
+  IPAddress = getPrimaryIP();
   console.log("Server available at IP address: ", IPAddress);
 }
 
@@ -344,6 +389,14 @@ const corsOptions = {
   credentials: true
 };
 app.use(cors(corsOptions));
+
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'project-api-2025',
+    version: '1.0.0'
+  });
+});
 
 // API
 app.use('/list', listRoutes);
@@ -361,7 +414,7 @@ export const io = new SocketIOServer(httpServer, {
 });
 
 io.on('connection', (socket) => {
-  socket.on('disconnect', () => {});
+  socket.on('disconnect', () => { });
 });
 
 

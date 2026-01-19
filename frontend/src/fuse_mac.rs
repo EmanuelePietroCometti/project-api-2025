@@ -1,36 +1,29 @@
+use crate::file_api::{DirectoryEntry, FileApi};
 use anyhow::Result;
 use fuser015::{
-    FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-    spawn_mount2,
+    spawn_mount2, FileAttr, FileType, Filesystem, MountOption, Notifier, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use libc::{EIO, ENOENT, ENOTDIR, ENOTEMPTY};
+use rust_socketio::{ClientBuilder, Payload};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::{
     collections::HashMap,
     ffi::OsStr,
-    fs::{self, File},
+    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc::channel},
+    sync::{mpsc::channel, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
-use crate::file_api::{DirectoryEntry, FileApi};
-use rust_socketio::{ClientBuilder, Payload};
-use std::thread;
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
+const TTL: Duration = Duration::from_millis(2000);
 
-/// A lightweight error wrapper that stores an HTTP status code.
-///
-/// This type is used to propagate backend HTTP errors through the `anyhow`
-/// error stack. During error conversion (e.g., in `errno_from_anyhow`),
-/// the contained status code is mapped to the appropriate POSIX errno.
-///
-/// The value is a raw `u16` status code returned by the remote API.
 #[derive(Debug, Clone, Copy)]
 struct HttpStatus(pub u16);
 impl std::fmt::Display for HttpStatus {
@@ -41,46 +34,12 @@ impl std::fmt::Display for HttpStatus {
 
 impl std::error::Error for HttpStatus {}
 
-/// Temporary write state for an open file.
-///
-/// Whenever a file is opened for writing, a temporary local file is created
-/// in `/tmp`. All writes go into this temporary file instead of being flushed
-/// immediately to the remote backend.
-///
-/// When FUSE triggers `flush` or `release`, this temp file is uploaded to the
-/// remote storage and then removed.
-///
-/// Fields:
-/// - `tem_path`: Path of the temporary file on the local filesystem.
-/// - `size`: Total size of data written so far, used to update the backend size
-///   and track incremental writes.
-#[derive(Clone)]
 pub(crate) struct TempWrite {
     tem_path: PathBuf,
     size: u64,
+    dirty: bool,
 }
 
-/// Central state container for inode mapping, attribute caching,
-/// directory caching, and temporary write tracking.
-///
-/// This state is shared across the filesystem via `Arc<FsState>` and protected
-/// through `Mutex` to ensure thread-safety for concurrent FUSE operations.
-///
-/// Responsibilities:
-/// - Maintains a **bidirectional mapping** between paths and inode numbers.
-/// - Stores file metadata in an **attribute cache**.
-/// - Stores directory listings in a **directory cache**, with TTL expiration.
-/// - Tracks temporary write buffers via `TempWrite`.
-/// - Allocates new inode numbers when new paths appear.
-///
-/// Fields:
-/// - `ino_by_path`: Maps absolute paths → inode numbers.
-/// - `path_by_ino`: Maps inode numbers → absolute paths.
-/// - `attr_cache`: Cached `FileAttr` values for files and directories.
-/// - `dir_cache`: Cached directory listings + timestamp for TTL management.
-/// - `writes`: Tracks open writable files and their temporary files.
-/// - `next_ino`: Monotonically increasing counter for inode allocation.
-/// - `cache_ttl`: Lifetime of directory cache entries.
 #[derive(Clone)]
 pub(crate) struct FsState {
     pub ino_by_path: Arc<Mutex<HashMap<PathBuf, u64>>>,
@@ -90,30 +49,14 @@ pub(crate) struct FsState {
     pub writes: Arc<Mutex<HashMap<u64, TempWrite>>>,
     pub next_ino: Arc<Mutex<u64>>,
     pub cache_ttl: Duration,
+    pub next_fh: Arc<AtomicU64>,
 }
 
-/// Main FUSE filesystem implementation backed by a remote HTTP/WebSocket API.
-///
-/// This struct implements the `fuser016::Filesystem` trait and mediates between
-/// FUSE requests and the remote backend. It uses `FsState` internally to manage
-/// inode mappings, caching, and temporary writes.
-///
-/// Core responsibilities:
-/// - Translate FUSE operations (`lookup`, `read`, `write`, `mkdir`, ...) into
-///   API requests through `FileApi`.
-/// - Maintain an adaptive cache for directory listings and metadata.
-/// - Handle WebSocket push notifications (`fs_change`) to invalidate caches.
-/// - Create and manage temporary files for buffered writes.
-/// - Execute async API operations using the embedded Tokio runtime.
-///
-/// Fields:
-/// - `state`: Shared filesystem state and caches.
-/// - `api`: HTTP API client used to fetch metadata and contents from backend.
-/// - `rt`: Tokio runtime used to run async API calls inside synchronous FUSE.
 struct RemoteFs {
     state: Arc<FsState>,
     api: FileApi,
     rt: Arc<Runtime>,
+    notifier: Arc<Mutex<Option<Notifier>>>,
 }
 
 fn errno_from_anyhow(err: &anyhow::Error) -> i32 {
@@ -148,7 +91,13 @@ fn errno_from_anyhow(err: &anyhow::Error) -> i32 {
 }
 
 // Function that extract the file's metadata from the payload
-fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16)> {
+fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64, i64, u16, i64)> {
+    if cfg!(debug_assertions) {
+        println!(
+            "[UPDATE_METADATA_FROM_PAYLOAD] Payload received: {:?}",
+            payload
+        );
+    }
     let rel = payload["relPath"].as_str()?;
     let name = payload["name"]
         .as_str()
@@ -166,51 +115,47 @@ fn metadata_from_payload(payload: &Value) -> Option<(PathBuf, String, bool, u64,
 
     let perm_str = payload["permissions"].as_str().unwrap_or("644");
     let perm = u16::from_str_radix(perm_str, 8).unwrap_or(0o644);
-
+    let nlink = payload["nlink"].as_i64().unwrap_or(1);
     let abs = Path::new("/").join(rel);
-
-    Some((abs, name, is_dir, size, mtime, perm))
+    if cfg!(debug_assertions) {
+        println!("[UPDATE_METADATA_FROM_PAYLOAD] Values extracted: (abs: {:?}, name: {}, is_dir: {}, size: {}, mtime: {}, perm: {}, nlink: {})", abs, name, is_dir, size, mtime, perm, nlink);
+    }
+    Some((abs, name, is_dir, size, mtime, perm, nlink))
 }
 
 // Function that start the websocket listener, initialize the websocket connection and listen the messages
-pub fn start_websocket_listener(
-    api_url: &str,
-    notifier: Arc<Notifier>,
-    fs_state: Arc<FsState>,
-) {
+pub fn start_websocket_listener(api_url: &str, notifier: Arc<Notifier>, fs_state: Arc<FsState>) {
     let ws_url = format!("{}/socket.io/", api_url.trim_end_matches('/'));
-
+    if cfg!(debug_assertions) {
+        println!("[START_WBSOCKET_LISTENER] WebSocket URL: {}", ws_url);
+    }
     tokio::spawn(async move {
         let notifier_cloned = notifier.clone();
         let fs_state_cloned = fs_state.clone();
         let ws_url = ws_url.clone();
         tokio::task::spawn_blocking(move || {
             let client = ClientBuilder::new(ws_url)
-                .on("connect", |_, _| {
-                    println!("Socket.IO connected!");
-                })
-                .on("fs_change", move |payload, _| {
-                    match payload {
-                        Payload::Text(values) => {
-                            if values.len() < 1 {
-                                eprintln!("fs_change payload senza dati");
-                                return;
-                            }
-                            let json_payload = &values[0];
-                            handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
+                .on("connect", |_, _| {})
+                .on("fs_change", move |payload, _| match payload {
+                    Payload::Text(values) => {
+                        if values.len() < 1 {
+                            return;
                         }
-                        _other =>{
-                            eprintln!("Binary payload non gestito");
-                        }
+                        let json_payload = &values[0];
+                        handle_fs_change(json_payload, &notifier_cloned, &fs_state_cloned);
                     }
+                    _other => {}
                 })
-                .on("error", |err, _| {
-                    eprintln!("Socket.IO error: {:?}", err);
-                })
+                .on("error", |_err, _| {})
                 .connect();
 
             if let Err(err) = client {
-                eprintln!("Socket.IO connection failed: {:?}", err);
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[START_WBSOCKET_LISTENER] WebSocket connection error: {:?}",
+                        err
+                    );
+                }
             }
         });
     });
@@ -221,65 +166,114 @@ fn resolve_parent<'a>(path: &'a Path, st: &FsState) -> Option<(u64, &'a std::ffi
     let parent = path.parent()?;
     let name = path.file_name()?;
     let ino = st.ino_of(parent)?;
+    if cfg!(debug_assertions) {
+        println!(
+            "[RESOLVE_PARENT] Resolved parent: {:?}, name: {:?}, ino: {}",
+            parent, name, ino
+        );
+    }
     Some((ino, name))
 }
 
 /// Dispatches a filesystem-change WebSocket event to the correct handler based on its operation type.
 fn handle_fs_change(payload: &serde_json::Value, notifier: &Notifier, fs_state: &FsState) {
+    if cfg!(debug_assertions) {
+        println!("[HANDLE_FS_CHANGE] Payload received: {:?}", payload);
+    }
     let op = payload["op"].as_str().unwrap_or("");
     match op {
         "add" | "addDir" => {
+            if cfg!(debug_assertions) {
+                println!("[HANDLE_FS_CHANGE] Handling 'create' event");
+            }
             handle_created(payload, notifier, fs_state);
         }
 
         "write" | "change" => {
+            if cfg!(debug_assertions) {
+                println!("[HANDLE_FS_CHANGE] Handling 'update' event");
+            }
             handle_updated(payload, notifier, fs_state);
         }
 
         "unlink" | "unlinkDir" => {
+            if cfg!(debug_assertions) {
+                println!("[HANDLE_FS_CHANGE] Handling 'delete' event");
+            }
             handle_deleted_event(payload, notifier, fs_state);
         }
 
         "rename" | "renameDir" => {
+            if cfg!(debug_assertions) {
+                println!("[HANDLE_FS_CHANGE] Handling 'rename' event");
+            }
             handle_renamed_event(payload, notifier, fs_state);
         }
 
         _ => {
-            println!("Unknown fs_change op: {:?}", op);
+            return;
         }
     }
 }
 
 /// Handles a "create" event by inserting the new file/dir metadata and invalidating relevant caches
 fn handle_created(payload: &Value, notifier: &Notifier, st: &FsState) {
-    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
-        eprintln!("handle_created: invalid metadata in payload: {payload}");
+    if cfg!(debug_assertions) {
+        println!("[HANDLE_CREATED] Payload received: {:?}", payload);
+    }
+    let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
+        if cfg!(debug_assertions) {
+            eprintln!("[HANDLE_CREATED] Failed to extract metadata from payload");
+        }
         return;
     };
-    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
-
+    if let Some(_existing_ino) = st.ino_of(&abs) {
+        if cfg!(debug_assertions) {
+            println!("[HANDLE_CREATED] Path already exists in cache: {:?}", abs);
+        }
+        update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
+        return;
+    }
+    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
     let parent = abs.parent().unwrap_or(Path::new("/"));
     if let Some(parent_ino) = st.ino_of(parent) {
+        st.remove_dir_cache(parent);
         let _ = notifier.inval_entry(parent_ino, OsStr::new(&name));
-        let _ = notifier.inval_inode(parent_ino, 0, 0);
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_CREATED] Invalidated entry for parent ino: {}, name: {:?}",
+                parent_ino, name
+            );
+        }
     }
-
+    if cfg!(debug_assertions) {
+        println!(
+            "[HANDLE_CREATED] Created new entry: {:?} with ino: {}",
+            abs, ino
+        );
+    }
     let _ = notifier.inval_inode(ino, 0, 0);
 }
-
 /// Handles a delete event by resolving the absolute path and delegating removal logic
 fn handle_deleted_event(payload: &Value, notifier: &Notifier, st: &FsState) {
     if let Some(rel) = payload["relPath"].as_str() {
+        if cfg!(debug_assertions) {
+            println!("[HANDLE_DELETED] relPath: {}", rel);
+        }
         let abs = Path::new("/").join(rel);
         handle_deleted_path(&abs, notifier, st);
-    } else {
-        eprintln!("handle_deleted_event: missing relPath in payload: {payload}");
     }
 }
 
 /// Removes all cached state for a deleted path and notifies FUSE of invalidated entries
 fn handle_deleted_path(abs: &Path, notifier: &Notifier, st: &FsState) {
     if let Some((parent_ino, name)) = resolve_parent(abs, st) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_DELETED_PATH] Invalidating entry for parent ino: {}, name: {:?}",
+                parent_ino, name
+            );
+        }
         let _ = notifier.inval_entry(parent_ino, name);
         let _ = notifier.inval_inode(parent_ino, 0, 0);
     }
@@ -288,6 +282,12 @@ fn handle_deleted_path(abs: &Path, notifier: &Notifier, st: &FsState) {
     st.remove_attr(abs);
 
     if let Some(parent) = abs.parent() {
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_DELETED_PATH] Removing dir cache for parent: {:?}",
+                parent
+            );
+        }
         st.remove_dir_cache(parent);
     }
 }
@@ -295,11 +295,15 @@ fn handle_deleted_path(abs: &Path, notifier: &Notifier, st: &FsState) {
 /// Handles a rename event by updating inode-path mappings and invalidating affected caches
 fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
     let Some(old_rel) = payload["oldPath"].as_str() else {
-        eprintln!("handle_renamed_event: missing oldPath in payload: {payload}");
+        if cfg!(debug_assertions) {
+            eprintln!("[HANDLE_RENAMED_EVENT] Missing oldPath in payload");
+        }
         return;
     };
     let Some(new_rel) = payload["newPath"].as_str() else {
-        eprintln!("handle_renamed_event: missing newPath in payload: {payload}");
+        if cfg!(debug_assertions) {
+            eprintln!("[HANDLE_RENAMED_EVENT] Missing newPath in payload");
+        }
         return;
     };
 
@@ -307,27 +311,55 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
     let new_abs = Path::new("/").join(new_rel);
 
     if let Some((old_parent_ino, old_name)) = resolve_parent(&old_abs, st) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_RENAMED_EVENT] Invalidating old entry for parent ino: {}, name: {:?}",
+                old_parent_ino, old_name
+            );
+        }
         let _ = notifier.inval_entry(old_parent_ino, old_name);
         let _ = notifier.inval_inode(old_parent_ino, 0, 0);
     }
 
     let ino = if let Some(ino) = st.ino_of(&old_abs) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_RENAMED_EVENT] Found old path in cache: {:?} with ino: {}",
+                old_abs, ino
+            );
+        }
         st.remove_path(&old_abs);
         st.insert_path_mapping(&new_abs, ino);
         ino
     } else {
-        st.ino_of(&new_abs).unwrap_or_else(|| st.allocate_ino(&new_abs))
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_RENAMED_EVENT] Old path not found in cache: {:?}",
+                old_abs
+            );
+        }
+        st.ino_of(&new_abs)
+            .unwrap_or_else(|| st.allocate_ino(&new_abs))
     };
 
-    let Some((_abs_meta, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
-        eprintln!("handle_renamed_event: invalid metadata in payload: {payload}");
+    let Some((_abs_meta, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload)
+    else {
+        if cfg!(debug_assertions) {
+            eprintln!("[HANDLE_RENAMED_EVENT] Failed to extract metadata from payload");
+        }
         st.remove_attr(&old_abs);
         st.remove_attr(&new_abs);
         return;
     };
     let final_abs = &new_abs;
-    let _ = update_cache_from_metadata(st, final_abs, &name, is_dir, size, mtime, perm);
+    let _ = update_cache_from_metadata(st, final_abs, &name, is_dir, size, mtime, perm, nlink);
     if let Some((new_parent_ino, _)) = resolve_parent(&new_abs, st) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[HANDLE_RENAMED_EVENT] Invalidating new entry for parent ino: {}, name: {:?}",
+                new_parent_ino, name
+            );
+        }
         let _ = notifier.inval_inode(new_parent_ino, 0, 0);
     }
 
@@ -336,11 +368,13 @@ fn handle_renamed_event(payload: &Value, notifier: &Notifier, st: &FsState) {
 
 /// Handles a file update event by refreshing attributes and invalidating the inode in FUSE
 fn handle_updated(payload: &Value, notifier: &Notifier, st: &FsState) {
-    let Some((abs, name, is_dir, size, mtime, perm)) = metadata_from_payload(payload) else {
-        eprintln!("handle_updated: invalid metadata in payload: {payload}");
+    let Some((abs, name, is_dir, size, mtime, perm, nlink)) = metadata_from_payload(payload) else {
+        if cfg!(debug_assertions) {
+            eprintln!("[HANDLE_UPDATED] Failed to extract metadata from payload");
+        }
         return;
     };
-    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm);
+    let ino = update_cache_from_metadata(st, &abs, &name, is_dir, size, mtime, perm, nlink);
     let _ = notifier.inval_inode(ino, 0, 0);
 }
 
@@ -353,6 +387,7 @@ pub fn update_cache_from_metadata(
     size: u64,
     mtime: i64,
     perm: u16,
+    nlink: i64,
 ) -> u64 {
     let kind = if is_dir {
         FileType::Directory
@@ -360,35 +395,55 @@ pub fn update_cache_from_metadata(
         FileType::RegularFile
     };
     let parent = abs.parent().unwrap_or(Path::new("/"));
-
     let ino = match st.ino_of(abs) {
         Some(i) => i,
-        None => st.allocate_ino(abs), 
+        None => {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[UPDATE_CACHE_FROM_METADATA] Allocating new ino for path: {:?}",
+                    abs
+                );
+            }
+            st.allocate_ino(abs)
+        }
     };
 
     let blocks = if size == 0 { 0 } else { (size + 511) / 512 };
-
-    let attr = FileAttr {
-        ino,
-        size,
-        blocks,
-        blksize: 512,
-        atime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        mtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        ctime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        crtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
-        kind,
-        perm,
-        nlink: if is_dir { 2 } else { 1 },
-        uid: 1000,
-        gid: 1000,
-        rdev: 0,
-        flags: 0,
-    };
-    st.set_attr(abs, attr);
-    st.insert_child(parent, name.to_string(), ino);
-    st.remove_dir_cache(parent);
-    ino
+    let uid = (unsafe { libc::getuid() }) as u32;
+    let gid = (unsafe { libc::getgid() }) as u32;
+    if st.get_attr(parent).is_none() {
+        let attr = FileAttr {
+            ino,
+            size,
+            blocks,
+            blksize: 512,
+            atime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            mtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            ctime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            crtime: UNIX_EPOCH + Duration::from_secs(mtime as u64),
+            kind,
+            perm,
+            nlink: nlink as u32,
+            uid,
+            gid,
+            rdev: 0,
+            flags: 0,
+        };
+        st.set_attr(abs, attr);
+        st.insert_child(parent, name.to_string(), ino);
+        st.remove_dir_cache(parent);
+        ino
+    } else {
+        if cfg!(debug_assertions) {
+            println!(
+                "[UPDATE_CACHE_FROM_METADATA] Updating existing attr for path: {:?}",
+                abs
+            );
+        }
+        st.remove_attr(parent);
+        st.remove_dir_cache(parent);
+        ino
+    }
 }
 
 impl FsState {
@@ -404,7 +459,8 @@ impl FsState {
             dir_cache: Arc::new(Mutex::new(HashMap::new())),
             writes: Arc::new(Mutex::new(HashMap::new())),
             next_ino: Arc::new(Mutex::new(2)),
-            cache_ttl: Duration::from_secs(300),
+            cache_ttl: TTL,
+            next_fh: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -414,8 +470,17 @@ impl FsState {
 
         let mut child = parent.to_path_buf();
         if child.to_string_lossy() != "/" {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[INSERT_CHILD] Inserting child: {} under parent: {:?}",
+                    name, parent
+                );
+            }
             child.push(name);
         } else {
+            if cfg!(debug_assertions) {
+                println!("[INSERT_CHILD] Inserting child: {} under root parent", name);
+            }
             child = PathBuf::from(format!("/{}", name));
         }
 
@@ -423,38 +488,30 @@ impl FsState {
         path_by_ino.insert(ino, child);
     }
 
-    pub fn insert_write_tempfile(&self, ino: u64, temp_path: PathBuf) {
+    pub fn insert_write_tempfile(&self, fh: u64, temp_path: PathBuf, dirty: bool) {
         let mut writes = self.writes.lock().unwrap();
         writes.insert(
-            ino,
+            fh,
             TempWrite {
                 tem_path: temp_path,
                 size: 0,
+                dirty,
             },
         );
     }
 
-    pub fn update_write_size(&self, ino: u64, delta: u64) {
+    // Accesso MUTABILE (per write, flush, release)
+    fn with_write_mut<F, R>(&self, fh: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut TempWrite) -> R,
+    {
         let mut writes = self.writes.lock().unwrap();
-        if let Some(entry) = writes.get_mut(&ino) {
-            entry.size += delta;
-        }
+        writes.get_mut(&fh).map(f)
     }
 
-    pub fn take_write(&self, ino: u64) -> Option<TempWrite> {
-        self.writes.lock().unwrap().remove(&ino)
-    }
-
-    pub fn _flush_write(&self, ino: u64) -> Option<TempWrite> {
-        self.writes.lock().unwrap().remove(&ino)
-    }
-
-    pub fn _remove_write(&self, ino: u64) {
-        self.writes.lock().unwrap().remove(&ino);
-    }
-
-    pub fn get_write(&self, ino: u64) -> Option<TempWrite> {
-        self.writes.lock().unwrap().get(&ino).cloned()
+    // Rimuove e restituisce (solo in release)
+    pub fn take_write(&self, fh: u64) -> Option<TempWrite> {
+        self.writes.lock().unwrap().remove(&fh)
     }
 
     // ---- PATH ↔ INODE ----
@@ -485,6 +542,11 @@ impl FsState {
     pub fn remove_path(&self, path: &Path) {
         if let Some(ino) = self.ino_by_path.lock().unwrap().remove(path) {
             self.path_by_ino.lock().unwrap().remove(&ino);
+        } else {
+            if cfg!(debug_assertions) {
+                eprintln!("[REMOVE_PATH] Path not found in cache: {:?}", path);
+            }
+            return;
         }
     }
 
@@ -540,6 +602,47 @@ impl FsState {
         self.attr_cache.lock().unwrap().clear();
         self.dir_cache.lock().unwrap().clear();
     }
+
+    pub fn cleanup_all_tempfiles(&self) {
+        let writes = match self.writes.lock() {
+            Ok(w) => w,
+            Err(_) => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[CLEANUP_ALL_TEMPFILES] Failed to acquire writes lock");
+                }
+                return;
+            }
+        };
+
+        for (_ino, tw) in writes.iter() {
+            if tw.tem_path.exists() {
+                match std::fs::remove_file(&tw.tem_path) {
+                    Ok(_) => {
+                        if cfg!(debug_assertions) {
+                            println!(
+                                "[CLEANUP_ALL_TEMPFILES] Removed tempfile: {:?}",
+                                tw.tem_path
+                            );
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "[CLEANUP_ALL_TEMPFILES] Failed to remove tempfile: {:?}",
+                                tw.tem_path
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 impl RemoteFs {
@@ -550,7 +653,7 @@ impl RemoteFs {
     }
 
     // Function that init the cache
-    // It is called at the beginning 
+    // It is called at the beginning
     pub fn init_cache(&self) {
         self.state.clear_all_cache();
     }
@@ -558,17 +661,6 @@ impl RemoteFs {
     // Function that verify if the cache is still valid
     pub fn is_cache_valid(&self, timestamp: SystemTime) -> bool {
         SystemTime::now().duration_since(timestamp).unwrap() < self.state.cache_ttl
-    }
-
-    // Functions that obtain information from the cache
-    pub fn get_dir_cache(&self, path: &Path) -> Option<(Vec<DirectoryEntry>, SystemTime)> {
-        let cache_entry = self.state.get_dir_cache(&path);
-        if let Some((_, ts)) = &cache_entry {
-            if !self.is_cache_valid(*ts) {
-                return None;
-            }
-        }
-        cache_entry
     }
 
     pub fn get_attr_cache(&self, path: &Path) -> Option<FileAttr> {
@@ -580,10 +672,16 @@ impl RemoteFs {
     pub fn clear_cache(&self, path: Option<&Path>) {
         match path {
             Some(p) => {
+                if cfg!(debug_assertions) {
+                    println!("[CLEAR_CACHE] Clearing cache for path: {:?}", p);
+                }
                 self.state.remove_attr(&p);
                 self.state.remove_dir_cache(&p);
             }
             None => {
+                if cfg!(debug_assertions) {
+                    println!("[CLEAR_CACHE] Clearing entire cache");
+                }
                 self.state.clear_all_cache();
             }
         }
@@ -591,28 +689,54 @@ impl RemoteFs {
 
     // Function that update the cache
     pub fn update_cache(&self, dir: &Path) -> anyhow::Result<()> {
-        let rel = Self::rel_of(dir);
-        let list = self.rt.block_on(self.api.ls(&rel))?;
-        {
-            self.state
-                .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
+        let rel_db = Self::rel_for_db(dir);
+        let rel_fs = Self::rel_for_fs(dir);
+        let list = self.rt.block_on(self.api.ls(&rel_db))?;
+
+        self.state
+            .set_dir_cache(&dir.to_path_buf(), (list.clone(), SystemTime::now()));
+        let rel_db_parent = Self::rel_for_db(dir);
+        let de = self
+            .rt
+            .block_on(self.api.get_update_metadata(&rel_db_parent))?;
+        if let Some(mut parent_attr) = self.get_attr_cache(dir) {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[UPDATE_CACHE] Updating parent attr in cache for dir: {:?}",
+                    dir
+                );
+            }
+            parent_attr.nlink = de.nlink as u32;
+            parent_attr.size = de.size as u64;
+            parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
+            self.state.set_attr(dir, parent_attr);
+        } else {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[UPDATE_CACHE] Parent attr not found in cache for dir: {:?}, creating new attr",
+                    dir
+                );
+            }
         }
-        let mut _attrcache = self.state.get_attr(&dir);
         for de in &list {
             let mut child = PathBuf::from("/");
-            if !rel.is_empty() {
-                child.push(&rel);
+            if !rel_fs.is_empty() {
+                child.push(&rel_fs);
             }
             child.push(&de.name);
-            let isdir = Self::is_dir(&de);
-            let ty = if isdir {
+
+            let is_dir = Self::is_dir(&de);
+            let ty = if is_dir {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             };
+            let nlink_child = de.nlink as u32;
+
             let perm = Self::parse_perm(&de.permissions);
-            let size = if isdir { 0 } else { de.size.max(0) as u64 };
-            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+            let size = de.size as u64;
+
+            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, nlink_child);
             self.state.set_attr(&child, attr);
         }
         Ok(())
@@ -634,9 +758,10 @@ impl RemoteFs {
             state: Arc::new(FsState::new(api.clone(), rt.clone())),
             api,
             rt,
+            notifier: Arc::new(Mutex::new(None)),
         }
     }
-     
+
     // Function that allocate the inode
     fn alloc_ino(&self, path: &Path) -> u64 {
         if let Some(ino) = self.state.ino_of(path) {
@@ -651,8 +776,24 @@ impl RemoteFs {
         self.state.path_of(ino)
     }
 
-    // Function that extract the relative path
-    fn rel_of(path: &Path) -> String {
+    /// Extract relative path for db
+    fn rel_for_db(path: &Path) -> String {
+        let s = path.to_string_lossy();
+
+        if s == "/" {
+            return "".to_string();
+        }
+        if s.starts_with("./") {
+            s.to_string()
+        } else {
+            let trimmed = s.trim_start_matches("/");
+            format!("./{}", trimmed)
+        }
+    }
+
+    /// Extract relative path for fs (PathBuf)
+
+    fn rel_for_fs(path: &Path) -> String {
         let s = path.to_string_lossy();
         if s == "/" {
             "".to_string()
@@ -669,13 +810,14 @@ impl RemoteFs {
         size: u64,
         mtime: Option<i64>,
         perm: u16,
+        nlink: u32,
     ) -> FileAttr {
         let now = SystemTime::now();
         let mtime_st = mtime
             .and_then(|sec| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(sec as u64)))
             .unwrap_or(now);
-        let uid = unsafe { libc::getuid() } as u32;
-        let gid = unsafe { libc::getgid() } as u32;
+        let uid = (unsafe { libc::getuid() }) as u32;
+        let gid = (unsafe { libc::getgid() }) as u32;
         FileAttr {
             ino: self.alloc_ino(path),
             size,
@@ -686,11 +828,7 @@ impl RemoteFs {
             crtime: mtime_st,
             kind: ty,
             perm,
-            nlink: if matches!(ty, FileType::Directory) {
-                2
-            } else {
-                1
-            },
+            nlink,
             uid,
             gid,
             rdev: 0,
@@ -714,42 +852,50 @@ impl RemoteFs {
 
     // Function that define the directory entries
     pub fn dir_entries(&self, dir: &Path) -> Result<Vec<(PathBuf, DirectoryEntry)>> {
-        let rel = Self::rel_of(dir);
+        let rel_db = Self::rel_for_db(dir);
+        let rel_fs = Self::rel_for_fs(dir);
+
         if let Some((entries, ts)) = self.state.get_dir_cache(&dir) {
-            if SystemTime::now()
-                .duration_since(ts)
-                .unwrap_or(Duration::ZERO)
-                < self.state.cache_ttl
-            {
+            if cfg!(debug_assertions) {
+                println!("[DIR_ENTRIES] Using cached entries for dir: {:?}", dir);
+            }
+            if self.is_cache_valid(ts) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[DIR_ENTRIES] Cache is valid for dir: {:?}, returning cached entries",
+                        dir
+                    );
+                }
                 let mut out = Vec::with_capacity(entries.len());
                 for de in entries {
                     let mut child = PathBuf::from("/");
-                    if !rel.is_empty() {
-                        child.push(&rel);
+                    if !rel_fs.is_empty() {
+                        child.push(&rel_fs);
                     }
                     child.push(&de.name);
-                    let is_dir = Self::is_dir(&de);
-                    let ty = if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                    let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
-                    self.insert_attr_cache(child.clone(), attr);
                     out.push((child, de));
                 }
+                let _ = self.update_cache(dir);
                 return Ok(out);
             }
         }
-        let list = self.rt.block_on(self.api.ls(&rel))?;
+
+        let list = self.rt.block_on(self.api.ls(&rel_db))?;
+
         self.insert_dir_cache(dir.to_path_buf(), (list.clone(), SystemTime::now()));
+
         let mut out = Vec::with_capacity(list.len());
-        for de in list {
+
+        for de in &list {
             let mut child = PathBuf::from("/");
-            if !rel.is_empty() {
-                child.push(&rel);
+            if !rel_fs.is_empty() {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[DIR_ENTRIES] Building child path for dir: {:?} with rel_fs: {}",
+                        dir, rel_fs
+                    );
+                }
+                child.push(&rel_fs);
             }
             child.push(&de.name);
 
@@ -760,13 +906,55 @@ impl RemoteFs {
                 FileType::RegularFile
             };
             let perm = Self::parse_perm(&de.permissions);
-            let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm);
+            let size = de.size as u64;
+
+            let child_nlink = de.nlink as u32;
+            let attr = self.file_attr(&child, ty, size, Some(de.mtime), perm, child_nlink);
             self.insert_attr_cache(child.clone(), attr);
 
-            out.push((child, de));
+            out.push((child, de.clone()));
         }
+        let rel_db_parent = Self::rel_for_db(dir);
+        let de = self
+            .rt
+            .block_on(self.api.get_update_metadata(&rel_db_parent))?;
+
+        if let Some(mut parent_attr) = self.state.get_attr(dir) {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[DIR_ENTRIES] Updating parent attr in cache for dir: {:?}",
+                    dir
+                );
+            }
+            parent_attr.nlink = de.nlink as u32;
+            parent_attr.size = de.size as u64;
+            parent_attr.mtime = UNIX_EPOCH + Duration::from_secs(de.mtime as u64);
+            self.state.set_attr(dir, parent_attr);
+        } else {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[DIR_ENTRIES] Creating new attr in cache for dir: {:?}",
+                    dir
+                );
+            }
+            let attr = self.file_attr(
+                dir,
+                FileType::Directory,
+                de.size as u64,
+                Some(de.mtime),
+                0o755,
+                de.nlink as u32,
+            );
+            self.state.set_attr(dir, attr);
+        }
+
         Ok(out)
+    }
+}
+
+impl Drop for RemoteFs {
+    fn drop(&mut self) {
+        self.state.cleanup_all_tempfiles();
     }
 }
 
@@ -777,145 +965,160 @@ impl Filesystem for RemoteFs {
         _req: &Request<'_>,
         ino: u64,
         mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<TimeOrNow>,
-        mtime: Option<TimeOrNow>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
-        _crtime: Option<SystemTime>, 
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
+        _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[SETATTR] Called with ino: {}, mode: {:?}, size: {:?}, fh: {:?}",
+                ino, mode, size, fh
+            );
+        }
+        if ino == 1 {
+            if cfg!(debug_assertions) {
+                println!("[SETATTR] Setting attributes for root inode");
+            }
+            let uid = (unsafe { libc::getuid() }) as u32;
+            let gid = (unsafe { libc::getgid() }) as u32;
+
+            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755, 2);
+            attr.uid = uid;
+            attr.gid = gid;
+            reply.attr(&self.state.cache_ttl, &attr);
+            return;
+        }
         let Some(path) = self.path_of(ino) else {
+            if cfg!(debug_assertions) {
+                eprintln!("[SETATTR] Inode not found: {}", ino);
+            }
             reply.error(ENOENT);
             return;
         };
-        let parent = path.parent().unwrap_or(Path::new("/"));
-        let rel = Self::rel_of(&path);
+        let rel_db = Self::rel_for_db(&path);
 
-        let mut attr = if let Some(a) = self.get_attr_cache(&path) {
+        let mut attr = if let Some(a) = self.state.get_attr(&path) {
             a
         } else {
-            match self.dir_entries(parent) {
-                Ok(entries) => {
-                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
-                        let is_dir = Self::is_dir(&de);
-                        let ty = if is_dir {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        let perm = Self::parse_perm(&de.permissions);
-                        let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                        self.insert_attr_cache(path.clone(), a.clone());
-                        a
-                    } else {
-                        reply.error(ENOENT);
-                        return;
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            let _ = self.dir_entries(parent);
+            match self.state.get_attr(&path) {
+                Some(a) => a,
+                None => {
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "[SETATTR] Attributes not found in cache for path: {:?}",
+                            path
+                        );
                     }
-                }
-                Err(_) => {
                     reply.error(ENOENT);
                     return;
                 }
             }
         };
-
         if let Some(m) = mode {
-            match self.rt.block_on(self.api.chmod(&rel, m)) {
-                Ok(_) => {
-                    attr.perm = (m & 0o777) as u16;
-                }
-                Err(e) => {
-                    reply.error(errno_from_anyhow(&e));
-                    return;
-                }
+            attr.perm = (m & 0o777) as u16;
+        } else {
+            if cfg!(debug_assertions) {
+                println!("[SETATTR] Mode not provided, keeping existing permissions");
             }
         }
 
         if let Some(new_size) = size {
-            if new_size == 0 {
-        // Ignora completamente — macOS sta solo aggiornando metadata
-        reply.attr(&self.state.cache_ttl, &attr);
-        return;
-    }
+            let mut is_local_write = false;
 
-    // 2. Gestisci truncate solo se il file è apertamente in scrittura (fh presente)
-    if _fh.is_none() {
-        // Non è una richiesta di ftruncate() → ignoriamo
-        reply.attr(&self.state.cache_ttl, &attr);
-        return;
-    }
-            match self.rt.block_on(self.api.truncate(&rel, new_size)) {
-                Ok(_) => {
-                    attr.size = new_size;
-                    attr.blocks = (new_size + 511) / 512;
+            if let Some(fh_val) = fh {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[SETATTR] Received fh: {} for setattr on path: {:?}",
+                        fh_val, path
+                    );
                 }
-                Err(e) => {
-                    reply.error(errno_from_anyhow(&e));
-                    return;
+                if let Some(effective_size) = self.state.with_write_mut(fh_val, |tw| {
+                    tw.size = new_size;
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tw.tem_path) {
+                        let _ = f.set_len(new_size);
+                    }
+                    tw.size
+                }) {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[SETATTR] Updating size from local write tempfile for fh: {}, new size: {}",
+                            fh_val, effective_size
+                        );
+                    }
+                    attr.size = effective_size;
+                    attr.blocks = (effective_size + 511) / 512;
+                    is_local_write = true;
+                }
+            }
+
+            if !is_local_write {
+                match self.rt.block_on(self.api.truncate(&rel_db, new_size)) {
+                    Ok(_) => {
+                        attr.size = new_size;
+                        attr.blocks = (new_size + 511) / 512;
+                    }
+                    Err(e) => {
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "[SETATTR] Truncate failed for path: {:?}, error: {:?}",
+                                path, e
+                            );
+                        }
+                        let errno = errno_from_anyhow(&e);
+
+                        if errno == libc::ENOENT || errno == libc::EIO || errno == libc::ENOSPC {
+                            if cfg!(debug_assertions) {
+                                eprintln!(
+                                    "[SETATTR] Attempting to recover from truncate error for path: {:?}, errno: {}",
+                                    path, errno
+                                );
+                            }
+                            attr.size = new_size;
+                            attr.blocks = (new_size + 511) / 512;
+                        } else {
+                            if cfg!(debug_assertions) {
+                                eprintln!(
+                                    "[SETATTR] Truncate error not recoverable for path: {:?}, errno: {}",
+                                    path, errno
+                                );
+                            }
+                            reply.error(errno);
+                            return;
+                        }
+                    }
                 }
             }
         }
-
-        let mut need_utimes = false;
-        let mut new_atime = None;
-        let mut new_mtime = None;
-        if let Some(a) = atime {
-            new_atime = Some(match a {
-                TimeOrNow::SpecificTime(t) => t,
-                TimeOrNow::Now => SystemTime::now(),
-            });
-            attr.atime = new_atime.unwrap();
-            need_utimes = true;
+        self.insert_attr_cache(path.to_path_buf(), attr.clone());
+        if cfg!(debug_assertions) {
+            println!(
+                "[SETATTR] Updated attributes for path: {:?}, new attr: {:?}",
+                path, attr
+            );
         }
-        if let Some(m) = mtime {
-            new_mtime = Some(match m {
-                TimeOrNow::SpecificTime(t) => t,
-                TimeOrNow::Now => SystemTime::now(),
-            });
-            let t = new_mtime.unwrap();
-            attr.mtime = t;
-            attr.ctime = t;
-            need_utimes = true;
-        }
-        if need_utimes {
-            match self
-                .rt
-                .block_on(self.api.utimes(&rel, new_atime, new_mtime))
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    reply.error(errno_from_anyhow(&e));
-                    return;
-                }
-            }
-        }
-
-        if let Some(u) = uid {
-            attr.uid = u;
-        }
-        if let Some(g) = gid {
-            attr.gid = g;
-        }
-        if let Some(f) = flags {
-            attr.flags = f;
-        }
-
-        self.insert_attr_cache(path.clone(), attr.clone());
-        let _ = self.update_cache(parent);
         reply.attr(&self.state.cache_ttl, &attr);
     }
 
-    // Function that obtain the file's stats
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser015::ReplyStatfs) {
+        if cfg!(debug_assertions) {
+            println!("[STATFS] Statfs called");
+        }
         match self.rt.block_on(self.api.statfs()) {
             Ok(stats) => {
+                if cfg!(debug_assertions) {
+                    println!("[STATFS] Remote statfs succeeded: {:?}", stats);
+                }
                 let bsize = stats.bsize; // Block size (from backend)
                 let blocks = stats.blocks; // Number of blocks (from backend)
                 let bfree = stats.bfree; // Number of free blocks (from backend)
@@ -935,8 +1138,12 @@ impl Filesystem for RemoteFs {
                     namelen,
                     frsize,
                 );
+                return;
             }
             Err(_e) => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[STATFS] Remote statfs failed, using default values");
+                }
                 let bsize: u32 = 4096;
                 let blocks: u64 = 1_000_000;
                 let bfree: u64 = 1_000_000;
@@ -946,6 +1153,7 @@ impl Filesystem for RemoteFs {
                 let namelen: u32 = 255;
                 let frsize: u32 = bsize;
                 reply.statfs(blocks, bfree, bavail, files, ffree, bsize, namelen, frsize);
+                return;
             }
         }
     }
@@ -958,37 +1166,54 @@ impl Filesystem for RemoteFs {
         name: &std::ffi::OsStr,
         reply: ReplyEntry,
     ) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[LOOKUP] Lookup called for parent ino: {}, name: {:?}",
+                parent, name
+            );
+        }
         let Some(parent_path) = self.path_of(parent) else {
+            if cfg!(debug_assertions) {
+                eprintln!("[LOOKUP] Parent inode not found: {}", parent);
+            }
             reply.error(ENOENT);
             return;
         };
-        let dir = if parent_path == Path::new("/") {
-            parent_path.clone()
-        } else {
-            parent_path
-        };
-        match self.dir_entries(&dir) {
-            Ok(entries) => {
-                let target = entries
-                    .into_iter()
-                    .find(|(p, _)| p.file_name() == Some(name));
-                if let Some((path, de)) = target {
-                    let is_dir = Self::is_dir(&de);
-                    let ty = if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                    let attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                    self.insert_attr_cache(path.clone(), attr.clone());
+
+        let child_path = parent_path.join(name);
+
+        match self.dir_entries(&parent_path) {
+            Ok(_) => {
+                if let Some(attr) = self.state.get_attr(&child_path) {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[LOOKUP] Found attributes for child path: {:?}, returning entry",
+                            child_path
+                        );
+                    }
                     reply.entry(&self.state.cache_ttl, &attr, 0);
+                    return;
                 } else {
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "[LOOKUP] Attributes not found in cache for child path: {:?}",
+                            child_path
+                        );
+                    }
                     reply.error(ENOENT);
+                    return;
                 }
             }
-            Err(_) => reply.error(ENOENT),
+            Err(e) => {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[LOOKUP] Failed to read directory entries for parent path: {:?}, error: {:?}",
+                        parent_path, e
+                    );
+                }
+                reply.error(errno_from_anyhow(&e));
+                return;
+            }
         }
     }
 
@@ -1001,37 +1226,74 @@ impl Filesystem for RemoteFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[READDIR] Readdir called for ino: {}, offset: {}",
+                ino, offset
+            );
+        }
         let Some(dir) = self.path_of(ino) else {
+            if cfg!(debug_assertions) {
+                eprintln!("[READDIR] Inode not found: {}", ino);
+            }
             reply.error(ENOTDIR);
             return;
         };
         let entries = match self.dir_entries(&dir) {
             Ok(v) => v,
             Err(_) => {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[READDIR] Failed to read directory entries for path: {:?}",
+                        dir
+                    );
+                }
                 reply.error(ENOENT);
                 return;
             }
         };
         if offset == 0 {
             if !reply.add(ino, 1, FileType::Directory, ".") {
+                if cfg!(debug_assertions) {
+                    println!("[READDIR] Reply buffer full after adding '.' entry");
+                }
                 reply.ok();
                 return;
             }
             let parent_ino = if dir == Path::new("/") {
+                if cfg!(debug_assertions) {
+                    println!("[READDIR] Directory is root, setting parent ino to 1");
+                }
                 1
             } else {
+                if cfg!(debug_assertions) {
+                    println!("[READDIR] Getting parent ino for directory: {:?}", dir);
+                }
                 dir.parent()
                     .and_then(|p| self.state.ino_of(&p))
                     .unwrap_or(1)
             };
             if !reply.add(parent_ino, 2, FileType::Directory, "..") {
+                if cfg!(debug_assertions) {
+                    println!("[READDIR] Reply buffer full after adding '..' entry");
+                }
                 reply.ok();
                 return;
             }
         }
         let mut idx = if offset <= 2 {
+            if cfg!(debug_assertions) {
+                println!("[READDIR] Starting index at 0 since offset is {}", offset);
+            }
             0
         } else {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[READDIR] Starting index at {} based on offset {}",
+                    (offset - 2) as usize,
+                    offset
+                );
+            }
             (offset - 2) as usize
         };
         while idx < entries.len() {
@@ -1043,173 +1305,332 @@ impl Filesystem for RemoteFs {
                 FileType::RegularFile
             };
             let child_ino = self.alloc_ino(child);
-            let this_off = 3 + idx as i64;
+            let this_off = 3 + (idx as i64);
             if !reply.add(child_ino, this_off, ty, child.file_name().unwrap()) {
                 break;
             }
             idx += 1;
+            if cfg!(debug_assertions) {
+                println!(
+                    "[READDIR] Added entry: {:?} with ino: {} at offset: {}",
+                    child, child_ino, this_off
+                );
+            }
         }
 
         reply.ok();
     }
 
     // Retrieves metadata and file attributes for a given path
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        if cfg!(debug_assertions) {
+            println!("[GETATTR] Getattr called for ino: {}", ino);
+        }
         if ino == 1 {
-            let uid = unsafe { libc::getuid() } as u32;
-            let gid = unsafe { libc::getgid() } as u32;
-            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755);
+            if cfg!(debug_assertions) {
+                println!("[GETATTR] Getting attributes for root inode");
+            }
+            let uid = (unsafe { libc::getuid() }) as u32;
+            let gid = (unsafe { libc::getgid() }) as u32;
+            let mut attr = self.file_attr(Path::new("/"), FileType::Directory, 0, None, 0o755, 2);
             attr.uid = uid;
             attr.gid = gid;
             reply.attr(&self.state.cache_ttl, &attr);
             return;
         }
-
         let Some(path) = self.path_of(ino) else {
+            if cfg!(debug_assertions) {
+                eprintln!("[GETATTR] Inode not found: {}", ino);
+            }
             reply.error(ENOENT);
             return;
         };
-
-        let parent = path.parent().unwrap_or(Path::new("/"));
-        let parent_cache_valid = self.get_dir_cache(parent).is_some();
-        if parent_cache_valid {
-            if let Some(attr) = self.state.get_attr(&path) {
-                reply.attr(&self.state.cache_ttl, &attr);
-                return;
+        let mut forced_size: Option<u64> = None;
+        if let Some(fh_val) = fh {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[GETATTR] Checking for local write tempfile for fh: {} on path: {:?}",
+                    fh_val, path
+                );
+            }
+            let writes = self.state.writes.lock().unwrap();
+            if let Some(tw) = writes.get(&fh_val) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[GETATTR] Found local write tempfile for fh: {}, size: {}",
+                        fh_val, tw.size
+                    );
+                }
+                forced_size = Some(tw.size);
             }
         }
-        match self.dir_entries(parent) {
-            Ok(entries) => {
-                if let Some((_, de)) = entries.into_iter().find(|(p, _)| p == &path) {
-                    let is_dir = Self::is_dir(&de);
-                    let ty = if is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    };
-                    let perm = Self::parse_perm(&de.permissions);
-                    let size = if is_dir { 0 } else { de.size.max(0) as u64 };
-                    let mut attr = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                    attr.nlink = if is_dir { 2 } else { 1 };
-                    self.insert_attr_cache(path.clone(), attr.clone());
-                    reply.attr(&self.state.cache_ttl, &attr);
-                } else {
-                    reply.error(ENOENT);
-                }
+
+        let attr_opt = if let Some(a) = self.state.get_attr(&path) {
+            if cfg!(debug_assertions) {
+                println!("[GETATTR] Found attributes in cache for path: {:?}", path);
             }
-            Err(_) => reply.error(ENOENT),
+            Some(a)
+        } else {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            if self.dir_entries(parent).is_ok() {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[GETATTR] Fetched directory entries for parent: {:?}, checking cache again for path: {:?}",
+                        parent, path
+                    );
+                }
+                self.state.get_attr(&path)
+            } else {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[GETATTR] Failed to fetch directory entries for parent: {:?}",
+                        parent
+                    );
+                }
+                None
+            }
+        };
+        if let Some(mut attr) = attr_opt {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[GETATTR] Returning attributes for path: {:?}, attr: {:?}",
+                    path, attr
+                );
+            }
+            if let Some(real_size) = forced_size {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[GETATTR] Overriding size with local write tempfile size: {} for path: {:?}",
+                        real_size, path
+                    );
+                }
+                attr.size = real_size;
+                attr.blocks = (real_size + 511) / 512;
+            }
+            reply.attr(&self.state.cache_ttl, &attr);
+        } else {
+            if cfg!(debug_assertions) {
+                eprintln!("[GETATTR] Attributes not found for path: {:?}", path);
+            }
+            reply.error(ENOENT);
         }
     }
 
     // Function that open a new temporary file
-   fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-    let temp_path = self.get_temporary_path(ino);
-    if !temp_path.exists() {
-        if let Err(_e) = File::create(&temp_path) {
-            reply.error(libc::EIO);
-            return;
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if cfg!(debug_assertions) {
+            println!("[OPEN] Open called for ino: {}, flags: {:#o}", ino, flags);
         }
+        let fh = self.state.alloc_fh();
+
+        let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+
+        if wants_write {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[OPEN] Open requested with write access for ino: {}, allocating tempfile",
+                    ino
+                );
+            }
+            let temp_path = self.get_temporary_path(fh);
+
+            if let Err(_) = File::create(&temp_path) {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[OPEN] Failed to create temporary file at path: {:?}",
+                        temp_path
+                    );
+                }
+                reply.error(libc::EIO);
+                return;
+            }
+            if let Some(path) = self.path_of(ino) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[OPEN] Loading existing file data into tempfile for path: {:?}",
+                        path
+                    );
+                }
+                let Some(attr) = self.state.get_attr(&path) else {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[OPEN] Attributes not found in cache for path: {:?}", path);
+                    }
+                    reply.error(ENOENT);
+                    return;
+                };
+                let rel = Self::rel_for_db(&path);
+                if let Ok(bytes) = self.rt.block_on(self.api.read_all(&rel, attr.size)) {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[OPEN] Writing {} bytes to tempfile at path: {:?}",
+                            bytes.len(),
+                            temp_path
+                        );
+                    }
+                    if let Ok(mut f) = File::options().write(true).open(&temp_path) {
+                        if cfg!(debug_assertions) {
+                            println!(
+                                "[OPEN] Opened tempfile for writing at path: {:?}",
+                                temp_path
+                            );
+                        }
+                        let _ = f.write_all(&bytes);
+                    }
+                }
+            }
+            if cfg!(debug_assertions) {
+                println!(
+                    "[OPEN] Inserting write tempfile into state for fh: {}, path: {:?}",
+                    fh, temp_path
+                );
+            }
+            self.state.insert_write_tempfile(fh, temp_path, true);
+        }
+        if cfg!(debug_assertions) {
+            println!("[OPEN] File opened with fh: {}", fh);
+        }
+        reply.opened(fh, flags as u32);
     }
-
-    let accmode = flags & libc::O_ACCMODE;
-
-    if accmode == libc::O_RDONLY {
-        // Read-only → NON generare un file handle (fh = 0)
-        reply.opened(0, flags as u32);
-    } else {
-        // Write mode → usa ancora ino come fh
-        self.state.insert_write_tempfile(ino, temp_path);
-        reply.opened(ino, flags as u32);
-    }
-}
-
-
 
     // Reads data from a file starting at a specified offset
-   fn read(
+    fn read(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[READ] Read called for ino: {}, fh: {}, offset: {}, size: {}",
+                ino, fh, offset, size
+            );
+        }
         let Some(path) = self.path_of(ino) else {
+            if cfg!(debug_assertions) {
+                eprintln!("[READ] Inode not found: {}", ino);
+            }
             reply.error(ENOENT);
             return;
         };
-        let rel = Self::rel_of(&path);
 
-        if let Some(tw) = self.state.get_write(ino) {
+        let rel_db = Self::rel_for_db(&path);
+        let mut tmp_result: Option<Vec<u8>> = None;
+        let mut tmp_error: Option<i32> = None;
+
+        self.state.with_write_mut(fh, |tw| {
             if let Ok(mut f) = File::open(&tw.tem_path) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[READ] Reading from local write tempfile for fh: {}, path: {:?}",
+                        fh, tw.tem_path
+                    );
+                }
                 let mut buf = vec![0u8; size as usize];
                 if f.seek(SeekFrom::Start(offset.max(0) as u64)).is_ok() {
-                    let n = f.read(&mut buf).unwrap_or(0);
-                    reply.data(&buf[..n]);
-                } else {
-                    reply.error(EIO);
-                }
-                return;
-            } else {
-                reply.error(EIO);
-                return;
-            }
-        }
-
-        let mut attr = self.state.get_attr(&path);
-
-        if attr.is_none() {
-            let parent = path.parent().unwrap_or(Path::new("/"));
-
-            match self.dir_entries(parent) {
-                Ok(entries) => {
-                    if let Some((_, de)) = entries.into_iter().find(|(p, _)| *p == path) {
-                        let ty = if Self::is_dir(&de) {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        };
-                        let perm = Self::parse_perm(&de.permissions);
-                        let size = if ty == FileType::Directory {
-                            0
-                        } else {
-                            de.size as u64
-                        };
-
-                        let a = self.file_attr(&path, ty, size, Some(de.mtime), perm);
-                        self.insert_attr_cache(path.clone(), a.clone());
-                        attr = Some(a);
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[READ] Seeked to offset {} in tempfile for fh: {}",
+                            offset, fh
+                        );
                     }
+                    let n = f.read(&mut buf).unwrap_or(0);
+                    buf.truncate(n);
+                    tmp_result = Some(buf);
+                } else {
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "[READ] Failed to seek to offset {} in tempfile for fh: {}",
+                            offset, fh
+                        );
+                    }
+                    tmp_error = Some(EIO);
                 }
-                Err(_) => {
-                    reply.error(ENOENT);
-                    return;
+            } else {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[READ] Failed to open tempfile for reading for fh: {}, path: {:?}",
+                        fh, tw.tem_path
+                    );
                 }
+                tmp_error = Some(EIO);
             }
+        });
+        if let Some(e) = tmp_error {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[READ] Error occurred while reading from tempfile for fh: {}, errno: {}",
+                    fh, e
+                );
+            }
+            reply.error(e);
+            return;
         }
-
-        let attr = match attr {
-            Some(a) => a,
-            None => {
-                reply.error(ENOENT);
-                return;
+        if let Some(buf) = tmp_result {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[READ] Successfully read {} bytes from tempfile for fh: {}",
+                    buf.len(),
+                    fh
+                );
             }
+            reply.data(&buf);
+            return;
+        }
+        let attr = if let Some(a) = self.state.get_attr(&path) {
+            if cfg!(debug_assertions) {
+                println!("[READ] Found attributes in cache for path: {:?}", path);
+            }
+            Some(a)
+        } else {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[READ] Attributes not found in cache for path: {:?}, fetching directory entries",
+                    path
+                );
+            }
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            let _ = self.dir_entries(parent);
+            self.state.get_attr(&path)
         };
 
-        if offset as u64 >= attr.size {
+        let Some(attr) = attr else {
+            if cfg!(debug_assertions) {
+                eprintln!("[READ] Attributes not found in cache for path: {:?}", path);
+            }
+            reply.error(ENOENT);
+            return;
+        };
+
+        if (offset as u64) >= attr.size {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[READ] Offset {} is beyond end of file (size: {}) for path: {:?}, returning empty data",
+                    offset, attr.size, path
+                );
+            }
             reply.data(&[]);
             return;
         }
 
         let start = offset.max(0) as u64;
-        let end = (start + size as u64 - 1).min(attr.size - 1);
+        let end = (start + (size as u64) - 1).min(attr.size - 1);
 
-        match self.rt.block_on(self.api.read_range(&rel, start, end)) {
+        match self.rt.block_on(self.api.read_range(&rel_db, start, end)) {
             Ok(bytes) => reply.data(&bytes),
-            Err(err) => reply.error(errno_from_anyhow(&err)),
+            Err(err) => {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[READ] Failed to read range {}-{} for path: {:?}, error: {:?}",
+                        start, end, path, err
+                    );
+                }
+                reply.error(errno_from_anyhow(&err))
+            }
         }
     }
 
@@ -1217,8 +1638,8 @@ impl Filesystem for RemoteFs {
     fn write(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -1226,73 +1647,128 @@ impl Filesystem for RemoteFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let tw = match self.state.get_write(ino) {
-            Some(tw) => tw,
-            None => {
-                reply.error(libc::EIO);
-                return;
+        if cfg!(debug_assertions) {
+            println!(
+                "[WRITE] Write called for fh: {}, offset: {}, data length: {}",
+                fh,
+                offset,
+                data.len()
+            );
+        }
+        if offset < 0 {
+            if cfg!(debug_assertions) {
+                eprintln!("[WRITE] Invalid negative offset: {}", offset);
             }
-        };
-        let res = std::fs::OpenOptions::new().write(true).open(&tw.tem_path);
+            reply.error(libc::EINVAL);
+            return;
+        }
 
-        match res {
-            Ok(mut f) => {
-                if f.seek(SeekFrom::Start(offset as u64)).is_err() {
-                    reply.error(libc::EIO);
-                    return;
-                }
-                if f.write_all(data).is_err() {
-                    reply.error(libc::EIO);
-                    return;
-                }
-                let new_size = offset as u64 + data.len() as u64;
-                self.state
-                    .update_write_size(ino, new_size.saturating_sub(tw.size));
-                reply.written(data.len() as u32);
+        let mut wrote = false;
+
+        self.state.with_write_mut(fh, |tw| {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[WRITE] Writing to tempfile for fh: {}, path: {:?}",
+                    fh, tw.tem_path
+                );
             }
-            Err(_) => {
-                reply.error(libc::EIO);
+            if let Ok(mut f) = OpenOptions::new().write(true).open(&tw.tem_path) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[WRITE] Opened tempfile for writing at path: {:?}",
+                        tw.tem_path
+                    );
+                }
+                if f.seek(SeekFrom::Start(offset as u64)).is_ok() && f.write_all(data).is_ok() {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[WRITE] Wrote {} bytes at offset {} in tempfile for fh: {}",
+                            data.len(),
+                            offset,
+                            fh
+                        );
+                    }
+                    let end = (offset as u64) + (data.len() as u64);
+                    tw.size = tw.size.max(end);
+                    tw.dirty = true;
+                    wrote = true;
+                }
             }
+        });
+
+        if wrote {
+            if cfg!(debug_assertions) {
+                println!(
+                    "[WRITE] Successfully wrote {} bytes for fh: {}",
+                    data.len(),
+                    fh
+                );
+            }
+            reply.written(data.len() as u32);
+        } else {
+            if cfg!(debug_assertions) {
+                eprintln!("[WRITE] Failed to write data for fh: {}", fh);
+            }
+            reply.error(libc::EIO);
         }
     }
 
     // Ensures that any buffered file data is written to storage
-   fn flush(
+    fn flush(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
+        _ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        let tw = match self.state.take_write(ino) {
-            Some(tw) => tw,
-            None => {
-                reply.ok();
-                return;
-            }
-        };
-        if !tw.tem_path.exists() {
-            eprintln!("File temporaneo non trovato in flush: {:?}", tw.tem_path);
-            reply.error(libc::ENOENT);
-            return;
+        if cfg!(debug_assertions) {
+            println!("[FLUSH] Flush called");
         }
-        let path = match self.path_of(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        let rel_path = Self::rel_of(&path);
-        let result = self.rt.block_on(
-            self.api
-                .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
-        );
-        match result {
-            Ok(_) => reply.ok(),
-            Err(_) => reply.error(libc::EIO),
+        reply.ok();
+    }
+
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+        if cfg!(debug_assertions) {
+            println!("[FSYNC] Fsync called for ino: {}, fh: {}", ino, fh);
         }
+        let write_info = {
+            if cfg!(debug_assertions) {
+                println!("[FSYNC] Checking for write tempfile info for fh: {}", fh);
+            }
+            let writes = self.state.writes.lock().unwrap();
+            writes.get(&fh).map(|tw| tw.tem_path.clone())
+        };
+
+        if let Some(tmp_path) = write_info {
+            if let Some(path) = self.path_of(ino) {
+                if cfg!(debug_assertions) {
+                    println!(
+                        "[FSYNC] Writing tempfile to remote for path: {:?}, tempfile: {:?}",
+                        path, tmp_path
+                    );
+                }
+                let rel = Self::rel_for_db(&path);
+                if let Err(e) = self
+                    .rt
+                    .block_on(self.api.write_file(&rel, &tmp_path.to_string_lossy()))
+                {
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "[FSYNC] Failed to write file for path: {:?}, error: {:?}",
+                            path, e
+                        );
+                    }
+                    reply.error(errno_from_anyhow(&e));
+                    return;
+                }
+                if cfg!(debug_assertions) {
+                    println!("[FSYNC] File {:?} written successfully during fsync.", path);
+                }
+                self.state.with_write_mut(fh, |tw| tw.dirty = false);
+            }
+        }
+        reply.ok();
     }
 
     // Closes a file and releases associated resources
@@ -1300,40 +1776,94 @@ impl Filesystem for RemoteFs {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _flags: i32,
-        _lock_owner: std::option::Option<u64>,
+        _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let tw = match self.state.take_write(ino) {
-            Some(tw) => tw,
-            None => {
-                reply.ok();
-                return;
-            }
-        };
-        if !tw.tem_path.exists() {
-            eprintln!("File temporaneo non trovato in release: {:?}", tw.tem_path);
-            reply.error(libc::ENOENT);
-            return;
+        if cfg!(debug_assertions) {
+            println!("[RELEASE] Release called for ino: {}, fh: {}", ino, fh);
         }
+        let Some(tw) = self.state.take_write(fh) else {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[RELEASE] No write tempfile info found for fh: {}, nothing to do",
+                    fh
+                );
+            }
+            reply.ok();
+            return;
+        };
+
         let path = match self.path_of(ino) {
             Some(p) => p,
             None => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[RELEASE] Inode not found: {}", ino);
+                }
                 reply.error(libc::ENOENT);
                 return;
             }
         };
-        let rel_path = Self::rel_of(&path);
-        let result = self.rt.block_on(
-            self.api
-                .write_file(&rel_path, &tw.tem_path.to_string_lossy()),
-        );
-        match result {
-            Ok(_) => reply.ok(),
-            Err(_) => reply.error(libc::EIO),
+
+        let rel = Self::rel_for_db(&path);
+
+        if tw.dirty {
+            match self
+                .rt
+                .block_on(self.api.write_file(&rel, &tw.tem_path.to_string_lossy()))
+            {
+                Ok(_) => {
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[RELEASE] File {:?} written successfully during release.",
+                            path
+                        );
+                    }
+                    let size = std::fs::metadata(&tw.tem_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+
+                    if let Some(mut attr) = self.state.get_attr(&path) {
+                        attr.size = size;
+                        attr.mtime = SystemTime::now();
+                        attr.ctime = attr.mtime;
+                        self.state.set_attr(&path, attr);
+                    }
+
+                    if let Some(parent) = path.parent() {
+                        self.state.remove_dir_cache(parent);
+                    }
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[RELEASE] Updated cache after writing file for path: {:?}",
+                            path
+                        );
+                    }
+                    let _ = std::fs::remove_file(&tw.tem_path);
+                    self.state.with_write_mut(fh, |tw| tw.dirty = false);
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[RELEASE] Cleaned up tempfile for fh: {}, path: {:?}",
+                            fh, tw.tem_path
+                        );
+                    }
+                }
+                Err(_e) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!(
+                            "[RELEASE] Failed to write file for path: {:?} during release.",
+                            path
+                        );
+                    }
+                    let _ = std::fs::remove_file(&tw.tem_path);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
         }
+        reply.ok();
     }
 
     // Creates a new file with the given name and attributes
@@ -1347,42 +1877,62 @@ impl Filesystem for RemoteFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        if cfg!(debug_assertions) {
+            println!(
+                "[CREATE] Create called for parent ino: {}, name: {:?}, mode: {:o}, umask: {:o}",
+                parent, name, mode, umask
+            );
+        }
         let parent_path = match self.path_of(parent) {
             Some(p) => p,
             None => {
-                reply.error(ENOENT);
+                if cfg!(debug_assertions) {
+                    eprintln!("[CREATE] Parent inode not found: {}", parent);
+                }
+                reply.error(libc::ENOENT);
                 return;
             }
         };
-        let path = if parent_path == Path::new("/") {
-            PathBuf::from("/").join(name)
-        } else {
-            parent_path.join(name)
-        };
-        let ino = self.state.allocate_ino(&path);
-        let mut tmp = std::env::temp_dir();
-        tmp.push(format!("remote_fs_create_{:x}.part", ino));
-        let _ = fs::remove_file(&tmp);
 
-        if let Err(e) = fs::File::create(&tmp) {
-            eprintln!("create: tmp create failed {:?}: {:?}", tmp, e);
+        let path = parent_path.join(name);
+        let fh = self.state.alloc_fh();
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("remote_fs_fh_{:x}.part", fh));
+
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::File::create(&tmp).is_err() {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[CREATE] Failed to create temporary file at path: {:?}",
+                    tmp
+                );
+            }
             reply.error(libc::EIO);
             return;
         }
-        self.state.insert_write_tempfile(ino, tmp.clone());
+
+        self.state.insert_write_tempfile(fh, tmp, true);
+
         let final_mode = mode & !umask;
-        let _ = self.update_cache(&parent_path);
-        let mut attr = self.file_attr(
+        let attr = self.file_attr(
             &path,
             FileType::RegularFile,
             0,
             None,
             (final_mode & 0o777) as u16,
+            1,
         );
-        attr.nlink = 1;
 
         self.state.set_attr(&path, attr.clone());
-        reply.created(&self.state.cache_ttl, &attr, 0, ino, 0);
+        if let Some(parent_path) = self.state.path_of(parent) {
+            if cfg!(debug_assertions) {
+                println!("[CREATE] Updating cache for: {:?}", parent_path);
+            }
+            let _ = self.update_cache(&parent_path);
+        }
+
+        reply.created(&self.state.cache_ttl, &attr, 0, fh, 0);
     }
 
     // Changes the name or path of a file or directory
@@ -1396,52 +1946,79 @@ impl Filesystem for RemoteFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let old = match name.to_str() {
-            Some(s) => s,
+        if cfg!(debug_assertions) {
+            println!(
+                "[RENAME] Rename called from parent ino: {}, name: {:?} to new parent ino: {}, new name: {:?}",
+                parent,
+                name,
+                newparent,
+                newname
+            );
+        }
+        let old_parent = match self.path_of(parent) {
+            Some(p) => p,
             None => {
-                reply.error(libc::EINVAL);
+                if cfg!(debug_assertions) {
+                    eprintln!("[RENAME] Error old path: {:?}", libc::ENOENT);
+                }
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let new_parent = match self.path_of(newparent) {
+            Some(p) => p,
+            None => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[RENAME] Error new path: {:?}", libc::ENOENT);
+                }
+                reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        let new = match newname.to_str() {
-            Some(s) => s,
-            None => {
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
-        let old_parent_path = match self.path_of(parent) {
-            Some(p) => p,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        let new_parent_path = match self.path_of(newparent) {
-            Some(p) => p,
-            None => {
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        let old_path = old_parent_path.join(old);
-        let new_path = new_parent_path.join(new);
-        let old_rel = Self::rel_of(&old_path);
-        let new_rel = Self::rel_of(&new_path);
+        let old_path = old_parent.join(name);
+        let new_path = new_parent.join(newname);
+
+        let old_rel = Self::rel_for_db(&old_path);
+        let new_rel = Self::rel_for_db(&new_path);
+
+        let target_ino_opt = self.state.ino_of(&new_path);
         match self.rt.block_on(self.api.rename(&old_rel, &new_rel)) {
             Ok(_) => {
-                self.clear_cache(Some(&old_path));
-                let _ = self.update_cache(&old_parent_path);
-                let _ = self.update_cache(&new_parent_path);
+                if cfg!(debug_assertions) {
+                    println!("[RENAME] Renaming from {:?} to {:?}", old_path, new_path);
+                }
                 if let Some(ino) = self.state.ino_of(&old_path) {
                     self.state.remove_path(&old_path);
+                    if let Some(_target_ino) = target_ino_opt {
+                        self.state.remove_attr(&new_path);
+                    } else {
+                        if cfg!(debug_assertions) {
+                            eprintln!("[RENAME] ino of {:?} not found", new_path);
+                        }
+                    }
+                    if let Some(attr) = self.state.get_attr(&old_path) {
+                        self.state.remove_attr(&old_path);
+                        self.state.set_attr(&new_path, attr);
+                    } else {
+                        if cfg!(debug_assertions) {
+                            eprintln!("[RENAME] Updating {:?} attr failed", old_path);
+                        }
+                    }
                     self.state.insert_path_mapping(&new_path, ino);
                 }
+                self.state.remove_dir_cache(&old_parent);
+                if old_parent != new_parent {
+                    self.state.remove_dir_cache(&new_parent);
+                }
                 reply.ok();
+                return;
             }
             Err(e) => {
-                reply.error(errno_from_anyhow(&e));
+                if cfg!(debug_assertions) {
+                    eprintln!("[RENAME] {}", e);
+                }
+                reply.error(errno_from_anyhow(&e))
             }
         }
     }
@@ -1456,9 +2033,15 @@ impl Filesystem for RemoteFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        if cfg!(debug_assertions) {
+            println!("[MKDIR] Called for parent_ino: {}", parent);
+        }
         let parent_path = match self.path_of(parent) {
             Some(p) => p,
             None => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[MKDIR] path of {} not found", parent);
+                }
                 reply.error(ENOENT);
                 return;
             }
@@ -1469,28 +2052,39 @@ impl Filesystem for RemoteFs {
             parent_path.join(name)
         };
 
-        let rel = Self::rel_of(&path);
+        let rel = Self::rel_for_db(&path);
 
         match self.rt.block_on(self.api.mkdir(&rel)) {
             Ok(_) => {
-                if let Err(e) = self.update_cache(&parent_path) {
-                    eprintln!("update_cache failed after mkdir: {:?}", e);
+                if let Err(_e) = self.update_cache(&parent_path) {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[MKDIR] Update cache failed for {:?}", parent_path);
+                    }
                     reply.error(EIO);
                     return;
                 }
                 if let Some(attr) = self.state.get_attr(&path) {
+                    if cfg!(debug_assertions) {
+                        println!("[MKDIR] Attr of {:?} fond", path);
+                    }
                     reply.entry(&self.state.cache_ttl, &attr, 0);
                 } else {
-                    let mut attr = self.file_attr(&path, FileType::Directory, 0, None, 0o755);
-                    attr.nlink = 2;
-
+                    if cfg!(debug_assertions) {
+                        println!("[MKDIR] Attr of {:?} not fond", path);
+                    }
+                    let attr = self.file_attr(&path, FileType::Directory, 64, None, 0o755, 2);
                     self.state.set_attr(&path, attr.clone());
                     reply.entry(&self.state.cache_ttl, &attr, 0);
+                    return;
                 }
             }
             Err(e) => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[MKDIR] {}", e);
+                }
                 let errno = errno_from_anyhow(&e);
                 reply.error(errno);
+                return;
             }
         }
     }
@@ -1503,7 +2097,13 @@ impl Filesystem for RemoteFs {
         name: &std::ffi::OsStr,
         reply: ReplyEmpty,
     ) {
+        if cfg!(debug_assertions) {
+            println!("[UNLINK] Called for {:?}", name);
+        }
         let Some(parent_path) = self.path_of(parent) else {
+            if cfg!(debug_assertions) {
+                eprintln!("[UNLINK] Path of {:?} not fount", parent);
+            }
             reply.error(ENOENT);
             return;
         };
@@ -1512,27 +2112,41 @@ impl Filesystem for RemoteFs {
         } else {
             parent_path.join(name)
         };
-        let rel = Self::rel_of(&path);
+
+        let rel = Self::rel_for_db(&path);
         match self.rt.block_on(self.api.delete(&rel)) {
             Ok(_) => {
                 self.clear_cache(Some(&path));
                 let _ = self.update_cache(&parent_path);
-
                 self.state.remove_path(&path);
+                if cfg!(debug_assertions) {
+                    println!("[UNLINK] Succesfully unlinked {:?} ", name);
+                }
                 reply.ok();
+                return;
             }
             Err(e) => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[UNLINK] {}", e);
+                }
                 let errno = errno_from_anyhow(&e);
                 reply.error(errno);
+                return;
             }
         }
     }
 
     // Removes an empty directory from the filesystem
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        if cfg!(debug_assertions) {
+            println!("[RMDIR] Called for {:?}", name);
+        }
         let parent_path = match self.path_of(parent) {
             Some(p) => p,
             None => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[RMDIR] Path {:?} not found", parent);
+                }
                 reply.error(ENOENT);
                 return;
             }
@@ -1548,77 +2162,196 @@ impl Filesystem for RemoteFs {
             match self.dir_entries(&path) {
                 Ok(_) => true,
                 Err(_) => {
+                    if cfg!(debug_assertions) {
+                        eprintln!("[RMDIR] dir_entries error on {:?}", path);
+                    }
                     reply.error(ENOENT);
                     return;
                 }
             }
         };
-
         if !is_dir {
+            if cfg!(debug_assertions) {
+                eprintln!("[RMDIR] {:?} is not a directory", path);
+            }
             reply.error(ENOTDIR);
             return;
         }
         match self.dir_entries(&path) {
-            Ok(entries) if entries.is_empty() => {}
+            Ok(entries) if entries.is_empty() => {
+                if cfg!(debug_assertions) {
+                    println!("[RMDIR] Direcotory {:?} is empty", path);
+                }
+            }
             Ok(_) => {
+                if cfg!(debug_assertions) {
+                    println!("[RMDIR] Direcotory {:?} is not empty", path);
+                }
                 reply.error(ENOTEMPTY);
                 return;
             }
-            Err(_) => {
+            Err(e) => {
+                if cfg!(debug_assertions) {
+                    println!("[RMDIR] {}", e);
+                }
                 reply.error(ENOENT);
                 return;
             }
         }
-        let rel = Self::rel_of(&path);
+
+        let rel = Self::rel_for_db(&path);
         match self.rt.block_on(self.api.delete(&rel)) {
             Ok(_) => {
+                if cfg!(debug_assertions) {
+                    println!("[RMDIR] {:?} deleted on backend", rel);
+                }
                 self.clear_cache(Some(&path));
-                let _ = self.update_cache(&parent_path);
                 self.state.remove_path(&path);
+                let _ = self.update_cache(&parent_path);
+                if cfg!(debug_assertions) {
+                    println!("[RMDIR] Cache updated for {:?}", rel);
+                }
                 reply.ok();
+                return;
             }
             Err(e) => {
+                if cfg!(debug_assertions) {
+                    eprintln!("[RMDIR] {}", e);
+                }
                 let errno = errno_from_anyhow(&e);
                 reply.error(errno);
+                return;
             }
         }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser015::ReplyXattr,
+    ) {
+        reply.error(libc::ENOATTR);
+    }
+
+    fn listxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _size: u32,
+        reply: fuser015::ReplyXattr,
+    ) {
+        reply.size(0);
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
+        reply.ok();
+    }
+}
+
+pub fn is_mountpoint_busy(path: &str) -> bool {
+    let output = std::process::Command::new("lsof")
+        .arg("-wn")
+        .arg("+d")
+        .arg(path)
+        .output();
+
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
     }
 }
 
 pub fn mount_fs(mountpoint: &str, api: FileApi, url: String) -> anyhow::Result<()> {
     let rt = Arc::new(Runtime::new()?);
     let remote_fs = RemoteFs::new(api, rt.clone());
+    let notifier_ptr = remote_fs.notifier.clone();
     let fs_state = remote_fs.state.clone();
+
     remote_fs.init_cache();
     let mp = mountpoint.to_string();
+
+    
     let options = vec![
         MountOption::FSName("remote_fs".to_string()),
         MountOption::DefaultPermissions,
+        MountOption::CUSTOM("volname=RemoteFiles".to_string()),
+        MountOption::CUSTOM("local".to_string()),
     ];
+
     let bg_session = spawn_mount2(remote_fs, &mp, &options).expect("Failed to mount filesystem");
-    let notifier = Arc::new(bg_session.notifier());
+
+    let notifier_actual = bg_session.notifier();
+    {
+        let mut lock = notifier_ptr.lock().unwrap();
+        *lock = Some(notifier_actual.clone());
+    }
+
     {
         let url_clone = url.clone();
-        let notifier_clone = notifier.clone();
+        let notifier_for_ws = Arc::new(notifier_actual);
         rt.spawn(async move {
-            start_websocket_listener(&url_clone, notifier_clone, fs_state);
+            start_websocket_listener(&url_clone, notifier_for_ws, fs_state);
         });
     }
+
     let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
-    let shutting_down = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel();
-    {
-        let tx = tx.clone();
-        let shutting_down = shutting_down.clone();
-        thread::spawn(move || {
-            for _sig in signals.forever() {
-                if !shutting_down.swap(true, Ordering::SeqCst) {
-                    let _ = tx.send(());
-                }
+
+    thread::spawn(move || {
+        for _sig in signals.forever() {
+            let _ = tx.send(());
+        }
+    });
+
+    println!("[INFO] Filesystem (macOS) montato su {}. In attesa di segnali...", mp);
+
+    while let Ok(_) = rx.recv() {
+        let mut success = false;
+        let max_attempts = 3;
+
+        for i in 1..=max_attempts {
+            if !is_mountpoint_busy(&mp) {
+                success = true;
+                break;
             }
-        });
+
+            let msg = format!("EBUSY (macOS): Mountpoint occupato. Tentativo di chiusura {}/{}...", i, max_attempts);
+            eprintln!("[STOP] {}", msg);
+            crate::write_status(&msg); 
+            
+            if i < max_attempts {
+                thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        if success {
+            println!("[STOP] Mountpoint libero. Smontaggio in corso...");
+            crate::clear_status(); 
+            let _ = bg_session.join();
+            println!("[STOP] Filesystem macOS smontato con successo.");
+            return Ok(()); 
+        } else {
+            let err_msg = "ERRORE: Impossibile smontare macOS (Busy). Il demone resta attivo. Chiudi i file o i terminali aperti.";
+            eprintln!("[STOP] {}", err_msg);
+            crate::write_status(err_msg);
+        }
     }
-    let _ = rx.recv();
-    let _ = bg_session.join();
+    
     Ok(())
 }

@@ -11,14 +11,15 @@ const router = express.Router();
 // POST /mkdir/path
 router.post("/", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+     if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const dirPath = path.join(ROOT_DIR, relPath);
     const parentPathAbs = path.dirname(dirPath);
     const parentDirName = path.dirname(relPath);
     const name = path.basename(dirPath);
     backendChanges.add(dirPath);
-    console.log("dirPath in mkdirRoutes:", dirPath);
-    
     if (!fs.existsSync(parentPathAbs) && parentPathAbs !== ROOT_DIR) {
       return res.status(400).json({ error: "Parent directory not found" });
     } 
@@ -41,9 +42,11 @@ router.post("/", async (req, res) => {
       is_dir: true,
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions
+      permissions,
+      nlink: stats.nlink,
     });
-
+    await f.syncMetadataFromDisk(parentDirName);
+   
     res.status(201).json({ message: "Directory successfully created" });
 
   } catch (err) {

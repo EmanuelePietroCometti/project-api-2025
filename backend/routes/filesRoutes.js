@@ -9,7 +9,7 @@ const f = new FileDAO();
 
 function parseRange(rangeHeader, fileSize) {
   const match = rangeHeader.match(/bytes=(\d*)-(\d*)/);
-  
+
   let start = match[1] ? parseInt(match[1], 10) : 0;
   let end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
 
@@ -23,8 +23,14 @@ function parseRange(rangeHeader, fileSize) {
 
 router.get("/", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const filePath = path.join(ROOT_DIR, relPath);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "File not found" });
+    }
 
     backendChanges.add(filePath);
 
@@ -64,54 +70,84 @@ router.get("/", async (req, res) => {
 
 // PUT /files/path (write file)
 router.put("/", async (req, res) => {
+  let fd;
+
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
+    const offset = parseInt(req.query.offset ?? "0", 10);
+
     const filePathAbs = path.join(ROOT_DIR, relPath);
     const parentPathAbs = path.dirname(filePathAbs);
     const parentPath = path.dirname(relPath);
     const name = path.basename(filePathAbs);
 
     backendChanges.add(filePathAbs);
-
     if (!fs.existsSync(parentPathAbs)) {
       return res.status(400).json({
         error: "Parent directory not found. Create the directory first."
       });
     }
+    const flag = (offset === 0) ? "w+" : "r+";
+    
+    try {
+        fd = await fs.promises.open(filePathAbs, flag);
+    } catch (err) {
+        if (err.code === 'ENOENT') {
+            fd = await fs.promises.open(filePathAbs, "w+");
+        } else {
+            throw err;
+        }
+    }
 
-    const writeStream = fs.createWriteStream(filePathAbs);
-    req.pipe(writeStream);
+    let writtenTotal = 0;
+    let currentOffset = offset;
 
-    writeStream.on("finish", async () => {
-      const stats = await fs.promises.stat(filePathAbs);
+    for await (const chunk of req) {
+      await fd.write(chunk, 0, chunk.length, currentOffset);
+      currentOffset += chunk.length;
+      writtenTotal += chunk.length;
+    }
 
-      await f.updateFile({
-        path: relPath,
-        name: name,
-        parent: parentPath,
-        is_dir: false,
-        size: stats.size,
-        mtime: Math.floor(stats.mtimeMs / 1000),
-        permissions: (stats.mode & 0o777).toString(8)
-      });
+    await fd.close();
+    fd = null;
 
-      res.status(200).json({ message: "File correctly saved." });
+    const stats = await fs.promises.stat(filePathAbs);
+
+    await f.updateFile({
+      path: relPath,
+      name,
+      parent: parentPath,
+      is_dir: false,
+      size: stats.size,
+      mtime: Math.floor(stats.mtimeMs / 1000),
+      permissions: (stats.mode & 0o777).toString(8),
+      nlink: stats.nlink,
     });
-
-    writeStream.on("error", () => {
-      res.status(500).json({ error: "Error writing file" });
+    await f.syncMetadataFromDisk(parentPath);
+    res.status(200).json({
+      message: "File correctly saved.",
+      written: writtenTotal
     });
 
   } catch (err) {
+    if (fd) {
+      try { await fd.close(); } catch { }
+    }
     console.error(err);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(500).json({ error: "Error writing file" });
   }
 });
 
 // DELETE /files/path
 router.delete("/", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
 
@@ -119,6 +155,7 @@ router.delete("/", async (req, res) => {
     if (!stats) {
       return res.status(404).json({ error: "File or directory not found" });
     }
+    const parentPath=path.dirname(relPath);
 
     if (stats.isDirectory()) {
       await fs.promises.rm(filePathAbs, { recursive: true, force: true });
@@ -127,6 +164,7 @@ router.delete("/", async (req, res) => {
     }
 
     await f.deleteFile(relPath);
+    await f.syncMetadataFromDisk(parentPath);
     res.status(200).json({ message: "Deletion completed" });
   } catch (err) {
     res.status(500).json({ error: "Internal server error" });
@@ -136,7 +174,10 @@ router.delete("/", async (req, res) => {
 // PATCH /files/chmod?relPath=...&perm=755
 router.patch("/chmod", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const perm = req.query.perm;
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
@@ -151,7 +192,10 @@ router.patch("/chmod", async (req, res) => {
 // PATCH /files/truncate?relPath=...&size=123
 router.patch("/truncate", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const size = parseInt(req.query.size, 10);
     const filePathAbs = path.join(ROOT_DIR, relPath);
     backendChanges.add(filePathAbs);
@@ -164,7 +208,8 @@ router.patch("/truncate", async (req, res) => {
       is_dir: false,
       size: stats.size,
       mtime: Math.floor(stats.mtimeMs / 1000),
-      permissions: undefined,
+      permissions: (stats.mode & 0o777).toString(8),
+      nlink: stats.nlink,
     });
     res.status(200).json({ ok: true });
   } catch (err) {
@@ -175,7 +220,10 @@ router.patch("/truncate", async (req, res) => {
 // PATCH /files/utimes?relPath=...&atime=...&mtime=...
 router.patch("/utimes", async (req, res) => {
   try {
-    const relPath = req.query.relPath;
+    let relPath = req.query.relPath;
+    if (relPath.startsWith('././')) {
+      relPath = relPath.slice(2);
+    }
     const at = req.query.atime ? parseInt(req.query.atime, 10) : null;
     const mt = req.query.mtime ? parseInt(req.query.mtime, 10) : null;
     const filePathAbs = path.join(ROOT_DIR, relPath);
@@ -196,8 +244,14 @@ router.patch("/utimes", async (req, res) => {
 // PATCH /files/rename?oldRelPath=...&newRelPath=... 
 router.patch("/rename", async (req, res) => {
   try {
-    const oldRelPath = req.query.oldRelPath;
-    const newRelPath = req.query.newRelPath;
+    let oldRelPath = req.query.oldRelPath;
+    if (oldRelPath.startsWith('././')) {
+      oldRelPath = oldRelPath.slice(2);
+    }
+    let newRelPath = req.query.newRelPath;
+     if (newRelPath.startsWith('././')) {
+      newRelPath = newRelPath.slice(2);
+    }
     if (!oldRelPath || !newRelPath) {
       return res.status(400).json({ error: "Missing oldRelPath or newRelPath" });
     }

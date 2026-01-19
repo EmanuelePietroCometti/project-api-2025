@@ -435,6 +435,7 @@ dependencies = [
  "widestring",
  "winapi",
  "windows-service",
+ "windows-sys 0.59.0",
  "winfsp",
  "winfsp-sys",
 ]

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use reqwest::{Body, Client};
 use serde::Deserialize;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use urlencoding::encode;
@@ -19,7 +19,9 @@ pub struct DirectoryEntry {
     pub permissions: String,
     pub is_dir: i64,
     pub version: i64,
+    pub nlink: i64,
 }
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct StatsResponse {
     #[serde(deserialize_with = "serde_aux::field_attributes::deserialize_number_from_string")]
@@ -150,24 +152,63 @@ impl FileApi {
         let url = format!("{}/files", self.base_url);
 
         let mut file = fs::File::open(local_path).await?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).await?;
+        let metadata = file.metadata().await?;
 
-        let resp = self
-            .client
-            .put(&url)
-            .query(&[("relPath", rel_path)])
-            .body(Body::from(buffer))
-            .send()
-            .await?;
+        if metadata.len() == 0 {
+            let resp = self
+                .client
+                .put(&url)
+                .query(&[("relPath", rel_path), ("offset", "0")])
+                .body(Body::from(vec![]))
+                .send()
+                .await?;
 
-        let status = resp.status();
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(anyhow!("write_file failed: {} - {}", status, text))
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "write_file failed for empty file: {} - {}",
+                    status,
+                    text
+                ));
+            }
+
+            return Ok(());
         }
+        let mut offset: u64 = 0;
+
+        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+
+        loop {
+            let n = file.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+
+            let resp = self
+                .client
+                .put(&url)
+                .query(&[("relPath", rel_path), ("offset", &offset.to_string())])
+                .body(Body::from(buffer[..n].to_vec()))
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "write_file failed at offset {}: {} - {}",
+                    offset,
+                    status,
+                    text
+                ));
+            }
+
+            offset += n as u64;
+        }
+
+        Ok(())
     }
 
     /// DELETE /files?relPath=...
@@ -187,6 +228,30 @@ impl FileApi {
         } else {
             let text = resp.text().await.unwrap_or_default();
             Err(anyhow!("delete failed: {} - {}", status, text))
+        }
+    }
+
+    pub async fn get_update_metadata(&self, rel_path: &str) -> Result<DirectoryEntry> {
+        let url = format!("{}/list/updatedMetadata", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("relPath", rel_path)])
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            match serde_json::from_str::<DirectoryEntry>(&text) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(anyhow!("JSON structure mismatch: {}. Body: {}", e, text)),
+            }
+        } else {
+            Err(anyhow!(
+                "Get updated metadata failed: {} - {}",
+                status,
+                text
+            ))
         }
     }
 
@@ -242,6 +307,50 @@ impl FileApi {
         } else {
             let text = resp.text().await.unwrap_or_default();
             Err(anyhow!("rename failed: {} - {}", status, text))
+        }
+    }
+
+    pub async fn read_all(&self, rel_path: &str, total_size: u64) -> anyhow::Result<Vec<u8>> {
+        const CHUNK_SIZE: u64 = 64 * 1024;
+        let mut result = Vec::with_capacity(total_size as usize);
+        let mut offset = 0;
+
+        while offset < total_size {
+            let end = (offset + CHUNK_SIZE - 1).min(total_size - 1);
+            let chunk = self.read_range(rel_path, offset, end).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            result.extend_from_slice(&chunk);
+            offset += chunk.len() as u64;
+        }
+
+        Ok(result)
+    }
+
+    pub async fn health(ip: &str) -> anyhow::Result<(), anyhow::Error> {
+        let url = format!("http://{}:3001/health", ip);
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .build()?;
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend unreachable at IP address {}", ip))?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            if body["service"] == "project-api-2025" {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Correct IP address, wrong service 'project-api-2025'",
+                ))
+            }
+        } else {
+            Err(anyhow!("Backend answered with error: {}", resp.status()))
         }
     }
 }
