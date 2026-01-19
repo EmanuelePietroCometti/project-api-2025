@@ -330,6 +330,7 @@ impl RemoteFs {
         if s.is_empty() || s == "/" {
             return ".".to_string();
         }
+        
 
         if s.starts_with('.') {
             while s.starts_with("././") {
